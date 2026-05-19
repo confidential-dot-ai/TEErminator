@@ -22,4 +22,35 @@ $ ./teerminator remote add localhost:12345 https://example.com/v2/
 $ cat SECRETTOKEN | ./teerminatore remote auth localhost:12345 -
 ```
 
+Other supported commands include:
+
+``` 
+$ ./teerminator remote rm <common-name>
+```
+
+In particular it is meant to support Confidential.ai stack and its confidential Kubernetes, C8s, which uses a ceritficate-backed attestation flow tha     t abstracts away attestation verification form the end processes.
+And the command `remote remove` or `remote rm` allows you to delete a remote.
+
+For certificate-backed attestations, you might have to trust custom certificate authorities, especially when testing using localhost certs that might having been created using mkcert.
+```
+$ ./terminator certs add <CA PEM File>
+$ ./terminator certs
+common name:
+    Issued To:
+        ...
+    Issued By:
+             ...
+    Validity Period:
+        Issued On: <issuance iso-date>
+        Expires On: <expiry iso-date>
+    PEM-Encoding:
+        -----BEGIN CERTIFICATE-----
+        ....
+        -----END CERTIFICATE-----
+
+other common name:
+    ...
+$ ./terminator certs rm <common name>
+```
+
 
