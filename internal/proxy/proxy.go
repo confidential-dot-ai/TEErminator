@@ -43,6 +43,12 @@ func Start(ctx context.Context, localAddr, remoteURL, token string) (*Tunnel, er
 		return nil, fmt.Errorf("parsing remote URL: %w", err)
 	}
 
+	// localAddr may be a full URL (e.g. "http://localhost:8081") or a bare
+	// host:port. Normalise to host:port so net.Listen accepts it.
+	if parsed, err := url.Parse(localAddr); err == nil && parsed.Host != "" {
+		localAddr = parsed.Host
+	}
+
 	transport := newH3Transport(target)
 
 	rp := &httputil.ReverseProxy{
