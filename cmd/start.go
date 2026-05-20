@@ -25,11 +25,14 @@ var startCmd = &cobra.Command{
 			return fmt.Errorf("no remotes configured; add one with `teerminator remote add`")
 		}
 
+		ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+
 		tunnels := make([]*proxy.Tunnel, 0, len(cfg.Remotes))
 		for _, r := range cfg.Remotes {
-			t, err := proxy.Start(r.Local, r.Remote, r.Token)
+			t, err := proxy.Start(ctx, r.Local, r.Remote, r.Token)
 			if err != nil {
-				// Stop already-started tunnels before returning
+				// Stop already-started tunnels before returning.
 				for _, running := range tunnels {
 					running.Stop()
 				}
@@ -40,10 +43,7 @@ var startCmd = &cobra.Command{
 		}
 
 		fmt.Println("TEErminator running. Press Ctrl+C to stop.")
-
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
+		<-ctx.Done()
 
 		fmt.Println("\nShutting down...")
 		for _, t := range tunnels {

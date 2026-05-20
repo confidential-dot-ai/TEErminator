@@ -14,8 +14,23 @@ var rootCmd = &cobra.Command{
 verified through attested TLS headers or dedicated session-scoped attestation.`,
 }
 
+// SetupCommands registers all subcommands with the root command.
+func SetupCommands() {
+	remoteCmd.AddCommand(remoteAddCmd)
+	remoteCmd.AddCommand(remoteAuthCmd)
+	remoteCmd.AddCommand(remoteRmCmd)
+	rootCmd.AddCommand(remoteCmd)
+
+	certsCmd.AddCommand(certsAddCmd)
+	certsCmd.AddCommand(certsRmCmd)
+	rootCmd.AddCommand(certsCmd)
+
+	rootCmd.AddCommand(statusCmd)
+}
+
 // Execute runs the root command.
 func Execute() {
+	SetupCommands()
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

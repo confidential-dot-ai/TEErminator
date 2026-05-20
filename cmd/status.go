@@ -26,7 +26,3 @@ var statusCmd = &cobra.Command{
 		return w.Flush()
 	},
 }
-
-func init() {
-	rootCmd.AddCommand(statusCmd)
-}

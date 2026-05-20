@@ -92,8 +92,26 @@ var remoteAuthCmd = &cobra.Command{
 	},
 }
 
-func init() {
-	remoteCmd.AddCommand(remoteAddCmd)
-	remoteCmd.AddCommand(remoteAuthCmd)
-	rootCmd.AddCommand(remoteCmd)
+var remoteRmCmd = &cobra.Command{
+	Use:   "rm <local-addr>",
+	Short: "Remove a remote TEE proxy endpoint",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		localAddr := args[0]
+
+		cfg, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("loading config: %w", err)
+		}
+
+		if !cfg.RemoveRemote(localAddr) {
+			return fmt.Errorf("no remote found for local address %q", localAddr)
+		}
+		if err := cfg.Save(); err != nil {
+			return fmt.Errorf("saving config: %w", err)
+		}
+
+		fmt.Printf("Removed remote %s\n", localAddr)
+		return nil
+	},
 }

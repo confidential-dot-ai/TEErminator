@@ -1,0 +1,489 @@
+package proxy
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// startTunnel is a test helper that creates a tunnel pointing at backend and
+// registers cleanup to stop it when the test finishes.
+func startTunnel(t *testing.T, ctx context.Context, backendURL, token string) *Tunnel {
+	t.Helper()
+	tunnel, err := Start(ctx, "127.0.0.1:0", backendURL, token)
+	if err != nil {
+		t.Fatalf("Start tunnel: %v", err)
+	}
+	t.Cleanup(func() { tunnel.Stop() })
+	return tunnel
+}
+
+func TestBasicGET(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Custom", "test-value")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "hello from backend")
+	}))
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tunnel := startTunnel(t, ctx, backend.URL, "")
+
+	resp, err := http.Get("http://" + tunnel.Addr())
+	if err != nil {
+		t.Fatalf("GET through tunnel: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if got := string(body); got != "hello from backend" {
+		t.Errorf("body = %q, want %q", got, "hello from backend")
+	}
+	if got := resp.Header.Get("X-Custom"); got != "test-value" {
+		t.Errorf("X-Custom header = %q, want %q", got, "test-value")
+	}
+}
+
+func TestPOSTWithBody(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		b, _ := io.ReadAll(r.Body)
+		fmt.Fprint(w, "echo: "+string(b))
+	}))
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tunnel := startTunnel(t, ctx, backend.URL, "")
+
+	resp, err := http.Post(
+		"http://"+tunnel.Addr(),
+		"text/plain",
+		strings.NewReader("request-payload"),
+	)
+	if err != nil {
+		t.Fatalf("POST through tunnel: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if got := string(body); got != "echo: request-payload" {
+		t.Errorf("body = %q, want %q", got, "echo: request-payload")
+	}
+}
+
+func TestPathJoining(t *testing.T) {
+	tests := []struct {
+		name       string
+		remotePath string // appended to backend URL
+		reqPath    string // path sent to the tunnel
+		wantPath   string // path the backend should see
+	}{
+		{
+			name:       "prefix with trailing slash",
+			remotePath: "/v1/",
+			reqPath:    "/chat",
+			wantPath:   "/v1/chat",
+		},
+		{
+			name:       "prefix without trailing slash",
+			remotePath: "/v1",
+			reqPath:    "/chat",
+			wantPath:   "/v1/chat",
+		},
+		{
+			name:       "no prefix",
+			remotePath: "",
+			reqPath:    "/healthz",
+			wantPath:   "/healthz",
+		},
+		{
+			name:       "nested prefix",
+			remotePath: "/api/v2/",
+			reqPath:    "/users/42",
+			wantPath:   "/api/v2/users/42",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotPath string
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer backend.Close()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			tunnel := startTunnel(t, ctx, backend.URL+tt.remotePath, "")
+
+			resp, err := http.Get("http://" + tunnel.Addr() + tt.reqPath)
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			resp.Body.Close()
+
+			if gotPath != tt.wantPath {
+				t.Errorf("backend saw path %q, want %q", gotPath, tt.wantPath)
+			}
+		})
+	}
+}
+
+func TestBearerTokenInjection(t *testing.T) {
+	var gotAuth string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tunnel := startTunnel(t, ctx, backend.URL, "my-secret-token")
+
+	resp, err := http.Get("http://" + tunnel.Addr())
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	want := "Bearer my-secret-token"
+	if gotAuth != want {
+		t.Errorf("Authorization = %q, want %q", gotAuth, want)
+	}
+}
+
+func TestNoAuthHeaderWithoutToken(t *testing.T) {
+	var hasAuth bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, hasAuth = r.Header["Authorization"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tunnel := startTunnel(t, ctx, backend.URL, "")
+
+	resp, err := http.Get("http://" + tunnel.Addr())
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	if hasAuth {
+		t.Error("Authorization header present when token is empty; want absent")
+	}
+}
+
+func TestQueryParametersPreserved(t *testing.T) {
+	var gotQuery string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tunnel := startTunnel(t, ctx, backend.URL, "")
+
+	resp, err := http.Get("http://" + tunnel.Addr() + "/search?q=hello&page=2")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotQuery != "q=hello&page=2" {
+		t.Errorf("query = %q, want %q", gotQuery, "q=hello&page=2")
+	}
+}
+
+func TestRequestHeadersForwarded(t *testing.T) {
+	var gotHeader string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Request-ID")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tunnel := startTunnel(t, ctx, backend.URL, "")
+
+	req, err := http.NewRequest("GET", "http://"+tunnel.Addr(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Request-ID", "abc-123")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	if gotHeader != "abc-123" {
+		t.Errorf("X-Request-ID = %q, want %q", gotHeader, "abc-123")
+	}
+}
+
+func TestContextCancellation(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	tunnel, err := Start(ctx, "127.0.0.1:0", backend.URL, "")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Verify tunnel is operational.
+	resp, err := http.Get("http://" + tunnel.Addr())
+	if err != nil {
+		t.Fatalf("GET before cancel: %v", err)
+	}
+	resp.Body.Close()
+
+	// Cancel the parent context; the tunnel should shut down.
+	cancel()
+
+	select {
+	case <-tunnel.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("tunnel did not shut down within timeout")
+	}
+
+	// New connections should be refused.
+	client := &http.Client{Timeout: 2 * time.Second}
+	_, err = client.Get("http://" + tunnel.Addr())
+	if err == nil {
+		t.Error("expected error after context cancellation, got nil")
+	}
+}
+
+func TestStopGraceful(t *testing.T) {
+	// Backend that deliberately delays its response.
+	started := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "done")
+	}))
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tunnel, err := Start(ctx, "127.0.0.1:0", backend.URL, "")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Fire a request that will be in-flight when Stop is called.
+	var respBody string
+	var reqErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := http.Get("http://" + tunnel.Addr())
+		if err != nil {
+			reqErr = err
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		respBody = string(b)
+	}()
+
+	// Wait until the backend has started processing.
+	<-started
+
+	// Initiate graceful shutdown while the request is still in-flight.
+	tunnel.Stop()
+	<-done
+
+	if reqErr != nil {
+		t.Fatalf("in-flight request failed: %v", reqErr)
+	}
+	if respBody != "done" {
+		t.Errorf("body = %q, want %q", respBody, "done")
+	}
+}
+
+func TestConcurrentRequests(t *testing.T) {
+	var count atomic.Int64
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count.Add(1)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	defer backend.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tunnel := startTunnel(t, ctx, backend.URL, "")
+
+	const n = 50
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Get("http://" + tunnel.Addr())
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer resp.Body.Close()
+			io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				errs <- fmt.Errorf("status %d", resp.StatusCode)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("concurrent request error: %v", err)
+	}
+
+	if got := count.Load(); got != int64(n) {
+		t.Errorf("backend received %d requests, want %d", got, n)
+	}
+}
+
+func TestH3TransportFallback(t *testing.T) {
+	// Use an HTTPS backend so that the h3Transport attempts HTTP/3 first.
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "tls-ok")
+	}))
+	defer backend.Close()
+
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	transport := newH3Transport(target)
+	// Trust the test server's self-signed certificate for the fallback.
+	transport.fallback.TLSClientConfig = backend.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	defer transport.Close()
+
+	req, err := http.NewRequest("GET", backend.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if got := string(body); got != "tls-ok" {
+		t.Errorf("body = %q, want %q", got, "tls-ok")
+	}
+
+	// After a failed HTTP/3 attempt the host should be cached.
+	transport.mu.RLock()
+	marked := transport.noH3[target.Host]
+	transport.mu.RUnlock()
+	if !marked {
+		t.Error("host should be marked as noH3 after HTTP/3 failure")
+	}
+
+	// A second request should skip H3 and go straight to fallback.
+	req2, _ := http.NewRequest("GET", backend.URL, nil)
+	resp2, err := transport.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("second RoundTrip: %v", err)
+	}
+	defer resp2.Body.Close()
+	body2, _ := io.ReadAll(resp2.Body)
+	if got := string(body2); got != "tls-ok" {
+		t.Errorf("second body = %q, want %q", got, "tls-ok")
+	}
+}
+
+func TestH3TransportPlainHTTPSkipsQUIC(t *testing.T) {
+	// Plain HTTP should never attempt HTTP/3.
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "plain-ok")
+	}))
+	defer backend.Close()
+
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	transport := newH3Transport(target)
+	defer transport.Close()
+
+	req, err := http.NewRequest("GET", backend.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if got := string(body); got != "plain-ok" {
+		t.Errorf("body = %q, want %q", got, "plain-ok")
+	}
+
+	// Host should NOT be marked since HTTP/3 was never attempted.
+	transport.mu.RLock()
+	marked := transport.noH3[target.Host]
+	transport.mu.RUnlock()
+	if marked {
+		t.Error("host should not be marked as noH3 for plain HTTP")
+	}
+}
+
+func TestInvalidRemoteURL(t *testing.T) {
+	ctx := context.Background()
+	_, err := Start(ctx, "127.0.0.1:0", "://bad-url", "")
+	if err == nil {
+		t.Fatal("expected error for invalid remote URL, got nil")
+	}
+}

@@ -32,8 +32,14 @@ type Remote struct {
 	Token  string      `json:"token,omitempty"`
 }
 
+type Cert struct {
+	CommonName string `json:"common_name"`
+	PEM        string `json:"pem"`
+}
+
 type Config struct {
 	Remotes []Remote `json:"remotes"`
+	Certs   []Cert   `json:"certs,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -93,4 +99,50 @@ func (c *Config) AddRemote(r Remote) error {
 	}
 	c.Remotes = append(c.Remotes, r)
 	return nil
+}
+
+func (c *Config) FindRemoteByName(name string) *Remote {
+	for i := range c.Remotes {
+		if c.Remotes[i].Local == name {
+			return &c.Remotes[i]
+		}
+	}
+	return nil
+}
+
+func (c *Config) RemoveRemote(local string) bool {
+	for i, r := range c.Remotes {
+		if r.Local == local {
+			c.Remotes = append(c.Remotes[:i], c.Remotes[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Config) FindCertByName(commonName string) *Cert {
+	for i := range c.Certs {
+		if c.Certs[i].CommonName == commonName {
+			return &c.Certs[i]
+		}
+	}
+	return nil
+}
+
+func (c *Config) AddCert(cert Cert) error {
+	if c.FindCertByName(cert.CommonName) != nil {
+		return errors.New("a certificate with that common name already exists")
+	}
+	c.Certs = append(c.Certs, cert)
+	return nil
+}
+
+func (c *Config) RemoveCert(commonName string) bool {
+	for i, cert := range c.Certs {
+		if cert.CommonName == commonName {
+			c.Certs = append(c.Certs[:i], c.Certs[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
