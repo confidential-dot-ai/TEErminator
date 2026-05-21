@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/lunal-dev/TEErminator/internal/config"
 	"github.com/spf13/cobra"
@@ -48,11 +49,11 @@ var remoteAddCmd = &cobra.Command{
 }
 
 var remoteAuthCmd = &cobra.Command{
-	Use:   "auth <local-addr> <token-file|-  for stdin>",
+	Use:   "auth <local-addr|index> <token-file|-  for stdin>",
 	Short: "Set a bearer token for a remote endpoint",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		localAddr := args[0]
+		key := args[0]
 		tokenSrc := args[1]
 
 		var token string
@@ -75,9 +76,9 @@ var remoteAuthCmd = &cobra.Command{
 			return fmt.Errorf("loading config: %w", err)
 		}
 
-		r := cfg.FindByLocal(localAddr)
+		r := cfg.FindByKey(key)
 		if r == nil {
-			return fmt.Errorf("no remote found for local address %q; add it first with `remote add`", localAddr)
+			return fmt.Errorf("no remote found for %q; add it first with `remote add` or check `remote ls`", key)
 		}
 
 		r.Auth = config.AuthToken
@@ -87,31 +88,58 @@ var remoteAuthCmd = &cobra.Command{
 			return fmt.Errorf("saving config: %w", err)
 		}
 
-		fmt.Printf("Token set for %s\n", localAddr)
+		fmt.Printf("Token set for %s\n", r.Local)
 		return nil
 	},
 }
 
 var remoteRmCmd = &cobra.Command{
-	Use:   "rm <local-addr>",
+	Use:   "rm <local-addr|index>",
 	Short: "Remove a remote TEE proxy endpoint",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		localAddr := args[0]
+		key := args[0]
 
 		cfg, err := config.Load()
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)
 		}
 
-		if !cfg.RemoveRemote(localAddr) {
-			return fmt.Errorf("no remote found for local address %q", localAddr)
+		r := cfg.FindByKey(key)
+		if r == nil {
+			return fmt.Errorf("no remote found for %q", key)
+		}
+		local := r.Local
+		if !cfg.RemoveRemote(local) {
+			return fmt.Errorf("no remote found for %q", key)
 		}
 		if err := cfg.Save(); err != nil {
 			return fmt.Errorf("saving config: %w", err)
 		}
 
-		fmt.Printf("Removed remote %s\n", localAddr)
+		fmt.Printf("Removed remote %s\n", local)
 		return nil
+	},
+}
+
+var remoteLsCmd = &cobra.Command{
+	Use:   "ls",
+	Short: "List configured remote TEE proxy endpoints",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("loading config: %w", err)
+		}
+		if len(cfg.Remotes) == 0 {
+			fmt.Println("No remotes configured.")
+			return nil
+		}
+
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "#\tLocal\tRemote\tAuth\tStatus")
+		for i, r := range cfg.Remotes {
+			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", i+1, r.Local, r.Remote, r.Auth, r.Status)
+		}
+		return w.Flush()
 	},
 }

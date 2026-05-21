@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 type AuthType string
@@ -91,6 +92,18 @@ func (c *Config) FindByLocal(local string) *Remote {
 		}
 	}
 	return nil
+}
+
+// FindByKey resolves a remote by either its 1-based index (as printed by
+// `remote ls`) or its local address.
+func (c *Config) FindByKey(key string) *Remote {
+	if n, err := strconv.Atoi(key); err == nil {
+		if n >= 1 && n <= len(c.Remotes) {
+			return &c.Remotes[n-1]
+		}
+		return nil
+	}
+	return c.FindByLocal(key)
 }
 
 func (c *Config) AddRemote(r Remote) error {

@@ -19,6 +19,7 @@ func SetupCommands() {
 	remoteCmd.AddCommand(remoteAddCmd)
 	remoteCmd.AddCommand(remoteAuthCmd)
 	remoteCmd.AddCommand(remoteRmCmd)
+	remoteCmd.AddCommand(remoteLsCmd)
 	rootCmd.AddCommand(remoteCmd)
 
 	certsCmd.AddCommand(certsAddCmd)
