@@ -1,0 +1,3 @@
+- [] Support /attest remote endpoints
+- [] Support TLS Header attestations
+- [] Decide on WASM vs attestation-go workflows

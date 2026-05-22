@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lunal-dev/TEErminator/internal/verifier"
 	"github.com/quic-go/quic-go/http3"
 )
 
@@ -147,6 +149,9 @@ func newH3Transport(target *url.URL) *h3Transport {
 // standard HTTP/1.1 or HTTP/2. Connection-level failures (such as a QUIC
 // handshake rejection) occur before any request body is consumed, so the
 // original request can safely be forwarded via the fallback transport.
+//
+// If the inbound response carries an Attestation-Report header its value is
+// passed to verifier.VerifyAzSnpAttestation and the result is logged via slog.
 func (t *h3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Host
 
@@ -154,18 +159,40 @@ func (t *h3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	skip := t.noH3[host]
 	t.mu.RUnlock()
 
+	var (
+		resp *http.Response
+		err  error
+	)
 	if !skip && req.URL.Scheme == "https" {
-		resp, err := t.h3.RoundTrip(req)
-		if err == nil {
-			return resp, nil
+		resp, err = t.h3.RoundTrip(req)
+		if err != nil {
+			t.mu.Lock()
+			t.noH3[host] = true
+			t.mu.Unlock()
 		}
-
-		t.mu.Lock()
-		t.noH3[host] = true
-		t.mu.Unlock()
 	}
 
-	return t.fallback.RoundTrip(req)
+	if resp == nil {
+		resp, err = t.fallback.RoundTrip(req)
+	}
+
+	if err == nil && resp != nil {
+		if reportHeader := resp.Header.Get("Attestation-Report"); reportHeader != "" {
+			verifyErr := verifier.VerifyAzSnpAttestation([]byte(reportHeader))
+			if verifyErr != nil {
+				slog.Warn("attestation report verification failed",
+					"url", req.URL.String(),
+					"error", verifyErr,
+				)
+			} else {
+				slog.Info("attestation report verified successfully",
+					"url", req.URL.String(),
+				)
+			}
+		}
+	}
+
+	return resp, err
 }
 
 // Close releases resources held by both transports.

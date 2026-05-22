@@ -7,6 +7,7 @@ require (
 	github.com/lunal-dev/attestation-go v0.0.0-20260518232323-ae2c7e4d5bdd
 	github.com/quic-go/quic-go v0.59.1
 	github.com/spf13/cobra v1.10.2
+	github.com/tetratelabs/wazero v1.11.0
 )
 
 require (
