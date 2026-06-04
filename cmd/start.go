@@ -5,11 +5,16 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/lunal-dev/TEErminator/internal/config"
 	"github.com/lunal-dev/TEErminator/internal/proxy"
 	"github.com/spf13/cobra"
 )
+
+// reattestInterval is how long a verified verdict is reused for a long-lived
+// session before the next request re-attests.
+const reattestInterval = time.Minute
 
 var startCmd = &cobra.Command{
 	Use:   "start",
@@ -30,7 +35,15 @@ var startCmd = &cobra.Command{
 
 		tunnels := make([]*proxy.Tunnel, 0, len(cfg.Remotes))
 		for _, r := range cfg.Remotes {
-			t, err := proxy.Start(ctx, r.Local, r.Remote, r.Token)
+			t, err := proxy.StartWithOptions(ctx, r.Local, r.Remote, proxy.Options{
+				// Each tunnel enforces its own remote's attestation method, so the
+				// daemon can front several attested backends at once with different
+				// methods per backend.
+				Remote: r,
+				// Re-attest at most once per minute on a long-lived session; the
+				// TLS channel carries the guarantee between checks.
+				ReattestInterval: reattestInterval,
+			})
 			if err != nil {
 				// Stop already-started tunnels before returning.
 				for _, running := range tunnels {

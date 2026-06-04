@@ -2,7 +2,10 @@ package proxy
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"log/slog"
@@ -13,9 +16,22 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lunal-dev/TEErminator/internal/config"
 	"github.com/lunal-dev/TEErminator/internal/verifier"
 	"github.com/quic-go/quic-go/http3"
 )
+
+// Options configures attestation enforcement for a tunnel.
+type Options struct {
+	// Remote is the full per-remote policy for this tunnel. Each tunnel enforces
+	// its own remote's Mode/Measurements/DiscoveryURL/Pin independently of every
+	// other tunnel, so TEErminator can front multiple attested backends at once
+	// with a different attestation method per backend.
+	Remote config.Remote
+	// ReattestInterval is how long a successful verdict is reused before the next
+	// request re-attests. Zero means re-verify on every request.
+	ReattestInterval time.Duration
+}
 
 // Tunnel is a running HTTP reverse proxy that forwards requests to a remote host.
 type Tunnel struct {
@@ -40,6 +56,11 @@ func (t *Tunnel) Addr() string { return t.addr }
 // The provided context controls the tunnel lifetime: cancelling it initiates a
 // graceful shutdown that lets in-flight requests finish for up to 5 seconds.
 func Start(ctx context.Context, localAddr, remoteURL, token string) (*Tunnel, error) {
+	return StartWithOptions(ctx, localAddr, remoteURL, Options{Remote: config.Remote{Token: token}})
+}
+
+// StartWithOptions is Start with explicit attestation enforcement options.
+func StartWithOptions(ctx context.Context, localAddr, remoteURL string, opts Options) (*Tunnel, error) {
 	target, err := url.Parse(remoteURL)
 	if err != nil {
 		return nil, fmt.Errorf("parsing remote URL: %w", err)
@@ -51,8 +72,12 @@ func Start(ctx context.Context, localAddr, remoteURL, token string) (*Tunnel, er
 		localAddr = parsed.Host
 	}
 
-	transport := newH3Transport(target)
+	transport, err := newH3Transport(target, opts)
+	if err != nil {
+		return nil, err
+	}
 
+	token := opts.Remote.Token
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
@@ -122,13 +147,28 @@ type h3Transport struct {
 	h3       *http3.Transport
 	fallback *http.Transport
 
+	// attestation enforcement (per-remote, independent of other tunnels)
+	remote    config.Remote
+	vf        verifier.Verifier
+	cache     *verifier.SessionCache
+	remoteKey string
+
 	mu   sync.RWMutex
 	noH3 map[string]bool
 }
 
-func newH3Transport(target *url.URL) *h3Transport {
+func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 	tlsCfg := &tls.Config{
 		ServerName: target.Hostname(),
+	}
+
+	vf, err := verifier.For(opts.Remote.Mode)
+	if err != nil {
+		return nil, err
+	}
+	var cache *verifier.SessionCache
+	if vf != nil {
+		cache = verifier.NewSessionCache(opts.ReattestInterval)
 	}
 
 	return &h3Transport{
@@ -141,8 +181,12 @@ func newH3Transport(target *url.URL) *h3Transport {
 			MaxIdleConns:      100,
 			IdleConnTimeout:   90 * time.Second,
 		},
-		noH3: make(map[string]bool),
-	}
+		remote:    opts.Remote,
+		vf:        vf,
+		cache:     cache,
+		remoteKey: target.Host,
+		noH3:      make(map[string]bool),
+	}, nil
 }
 
 // RoundTrip tries HTTP/3 first; on failure it marks the host and falls back to
@@ -150,11 +194,67 @@ func newH3Transport(target *url.URL) *h3Transport {
 // handshake rejection) occur before any request body is consumed, so the
 // original request can safely be forwarded via the fallback transport.
 //
-// If the inbound response carries an Attestation-Report header its value is
-// passed to verifier.VerifyAzSnpAttestation and the result is logged via slog.
+// Attestation handling is driven entirely by this remote's configured Mode:
+//   - AttestNone (nil verifier): legacy best-effort — log any Attestation-Report
+//     header without enforcing.
+//   - any other mode: enforce that remote's method and fail closed (a
+//     verification error drops the response). Any mode that is recognised but not
+//     yet implemented therefore blocks traffic rather than forwarding it
+//     unverified.
 func (t *h3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Host
 
+	if t.vf == nil {
+		return t.roundTripLegacy(req, host)
+	}
+
+	// If this remote was verified within the re-attest interval, reuse the
+	// verdict and skip per-request attestation work — the established TLS session
+	// already carries the security guarantee between periodic freshness checks.
+	if fresh, ok := t.cache.Fresh(t.remoteKey); fresh {
+		if !ok {
+			return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
+		}
+		return t.do(req, host)
+	}
+
+	// Flow A binds a fresh per-request nonce into the evidence so a report
+	// captured from an earlier session cannot be replayed.
+	var nonce []byte
+	if t.remote.Mode == config.AttestTLSHeader {
+		nonce = make([]byte, 32)
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, fmt.Errorf("generate attestation nonce: %w", err)
+		}
+		req.Header.Set(verifier.NonceHeader, base64.RawURLEncoding.EncodeToString(nonce))
+	}
+
+	resp, err := t.do(req, host)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+
+	// Fail closed: a verification error drops the response.
+	res, verifyErr := t.vf.Verify(verifier.Input{
+		Remote:           &t.remote,
+		Nonce:            nonce,
+		ResponseHeader:   resp.Header,
+		PeerCertificates: peerCerts(resp),
+	})
+	t.cache.Record(t.remoteKey, verifyErr == nil, verifyErr)
+	if verifyErr != nil {
+		resp.Body.Close()
+		slog.Warn("attestation verification failed; dropping response",
+			"mode", t.remote.Mode, "url", req.URL.String(), "error", verifyErr)
+		return nil, fmt.Errorf("attestation verification failed for %s: %w", host, verifyErr)
+	}
+	slog.Info("attestation verified", "mode", t.remote.Mode, "url", req.URL.String(), "measurement", res.Measurement)
+	return resp, nil
+}
+
+// do performs the actual HTTP/3-then-fallback round trip without any attestation
+// handling.
+func (t *h3Transport) do(req *http.Request, host string) (*http.Response, error) {
 	t.mu.RLock()
 	skip := t.noH3[host]
 	t.mu.RUnlock()
@@ -175,24 +275,32 @@ func (t *h3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if resp == nil {
 		resp, err = t.fallback.RoundTrip(req)
 	}
+	return resp, err
+}
 
-	if err == nil && resp != nil {
-		if reportHeader := resp.Header.Get("Attestation-Report"); reportHeader != "" {
-			verifyErr := verifier.VerifyAzSnpAttestation([]byte(reportHeader))
-			if verifyErr != nil {
-				slog.Warn("attestation report verification failed",
-					"url", req.URL.String(),
-					"error", verifyErr,
-				)
-			} else {
-				slog.Info("attestation report verified successfully",
-					"url", req.URL.String(),
-				)
-			}
+// roundTripLegacy is the AttestNone path: forward the request and log any
+// Attestation-Report header without enforcing a verdict.
+func (t *h3Transport) roundTripLegacy(req *http.Request, host string) (*http.Response, error) {
+	resp, err := t.do(req, host)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	if reportHeader := resp.Header.Get(verifier.AttestationHeader); reportHeader != "" {
+		if verifyErr := verifier.VerifyAzSnpAttestation([]byte(reportHeader)); verifyErr != nil {
+			slog.Warn("attestation report verification failed", "url", req.URL.String(), "error", verifyErr)
+		} else {
+			slog.Info("attestation report verified successfully", "url", req.URL.String())
 		}
 	}
-
 	return resp, err
+}
+
+// peerCerts returns the verified TLS peer chain from a response, if any.
+func peerCerts(resp *http.Response) []*x509.Certificate {
+	if resp.TLS == nil {
+		return nil
+	}
+	return resp.TLS.PeerCertificates
 }
 
 // Close releases resources held by both transports.

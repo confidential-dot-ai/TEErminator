@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 
@@ -29,37 +30,52 @@ const hclReportSNPOffset = 0x20
 // SEV-SNP report embedded in the HCL report, attaches the provided VCEK
 // certificate and calls verify.SnpAttestation to confirm the report is valid.
 func VerifyAzSnpAttestation(raw []byte) error {
+	_, err := VerifyAzSnp(raw)
+	return err
+}
+
+// AzSnpResult holds the verified report fields callers need for policy checks:
+// the launch measurement (hex) and the raw report_data (which binds the client
+// nonce in Flow A).
+type AzSnpResult struct {
+	Measurement string // hex-encoded launch digest
+	ReportData  []byte // 64-byte report_data field from the SNP report
+}
+
+// VerifyAzSnp verifies an az-snp Attestation-Report payload and, on success,
+// returns the launch measurement and report_data for caller-side policy.
+func VerifyAzSnp(raw []byte) (*AzSnpResult, error) {
 	var report azSnpEvidence
 	if err := json.Unmarshal(raw, &report); err != nil {
-		return fmt.Errorf("parsing attestation.json: %w", err)
+		return nil, fmt.Errorf("parsing attestation.json: %w", err)
 	}
 
 	if report.Platform != "az-snp" {
-		return fmt.Errorf("unexpected platform %q, want \"az-snp\"", report.Platform)
+		return nil, fmt.Errorf("unexpected platform %q, want \"az-snp\"", report.Platform)
 	}
 
 	// Decode the HCL report (base64url, no padding).
 	hclBytes, err := base64.RawURLEncoding.DecodeString(report.Evidence.HclReport)
 	if err != nil {
-		return fmt.Errorf("decoding hcl_report: %w", err)
+		return nil, fmt.Errorf("decoding hcl_report: %w", err)
 	}
 
 	minLen := hclReportSNPOffset + abi.ReportSize
 	if len(hclBytes) < minLen {
-		return fmt.Errorf("hcl_report too short: got %d bytes, need at least %d", len(hclBytes), minLen)
+		return nil, fmt.Errorf("hcl_report too short: got %d bytes, need at least %d", len(hclBytes), minLen)
 	}
 
 	snpReportBytes := hclBytes[hclReportSNPOffset : hclReportSNPOffset+abi.ReportSize]
 
 	snpReport, err := abi.ReportToProto(snpReportBytes)
 	if err != nil {
-		return fmt.Errorf("parsing SNP report: %w", err)
+		return nil, fmt.Errorf("parsing SNP report: %w", err)
 	}
 
 	// Decode the VCEK certificate (base64url, no padding).
 	vcekDER, err := base64.RawURLEncoding.DecodeString(report.Evidence.Vcek)
 	if err != nil {
-		return fmt.Errorf("decoding vcek: %w", err)
+		return nil, fmt.Errorf("decoding vcek: %w", err)
 	}
 
 	attestation := &spb.Attestation{
@@ -71,8 +87,11 @@ func VerifyAzSnpAttestation(raw []byte) error {
 
 	opts := sv.DefaultOptions()
 	if err := sv.SnpAttestation(attestation, opts); err != nil {
-		return fmt.Errorf("SnpAttestation verification failed: %w", err)
+		return nil, fmt.Errorf("SnpAttestation verification failed: %w", err)
 	}
 
-	return nil
+	return &AzSnpResult{
+		Measurement: hex.EncodeToString(snpReport.GetMeasurement()),
+		ReportData:  snpReport.GetReportData(),
+	}, nil
 }

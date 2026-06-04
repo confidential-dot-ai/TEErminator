@@ -17,6 +17,12 @@ var remoteCmd = &cobra.Command{
 	Short: "Manage remote TEE proxy endpoints",
 }
 
+var (
+	remoteAddMode         string
+	remoteAddMeasurements []string
+	remoteAddDiscoveryURL string
+)
+
 var remoteAddCmd = &cobra.Command{
 	Use:   "add <local-addr> <remote-url>",
 	Short: "Add a new remote TEE proxy endpoint",
@@ -25,16 +31,23 @@ var remoteAddCmd = &cobra.Command{
 		localAddr := args[0]
 		remoteURL := args[1]
 
+		if !config.ValidAttestMode(remoteAddMode) {
+			return fmt.Errorf("invalid --mode %q (want one of: tls-header, attest, cds-cert, or empty)", remoteAddMode)
+		}
+
 		cfg, err := config.Load()
 		if err != nil {
 			return fmt.Errorf("loading config: %w", err)
 		}
 
 		r := config.Remote{
-			Local:  localAddr,
-			Remote: remoteURL,
-			Auth:   config.AuthNone,
-			Status: config.StatusUnknown,
+			Local:        localAddr,
+			Remote:       remoteURL,
+			Auth:         config.AuthNone,
+			Status:       config.StatusUnknown,
+			Mode:         config.AttestMode(remoteAddMode),
+			Measurements: remoteAddMeasurements,
+			DiscoveryURL: remoteAddDiscoveryURL,
 		}
 		if err := cfg.AddRemote(r); err != nil {
 			return err
@@ -43,9 +56,20 @@ var remoteAddCmd = &cobra.Command{
 			return fmt.Errorf("saving config: %w", err)
 		}
 
-		fmt.Printf("Added %s -> %s\n", localAddr, remoteURL)
+		if r.Mode != config.AttestNone {
+			fmt.Printf("Added %s -> %s (attestation: %s)\n", localAddr, remoteURL, r.Mode)
+		} else {
+			fmt.Printf("Added %s -> %s\n", localAddr, remoteURL)
+		}
 		return nil
 	},
+}
+
+func init() {
+	f := remoteAddCmd.Flags()
+	f.StringVar(&remoteAddMode, "mode", "", "attestation mode: tls-header (Flow A), attest (Flow B), cds-cert (Flow C), or empty to disable")
+	f.StringSliceVar(&remoteAddMeasurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated")
+	f.StringVar(&remoteAddDiscoveryURL, "discovery-url", "", "discovery base URL for Flow B/C (e.g. https://host/.well-known/c8s/)")
 }
 
 var remoteAuthCmd = &cobra.Command{
