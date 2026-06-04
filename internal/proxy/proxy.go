@@ -125,7 +125,9 @@ func StartWithOptions(ctx context.Context, localAddr, remoteURL string, opts Opt
 		<-watchCtx.Done()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
-		server.Shutdown(shutdownCtx)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("proxy: shutdown %s: %v", localAddr, err)
+		}
 	}()
 
 	return t, nil
@@ -136,8 +138,7 @@ func StartWithOptions(ctx context.Context, localAddr, remoteURL string, opts Opt
 func (t *Tunnel) Stop() error {
 	t.cancel()
 	<-t.done
-	t.transport.Close()
-	return nil
+	return t.transport.Close()
 }
 
 // h3Transport tries HTTP/3 (QUIC) first and falls back to standard HTTPS/HTTP.
@@ -243,7 +244,7 @@ func (t *h3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	})
 	t.cache.Record(t.remoteKey, verifyErr == nil, verifyErr)
 	if verifyErr != nil {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		slog.Warn("attestation verification failed; dropping response",
 			"mode", t.remote.Mode, "url", req.URL.String(), "error", verifyErr)
 		return nil, fmt.Errorf("attestation verification failed for %s: %w", host, verifyErr)

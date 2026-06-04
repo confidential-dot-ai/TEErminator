@@ -47,7 +47,7 @@ var startCmd = &cobra.Command{
 			if err != nil {
 				// Stop already-started tunnels before returning.
 				for _, running := range tunnels {
-					running.Stop()
+					_ = running.Stop()
 				}
 				return fmt.Errorf("starting proxy for %s -> %s: %w", r.Local, r.Remote, err)
 			}
