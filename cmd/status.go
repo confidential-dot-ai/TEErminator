@@ -19,9 +19,13 @@ var statusCmd = &cobra.Command{
 		}
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "Local\tRemote\tAuth\tStatus")
+		fmt.Fprintln(w, "Local\tRemote\tAuth\tMode\tStatus")
 		for _, r := range cfg.Remotes {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.Local, r.Remote, r.Auth, r.Status)
+			mode := string(r.Mode)
+			if r.Mode == config.AttestNone {
+				mode = "None"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.Local, r.Remote, r.Auth, mode, r.Status)
 		}
 		return w.Flush()
 	},
