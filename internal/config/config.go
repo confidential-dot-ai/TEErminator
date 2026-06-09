@@ -19,18 +19,57 @@ const (
 type TrustStatus string
 
 const (
-	StatusUnknown  TrustStatus = "Unknown"
-	StatusVerified TrustStatus = "Verified"
+	StatusUnknown   TrustStatus = "Unknown"
+	StatusVerified  TrustStatus = "Verified"
 	StatusUntrusted TrustStatus = "Untrusted"
-	StatusFailed   TrustStatus = "Failed"
+	StatusFailed    TrustStatus = "Failed"
 )
 
+// AttestMode selects how a remote's TEE attestation is verified.
+type AttestMode string
+
+const (
+	// AttestNone disables attestation verification (current default behaviour).
+	AttestNone AttestMode = ""
+	// AttestTLSHeader (Flow A) verifies an Attestation-Report response header,
+	// binding the client nonce, then reuses that verdict for the session.
+	AttestTLSHeader AttestMode = "tls-header"
+	// AttestEndpoint (Flow B) fetches a fresh attestation from a dedicated
+	// endpoint at session start.
+	AttestEndpoint AttestMode = "attest"
+	// AttestCDSCert (Flow C) fetches and pins the CDS cert before trusting the
+	// connection.
+	AttestCDSCert AttestMode = "cds-cert"
+)
+
+// CertPin records a certificate pinned by a Flow C bootstrap so later sessions
+// trust the same cert without re-fetching.
+type CertPin struct {
+	SHA256   string `json:"sha256"`
+	NotAfter string `json:"not_after,omitempty"`
+	PEM      string `json:"pem,omitempty"`
+}
+
 type Remote struct {
-	Local  string      `json:"local"`
-	Remote string      `json:"remote"`
-	Auth   AuthType    `json:"auth"`
-	Status TrustStatus `json:"status"`
-	Token  string      `json:"token,omitempty"`
+	Local        string      `json:"local"`
+	Remote       string      `json:"remote"`
+	Auth         AuthType    `json:"auth"`
+	Status       TrustStatus `json:"status"`
+	Token        string      `json:"token,omitempty"`
+	Mode         AttestMode  `json:"mode,omitempty"`
+	DiscoveryURL string      `json:"discovery_url,omitempty"`
+	Measurements []string    `json:"measurements,omitempty"` // accepted hex launch digests
+	Pin          *CertPin    `json:"pin,omitempty"`
+}
+
+// ValidAttestMode reports whether s is a recognised attestation mode.
+func ValidAttestMode(s string) bool {
+	switch AttestMode(s) {
+	case AttestNone, AttestTLSHeader, AttestEndpoint, AttestCDSCert:
+		return true
+	default:
+		return false
+	}
 }
 
 type Cert struct {

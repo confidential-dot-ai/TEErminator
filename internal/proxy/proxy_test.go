@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/lunal-dev/TEErminator/internal/config"
 )
 
 // startTunnel is a test helper that creates a tunnel pointing at backend and
@@ -22,7 +24,7 @@ func startTunnel(t *testing.T, ctx context.Context, backendURL, token string) *T
 	if err != nil {
 		t.Fatalf("Start tunnel: %v", err)
 	}
-	t.Cleanup(func() { tunnel.Stop() })
+	t.Cleanup(func() { _ = tunnel.Stop() })
 	return tunnel
 }
 
@@ -43,7 +45,7 @@ func TestBasicGET(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET through tunnel: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
@@ -80,7 +82,7 @@ func TestPOSTWithBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST through tunnel: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(resp.Body)
 	if got := string(body); got != "echo: request-payload" {
@@ -139,7 +141,7 @@ func TestPathJoining(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GET: %v", err)
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			if gotPath != tt.wantPath {
 				t.Errorf("backend saw path %q, want %q", gotPath, tt.wantPath)
@@ -165,7 +167,7 @@ func TestBearerTokenInjection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	want := "Bearer my-secret-token"
 	if gotAuth != want {
@@ -190,7 +192,7 @@ func TestNoAuthHeaderWithoutToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if hasAuth {
 		t.Error("Authorization header present when token is empty; want absent")
@@ -214,7 +216,7 @@ func TestQueryParametersPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if gotQuery != "q=hello&page=2" {
 		t.Errorf("query = %q, want %q", gotQuery, "q=hello&page=2")
@@ -244,7 +246,7 @@ func TestRequestHeadersForwarded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	if gotHeader != "abc-123" {
 		t.Errorf("X-Request-ID = %q, want %q", gotHeader, "abc-123")
@@ -268,7 +270,7 @@ func TestContextCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET before cancel: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Cancel the parent context; the tunnel should shut down.
 	cancel()
@@ -317,7 +319,7 @@ func TestStopGraceful(t *testing.T) {
 			reqErr = err
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		b, _ := io.ReadAll(resp.Body)
 		respBody = string(b)
 	}()
@@ -326,7 +328,7 @@ func TestStopGraceful(t *testing.T) {
 	<-started
 
 	// Initiate graceful shutdown while the request is still in-flight.
-	tunnel.Stop()
+	_ = tunnel.Stop()
 	<-done
 
 	if reqErr != nil {
@@ -364,8 +366,8 @@ func TestConcurrentRequests(t *testing.T) {
 				errs <- err
 				return
 			}
-			defer resp.Body.Close()
-			io.ReadAll(resp.Body)
+			defer func() { _ = resp.Body.Close() }()
+			_, _ = io.ReadAll(resp.Body)
 			if resp.StatusCode != http.StatusOK {
 				errs <- fmt.Errorf("status %d", resp.StatusCode)
 			}
@@ -397,10 +399,10 @@ func TestH3TransportFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	transport := newH3Transport(target)
+	transport, _ := newH3Transport(target, Options{})
 	// Trust the test server's self-signed certificate for the fallback.
 	transport.fallback.TLSClientConfig = backend.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
-	defer transport.Close()
+	defer func() { _ = transport.Close() }()
 
 	req, err := http.NewRequest("GET", backend.URL, nil)
 	if err != nil {
@@ -411,7 +413,7 @@ func TestH3TransportFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RoundTrip: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(resp.Body)
 	if got := string(body); got != "tls-ok" {
@@ -432,7 +434,7 @@ func TestH3TransportFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second RoundTrip: %v", err)
 	}
-	defer resp2.Body.Close()
+	defer func() { _ = resp2.Body.Close() }()
 	body2, _ := io.ReadAll(resp2.Body)
 	if got := string(body2); got != "tls-ok" {
 		t.Errorf("second body = %q, want %q", got, "tls-ok")
@@ -452,8 +454,8 @@ func TestH3TransportPlainHTTPSkipsQUIC(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	transport := newH3Transport(target)
-	defer transport.Close()
+	transport, _ := newH3Transport(target, Options{})
+	defer func() { _ = transport.Close() }()
 
 	req, err := http.NewRequest("GET", backend.URL, nil)
 	if err != nil {
@@ -464,7 +466,7 @@ func TestH3TransportPlainHTTPSkipsQUIC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RoundTrip: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(resp.Body)
 	if got := string(body); got != "plain-ok" {
@@ -477,6 +479,64 @@ func TestH3TransportPlainHTTPSkipsQUIC(t *testing.T) {
 	transport.mu.RUnlock()
 	if marked {
 		t.Error("host should not be marked as noH3 for plain HTTP")
+	}
+}
+
+// newTrustingTransport builds an h3Transport for backend with the given options,
+// trusting the test server's self-signed certificate on the fallback path.
+func newTrustingTransport(t *testing.T, backend *httptest.Server, opts Options) *h3Transport {
+	t.Helper()
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := newH3Transport(target, opts)
+	if err != nil {
+		t.Fatalf("newH3Transport: %v", err)
+	}
+	tr.fallback.TLSClientConfig = backend.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	t.Cleanup(func() { _ = tr.Close() })
+	return tr
+}
+
+// TestPerRemoteAttestationMethods verifies each tunnel enforces its own remote's
+// attestation method independently: AttestNone forwards, a configured method
+// fails closed when the backend supplies no valid evidence, and a recognised but
+// not-yet-implemented method blocks the response rather than forwarding it
+// unverified.
+func TestPerRemoteAttestationMethods(t *testing.T) {
+	// A backend that does not emit any Attestation-Report header.
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "backend-ok")
+	}))
+	defer backend.Close()
+
+	cases := []struct {
+		name      string
+		mode      config.AttestMode
+		wantError bool
+	}{
+		{"none forwards", config.AttestNone, false},
+		{"tls-header fails closed without evidence", config.AttestTLSHeader, true},
+		{"attest (unimplemented) fails closed", config.AttestEndpoint, true},
+		{"cds-cert (unimplemented) fails closed", config.AttestCDSCert, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newTrustingTransport(t, backend, Options{Remote: config.Remote{Mode: tc.mode}})
+			req, _ := http.NewRequest("GET", backend.URL, nil)
+			resp, err := tr.RoundTrip(req)
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			if tc.wantError && err == nil {
+				t.Fatalf("mode %q: expected fail-closed error, got nil response forwarded", tc.mode)
+			}
+			if !tc.wantError && err != nil {
+				t.Fatalf("mode %q: expected forward, got error %v", tc.mode, err)
+			}
+		})
 	}
 }
 
