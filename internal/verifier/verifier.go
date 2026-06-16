@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	pb "github.com/google/go-tpm-tools/proto/attest"
-	"github.com/lunal-dev/attestation-go/attestation"
+	"github.com/confidential-dot-ai/attestation-go/attestation"
 )
 
 // VerifyAttestation verifies a base64-encoded binarypb attestation carried in

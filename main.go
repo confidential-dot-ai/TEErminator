@@ -1,6 +1,6 @@
 package main
 
-import "github.com/lunal-dev/TEErminator/cmd"
+import "github.com/confidential-dot-ai/TEErminator/cmd"
 
 func main() {
 	cmd.Execute()

@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/lunal-dev/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/config"
 	"github.com/spf13/cobra"
 )
 

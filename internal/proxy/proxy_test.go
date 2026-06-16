@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lunal-dev/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/config"
 )
 
 // startTunnel is a test helper that creates a tunnel pointing at backend and

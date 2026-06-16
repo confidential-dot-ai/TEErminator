@@ -1,20 +1,18 @@
-module github.com/lunal-dev/TEErminator
+module github.com/confidential-dot-ai/TEErminator
 
-go 1.25.4
+go 1.25.0
 
 require (
-	github.com/google/go-sev-guest v0.14.1
-	github.com/google/go-tpm-tools v0.4.9-0.20260522205405-ed0161beaf76
-	github.com/lunal-dev/attestation-go v0.0.0-20260518232323-ae2c7e4d5bdd
-	github.com/quic-go/quic-go v0.59.1
+	github.com/confidential-dot-ai/attestation-go v0.0.0-20260616143317-8d6c740bb068
+	github.com/google/go-sev-guest v0.15.0
+	github.com/google/go-tpm-tools v0.4.9
+	github.com/quic-go/quic-go v0.60.0
 	github.com/spf13/cobra v1.10.2
-	github.com/tetratelabs/wazero v1.11.0
 )
 
 require (
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
-	github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260528170158-db25840c8cf6 // indirect
-	github.com/containerd/containerd v1.7.32 // indirect
+	github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260610210717-9bae6bf9becc // indirect
 	github.com/google/go-configfs-tsm v0.3.3 // indirect
 	github.com/google/go-eventlog v0.0.3-0.20260520195024-af9e78c4d692 // indirect
 	github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d // indirect
@@ -25,9 +23,9 @@ require (
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.52.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/crypto v0.53.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )

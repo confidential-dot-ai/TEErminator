@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/lunal-dev/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/config"
 )
 
 // ErrNotImplemented is returned by flows that are defined but not yet wired up.
