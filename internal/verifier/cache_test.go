@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lunal-dev/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/config"
 )
 
 func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {

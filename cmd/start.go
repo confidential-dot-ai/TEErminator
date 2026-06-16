@@ -7,8 +7,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lunal-dev/TEErminator/internal/config"
-	"github.com/lunal-dev/TEErminator/internal/proxy"
+	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/proxy"
 	"github.com/spf13/cobra"
 )
 

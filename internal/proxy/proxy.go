@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lunal-dev/TEErminator/internal/config"
-	"github.com/lunal-dev/TEErminator/internal/verifier"
+	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 	"github.com/quic-go/quic-go/http3"
 )
 
