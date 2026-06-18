@@ -31,7 +31,15 @@ $ ./teerminator remote rm <common-name>
 In particular it is meant to support Confidential.ai stack and its confidential Kubernetes, C8s, which uses a ceritficate-backed attestation flow tha     t abstracts away attestation verification form the end processes.
 And the command `remote remove` or `remote rm` allows you to delete a remote.
 
-For certificate-backed attestations, you might have to trust custom certificate authorities, especially when testing using localhost certs that might having been created using mkcert.
+For certificate-backed attestations, you might have to trust custom certificate authorities, especially when testing using localhost certs that might having been created using mkcert. Certificates added with `certs add` are appended to the system trust store and used as **upstream** TLS trust anchors for every remote, so a backend served by a private CA (e.g. a c8s mesh CA) verifies.
+
+When the upstream's certificate does not match the host you dial — for example a LoadBalancer reached by **raw IP** whose cert only carries an internal DNS SAN like `c8s-tls-lb.c8s-system.svc` — pass `--server-name` on `remote add` to validate the certificate against that name (like `curl --resolve <name>:<port>:<ip>`); the connection still dials the URL host:
+
+```
+$ ./teerminator certs add ./mesh-ca.pem
+$ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
+    --mode tls-header --server-name c8s-tls-lb.c8s-system.svc --measurements <hex,...>
+```
 ```
 $ ./terminator certs add <CA PEM File>
 $ ./terminator certs

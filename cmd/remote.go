@@ -21,6 +21,7 @@ var (
 	remoteAddMode         string
 	remoteAddMeasurements []string
 	remoteAddDiscoveryURL string
+	remoteAddServerName   string
 )
 
 var remoteAddCmd = &cobra.Command{
@@ -48,6 +49,7 @@ var remoteAddCmd = &cobra.Command{
 			Mode:         config.AttestMode(remoteAddMode),
 			Measurements: remoteAddMeasurements,
 			DiscoveryURL: remoteAddDiscoveryURL,
+			ServerName:   remoteAddServerName,
 		}
 		if err := cfg.AddRemote(r); err != nil {
 			return err
@@ -70,6 +72,7 @@ func init() {
 	f.StringVar(&remoteAddMode, "mode", "", "attestation mode: tls-header (Flow A), attest (Flow B), cds-cert (Flow C), or empty to disable")
 	f.StringSliceVar(&remoteAddMeasurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated")
 	f.StringVar(&remoteAddDiscoveryURL, "discovery-url", "", "discovery base URL for Flow B/C (e.g. https://host/.well-known/c8s/)")
+	f.StringVar(&remoteAddServerName, "server-name", "", "TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Pair with `teerminator certs add <ca.pem>` to trust the issuing CA")
 }
 
 var remoteAuthCmd = &cobra.Command{

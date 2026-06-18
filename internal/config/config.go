@@ -58,8 +58,16 @@ type Remote struct {
 	Token        string      `json:"token,omitempty"`
 	Mode         AttestMode  `json:"mode,omitempty"`
 	DiscoveryURL string      `json:"discovery_url,omitempty"`
-	Measurements []string    `json:"measurements,omitempty"` // accepted hex launch digests
-	Pin          *CertPin    `json:"pin,omitempty"`
+	// ServerName overrides the TLS SNI / certificate name the upstream is
+	// validated against, for when the --remote host has no matching SAN — e.g.
+	// a LoadBalancer reached by raw IP whose cert only carries an internal DNS
+	// SAN (`c8s-tls-lb.c8s-system.svc`). The connection still dials the URL host;
+	// only the certificate identity is checked against this name (like
+	// `curl --resolve <name>:<port>:<ip>`). Pair with a `certs add <ca.pem>`
+	// trust anchor so the chain also verifies.
+	ServerName   string   `json:"server_name,omitempty"`
+	Measurements []string `json:"measurements,omitempty"` // accepted hex launch digests
+	Pin          *CertPin `json:"pin,omitempty"`
 }
 
 // ValidAttestMode reports whether s is a recognised attestation mode.
