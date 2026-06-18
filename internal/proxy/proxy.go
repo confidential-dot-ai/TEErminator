@@ -31,6 +31,11 @@ type Options struct {
 	// ReattestInterval is how long a successful verdict is reused before the next
 	// request re-attests. Zero means re-verify on every request.
 	ReattestInterval time.Duration
+	// ExtraCAs are additional trust anchors (from `certs add`) appended to the
+	// system roots when validating the upstream TLS certificate. This is what
+	// lets TEErminator front a backend served by a private CA (e.g. a c8s mesh
+	// CA) instead of a publicly-trusted one.
+	ExtraCAs []config.Cert
 }
 
 // Tunnel is a running HTTP reverse proxy that forwards requests to a remote host.
@@ -159,8 +164,30 @@ type h3Transport struct {
 }
 
 func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
+	// Validate the upstream cert against the configured ServerName when set,
+	// otherwise the URL host. The override covers backends reached by an IP (or
+	// any name) whose certificate only carries a different SAN.
+	serverName := target.Hostname()
+	if opts.Remote.ServerName != "" {
+		serverName = opts.Remote.ServerName
+	}
 	tlsCfg := &tls.Config{
-		ServerName: target.Hostname(),
+		ServerName: serverName,
+	}
+	// Append any operator-added CAs (`certs add`) to the system trust store so a
+	// privately-issued upstream cert (e.g. c8s mesh CA) verifies. With no extra
+	// CAs, RootCAs stays nil and the system roots are used unchanged.
+	if len(opts.ExtraCAs) > 0 {
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		for _, c := range opts.ExtraCAs {
+			if !pool.AppendCertsFromPEM([]byte(c.PEM)) {
+				return nil, fmt.Errorf("trust store: failed to parse stored CA %q", c.CommonName)
+			}
+		}
+		tlsCfg.RootCAs = pool
 	}
 
 	vf, err := verifier.For(opts.Remote.Mode)

@@ -7,6 +7,13 @@
       minute (`internal/verifier/cache.go`) so long-lived TLS sessions are not
       re-attested on every request — the TLS channel carries the guarantee between
       periodic freshness checks.
+- [x] Trust custom upstream CAs and override the validated TLS name. Certs added
+      with `certs add` are appended to the system roots and used as upstream trust
+      anchors (`internal/proxy/proxy.go`, `Options.ExtraCAs`), and `remote add
+      --server-name <name>` validates the upstream cert against `<name>` while
+      still dialing the URL host — so a backend reached by raw IP whose cert only
+      carries an internal DNS SAN (e.g. a c8s LB serving `c8s-tls-lb.c8s-system.svc`)
+      now connects instead of failing `x509: ... doesn't contain any IP SANs`.
 - [ ] Support /attest remote endpoints (Flow B) and `/cds-cert` pinning (Flow C).
       Config model (`Mode`, `Measurements`, `DiscoveryURL`, `Pin`) and the Verifier
       dispatch are in place; each tunnel enforces its own remote's mode, so backends

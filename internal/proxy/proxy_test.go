@@ -2,8 +2,16 @@ package proxy
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -545,5 +553,96 @@ func TestInvalidRemoteURL(t *testing.T) {
 	_, err := Start(ctx, "127.0.0.1:0", "://bad-url", "")
 	if err == nil {
 		t.Fatal("expected error for invalid remote URL, got nil")
+	}
+}
+
+// selfSignedCert makes a self-signed cert (also usable as its own CA) whose only
+// SAN is dnsName — deliberately no IP SAN.
+func selfSignedCert(t *testing.T, dnsName string) (certPEM, keyPEM []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: dnsName},
+		DNSNames:              []string{dnsName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return certPEM, keyPEM
+}
+
+// TestUpstreamServerNameAndCustomCA covers an upstream (like a c8s LB reached by
+// public IP) whose cert is issued by a private CA and whose SAN is an internal
+// DNS name with no IP. The Remote.ServerName override + ExtraCAs trust anchor must
+// let it connect; without either, TLS validation must fail closed.
+func TestUpstreamServerNameAndCustomCA(t *testing.T) {
+	const sanName = "c8s-tls-lb.c8s-system.svc"
+	certPEM, keyPEM := selfSignedCert(t, sanName)
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "tls-ok")
+	}))
+	backend.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	backend.StartTLS()
+	defer backend.Close()
+
+	target, err := url.Parse(backend.URL) // https://127.0.0.1:PORT — host has no matching SAN
+	if err != nil {
+		t.Fatal(err)
+	}
+	extraCAs := []config.Cert{{CommonName: sanName, PEM: string(certPEM)}}
+
+	roundTrip := func(opts Options) error {
+		tr, err := newH3Transport(target, opts)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tr.Close() }()
+		req, _ := http.NewRequest("GET", backend.URL, nil)
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		if got := string(body); got != "tls-ok" {
+			return fmt.Errorf("body = %q, want tls-ok", got)
+		}
+		return nil
+	}
+
+	// CA trusted + ServerName overridden -> connects.
+	if err := roundTrip(Options{ExtraCAs: extraCAs, Remote: config.Remote{ServerName: sanName}}); err != nil {
+		t.Fatalf("CA + server-name should connect: %v", err)
+	}
+	// No ServerName override -> validated against the dial host (127.0.0.1), which
+	// the cert does not cover -> fails closed.
+	if err := roundTrip(Options{ExtraCAs: extraCAs}); err == nil {
+		t.Error("expected TLS failure without --server-name (cert has no IP SAN)")
+	}
+	// ServerName overridden but CA not trusted -> fails closed.
+	if err := roundTrip(Options{Remote: config.Remote{ServerName: sanName}}); err == nil {
+		t.Error("expected TLS failure without trusting the custom CA")
 	}
 }

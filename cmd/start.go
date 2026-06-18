@@ -43,6 +43,9 @@ var startCmd = &cobra.Command{
 				// Re-attest at most once per minute on a long-lived session; the
 				// TLS channel carries the guarantee between checks.
 				ReattestInterval: reattestInterval,
+				// Operator-added CAs (`certs add`) become upstream trust anchors,
+				// so a backend served by a private CA (e.g. a c8s mesh CA) verifies.
+				ExtraCAs: cfg.Certs,
 			})
 			if err != nil {
 				// Stop already-started tunnels before returning.
