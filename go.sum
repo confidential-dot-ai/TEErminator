@@ -2,8 +2,8 @@ cloud.google.com/go/compute/metadata v0.9.0 h1:pDUj4QMoPejqq20dK0Pg2N4yG9zIkYGdB
 cloud.google.com/go/compute/metadata v0.9.0/go.mod h1:E0bWwX5wTnLPedCKqk3pJmVgCBSM6qQI1yTBdEb3C10=
 github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260610210717-9bae6bf9becc h1:4G3D93Yu/tGTlEa+rXtl7rvXCOjV+8ffs2QhUCuBWrY=
 github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260610210717-9bae6bf9becc/go.mod h1:yKXtlqIj7IL5snfNlXr91iw2BNRhV5fhVHZixd87Fzg=
-github.com/confidential-dot-ai/attestation-go v0.0.0-20260616143317-8d6c740bb068 h1:YTd55S+RL5lEOs6sO+C3rSwWJNXXqUKlkLKlkkMaNlI=
-github.com/confidential-dot-ai/attestation-go v0.0.0-20260616143317-8d6c740bb068/go.mod h1:uyOWyll/MLT99hHUUGS2BHE+wCNWFNGs87abM4Lnm24=
+github.com/confidential-dot-ai/attestation-go v0.0.0-20260618154338-31fa14f0e911 h1:xrGvE1i4U5ZuEDnSPkZvnyeFCeT3zQTcAddbJUWDLAs=
+github.com/confidential-dot-ai/attestation-go v0.0.0-20260618154338-31fa14f0e911/go.mod h1:moA9phtAbLTFbU9OlVg+6fHkR6wzGW5qdxP7Yxdos5U=
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
