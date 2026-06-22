@@ -2,6 +2,8 @@ cloud.google.com/go/compute/metadata v0.9.0 h1:pDUj4QMoPejqq20dK0Pg2N4yG9zIkYGdB
 cloud.google.com/go/compute/metadata v0.9.0/go.mod h1:E0bWwX5wTnLPedCKqk3pJmVgCBSM6qQI1yTBdEb3C10=
 github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260610210717-9bae6bf9becc h1:4G3D93Yu/tGTlEa+rXtl7rvXCOjV+8ffs2QhUCuBWrY=
 github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260610210717-9bae6bf9becc/go.mod h1:yKXtlqIj7IL5snfNlXr91iw2BNRhV5fhVHZixd87Fzg=
+github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260617215616-d522e41e9e74 h1:QJh2RbDtv1tPKm9PTtlzUP394Wi6Gm9gebrDcitLWho=
+github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260617215616-d522e41e9e74/go.mod h1:07jta9kodtzgHx670Bj6y9zaXlv3zapamb7XxZEuDpg=
 github.com/confidential-dot-ai/attestation-go v0.0.0-20260618154338-31fa14f0e911 h1:xrGvE1i4U5ZuEDnSPkZvnyeFCeT3zQTcAddbJUWDLAs=
 github.com/confidential-dot-ai/attestation-go v0.0.0-20260618154338-31fa14f0e911/go.mod h1:moA9phtAbLTFbU9OlVg+6fHkR6wzGW5qdxP7Yxdos5U=
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
@@ -17,6 +19,8 @@ github.com/google/go-configfs-tsm v0.3.3 h1:8mrlZLYrFFxyc8PFpT1piBUFDEYBVsBjAkFC
 github.com/google/go-configfs-tsm v0.3.3/go.mod h1:in2lmJDGaYEiPOJY4vlq4lGXjkR/GcxN1k7o5oR2qn0=
 github.com/google/go-eventlog v0.0.3-0.20260520195024-af9e78c4d692 h1:7QsnKgT0iaZF7uMsPfAkHsyfpKBz57/SkDfVRj5cQgo=
 github.com/google/go-eventlog v0.0.3-0.20260520195024-af9e78c4d692/go.mod h1:7huE5P8w2NTObSwSJjboHmB7ioBNblkijdzoVa2skfQ=
+github.com/google/go-eventlog v0.0.3-0.20260617163629-883cc5652c69 h1:vW9PSMcZvz7XqNdndKzk5TmsZcD/i5Z1EmxUHMMAmqk=
+github.com/google/go-eventlog v0.0.3-0.20260617163629-883cc5652c69/go.mod h1:7huE5P8w2NTObSwSJjboHmB7ioBNblkijdzoVa2skfQ=
 github.com/google/go-sev-guest v0.15.0 h1:Xzfut5mbhcVb7TyPiyc5PolLUzdai7VH3QpyvXwcW9Y=
 github.com/google/go-sev-guest v0.15.0/go.mod h1:SK9vW+uyfuzYdVN0m8BShL3OQCtXZe/JPF7ZkpD3760=
 github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d h1:Ff8goEP/ue2/rZT5qyoRicuySCYDbAXEZS8Cf1fgsUo=
