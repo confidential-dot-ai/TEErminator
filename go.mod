@@ -11,9 +11,9 @@ require (
 
 require (
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
-	github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260610210717-9bae6bf9becc // indirect
+	github.com/GoogleCloudPlatform/confidential-space/server v0.0.0-20260617215616-d522e41e9e74 // indirect
 	github.com/google/go-configfs-tsm v0.3.3 // indirect
-	github.com/google/go-eventlog v0.0.3-0.20260520195024-af9e78c4d692 // indirect
+	github.com/google/go-eventlog v0.0.3-0.20260617163629-883cc5652c69 // indirect
 	github.com/google/go-sev-guest v0.15.0 // indirect
 	github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
