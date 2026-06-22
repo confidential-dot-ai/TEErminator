@@ -44,8 +44,8 @@ func newStartCmd(name string, opts StartOptions) *cobra.Command {
 
 	return &cobra.Command{
 		Use:   "start",
-		Short: "Start the TEErminator proxy daemon",
-		Long:  `Start the TEErminator proxy daemon, binding local ports and forwarding traffic to configured remote TEE endpoints.`,
+		Short: "Start the verifying proxy daemon",
+		Long:  `Start the verifying proxy daemon, binding local ports and forwarding traffic to configured remote TEE endpoints and only accepting attested responses.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load()
 			if err != nil {
@@ -84,7 +84,7 @@ func newStartCmd(name string, opts StartOptions) *cobra.Command {
 				fmt.Fprintf(out, "Listening on %s -> %s\n", r.Local, r.Remote)
 			}
 
-			fmt.Fprintln(out, "TEErminator running. Press Ctrl+C to stop.")
+			fmt.Fprintln(out, "verifying proxy running. Press Ctrl+C to stop.")
 			<-ctx.Done()
 
 			fmt.Fprintln(out, "\nShutting down...")
