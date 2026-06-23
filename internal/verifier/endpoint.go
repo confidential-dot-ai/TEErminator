@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 
@@ -109,7 +110,11 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	if err != nil {
 		return nil, fmt.Errorf("flow B: fetch attestation: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Error("error closing response Body", "error", err)
+		}
+	}()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("flow B: attestation endpoint returned %d: %s", resp.StatusCode, body)
