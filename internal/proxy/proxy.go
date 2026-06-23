@@ -3,6 +3,8 @@ package proxy
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -155,7 +157,8 @@ type h3Transport struct {
 
 	// attestation enforcement (per-remote, independent of other tunnels)
 	remote    config.Remote
-	vf        verifier.Verifier
+	vf        verifier.Verifier         // Flow A: passive response-header verifier
+	ea        *verifier.EndpointAttester // Flow B: active session-start attester
 	cache     *verifier.SessionCache
 	remoteKey string
 
@@ -190,13 +193,36 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 		tlsCfg.RootCAs = pool
 	}
 
-	vf, err := verifier.For(opts.Remote.Mode)
-	if err != nil {
-		return nil, err
-	}
-	var cache *verifier.SessionCache
-	if vf != nil {
+	var (
+		vf    verifier.Verifier
+		ea    *verifier.EndpointAttester
+		cache *verifier.SessionCache
+	)
+	switch opts.Remote.Mode {
+	case config.AttestEndpoint:
+		// Flow B fetches the attestation bundle itself, over the same TLS trust
+		// the proxy uses for the upstream, so the leaf it observes (and binds to)
+		// is the one forwarded traffic rides.
+		attestClient := &http.Client{
+			Transport: &http.Transport{TLSClientConfig: tlsCfg.Clone()},
+			Timeout:   30 * time.Second,
+		}
+		baseURL := target.Scheme + "://" + target.Host
+		var err error
+		ea, err = verifier.NewEndpointAttester(baseURL, attestClient, opts.Remote, tlsCfg.RootCAs)
+		if err != nil {
+			return nil, err
+		}
 		cache = verifier.NewSessionCache(opts.ReattestInterval)
+	default:
+		var err error
+		vf, err = verifier.For(opts.Remote.Mode)
+		if err != nil {
+			return nil, err
+		}
+		if vf != nil {
+			cache = verifier.NewSessionCache(opts.ReattestInterval)
+		}
 	}
 
 	return &h3Transport{
@@ -211,6 +237,7 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 		},
 		remote:    opts.Remote,
 		vf:        vf,
+		ea:        ea,
 		cache:     cache,
 		remoteKey: target.Host,
 		noH3:      make(map[string]bool),
@@ -231,6 +258,10 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 //     unverified.
 func (t *h3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Host
+
+	if t.ea != nil {
+		return t.roundTripEndpoint(req, host)
+	}
 
 	if t.vf == nil {
 		return t.roundTripLegacy(req, host)
@@ -321,6 +352,61 @@ func (t *h3Transport) roundTripLegacy(req *http.Request, host string) (*http.Res
 		}
 	}
 	return resp, err
+}
+
+// roundTripEndpoint is the Flow B (AttestEndpoint) path: attest the session
+// against the LB's /.well-known/c8s/attestation endpoint at session start, then
+// forward over the validated upstream TLS. The verdict is scoped to the attested
+// LB leaf (TLS-session scoped TEE binding): forwarded traffic must run on a
+// connection presenting the same leaf, otherwise the session re-attests.
+func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.Response, error) {
+	spki, fresh, ok := t.cache.FreshSession(t.remoteKey)
+	if fresh && !ok {
+		return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
+	}
+	if !fresh {
+		v, err := t.ea.Attest(req.Context())
+		var pinned [32]byte
+		if v != nil {
+			pinned = v.LeafSPKI
+		}
+		t.cache.RecordSession(t.remoteKey, err == nil, pinned, err)
+		if err != nil {
+			slog.Warn("attestation verification failed; refusing to forward",
+				"mode", t.remote.Mode, "url", req.URL.String(), "error", err)
+			return nil, fmt.Errorf("attestation verification failed for %s: %w", host, err)
+		}
+		slog.Info("attestation verified", "mode", t.remote.Mode, "url", req.URL.String(), "measurement", v.Measurement)
+		spki = pinned
+	}
+
+	// Forward over the fallback transport (HTTP/1.1 or H2) so resp.TLS reliably
+	// carries the peer leaf we pin against; Flow B does not use HTTP/3.
+	resp, err := t.fallback.RoundTrip(req)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+
+	// Pin: the serving connection must present the attested LB leaf. A swapped or
+	// rotated upstream leaf forces re-attestation rather than silent reuse.
+	if !sessionLeafMatches(resp, spki) {
+		_ = resp.Body.Close()
+		t.cache.Invalidate(t.remoteKey)
+		slog.Warn("upstream TLS leaf changed since attestation; dropping response",
+			"mode", t.remote.Mode, "url", req.URL.String())
+		return nil, fmt.Errorf("attestation binding broken for %s: upstream TLS leaf changed (re-attest required)", host)
+	}
+	return resp, nil
+}
+
+// sessionLeafMatches reports whether the response's TLS peer leaf SPKI equals the
+// attested one (constant-time).
+func sessionLeafMatches(resp *http.Response, want [32]byte) bool {
+	if resp.TLS == nil || len(resp.TLS.PeerCertificates) == 0 {
+		return false
+	}
+	got := sha256.Sum256(resp.TLS.PeerCertificates[0].RawSubjectPublicKeyInfo)
+	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
 // peerCerts returns the verified TLS peer chain from a response, if any.

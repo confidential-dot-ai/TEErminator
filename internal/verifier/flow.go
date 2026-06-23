@@ -46,7 +46,10 @@ func For(mode config.AttestMode) (Verifier, error) {
 	case config.AttestTLSHeader:
 		return tlsHeaderVerifier{}, nil
 	case config.AttestEndpoint:
-		return notImplemented{"attest"}, nil
+		// Flow B is not a passive response verifier: it actively fetches a fresh
+		// attestation bundle at session start. The proxy builds it via
+		// NewEndpointAttester, so For is never called for this mode.
+		return nil, fmt.Errorf("attestation mode %q is served by the endpoint attester, not For", mode)
 	case config.AttestCDSCert:
 		return notImplemented{"cds-cert"}, nil
 	default:
