@@ -20,6 +20,7 @@ import (
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
 	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
 
@@ -228,6 +229,10 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 	return &h3Transport{
 		h3: &http3.Transport{
 			TLSClientConfig: tlsCfg,
+			// Cap the QUIC handshake so an upstream that doesn't speak HTTP/3
+			// (no UDP listener) fails fast and falls back to TCP, instead of
+			// blocking forwarding for the full default ~5s handshake timeout.
+			QUICConfig: &quic.Config{HandshakeIdleTimeout: 2 * time.Second},
 		},
 		fallback: &http.Transport{
 			TLSClientConfig:   tlsCfg.Clone(),
