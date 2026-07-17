@@ -68,17 +68,18 @@ const NonceHeader = "X-Attestation-Nonce"
 // is bound to, so the client can confirm it matches the TLS peer cert.
 const CertFingerprintHeader = "X-Attestation-Cert-SHA256"
 
-// tlsHeaderVerifier implements Flow A: verify the SNP evidence in the response
+// tlsHeaderVerifier implements Flow A: verify the TEE evidence in the response
 // header, enforce the measurement allowlist, and bind the verdict to the client
 // nonce so a replayed report from a previous session is rejected.
 //
-// Two nonce bindings are accepted, covering both SNP attestation shapes:
+// Both Azure vTPM platforms are accepted so one tls-header remote can be backed
+// by either an SEV-SNP or an Intel TDX confidential VM:
 //   - Direct (bare-metal SEV-SNP): the hardware report_data carries the nonce,
 //     checked by reportDataBindsNonce.
-//   - vTPM (Azure az-snp CVM): the hardware report_data binds the vTPM AK, and
-//     the nonce rides in an AK-signed TPM quote (evidence.tpm_quote). The
-//     report_data->AK->quote->nonce chain is checked by the shared
-//     attestation-go verifier (azsnp.Result.VerifyVTPMFreshness).
+//   - vTPM (Azure az-snp / az-tdx CVM): the hardware report_data binds the vTPM
+//     AK, and the nonce rides in an AK-signed TPM quote (evidence.tpm_quote).
+//     The report_data->AK->quote->nonce chain is checked by the shared
+//     attestation-go verifier (VerifyAzVTPM -> {azsnp,aztdx}.VerifyVTPMFreshness).
 type tlsHeaderVerifier struct{}
 
 func (tlsHeaderVerifier) Verify(in Input) (*Result, error) {
@@ -90,7 +91,7 @@ func (tlsHeaderVerifier) Verify(in Input) (*Result, error) {
 		return nil, fmt.Errorf("flow A: response is missing the %s header", AttestationHeader)
 	}
 
-	res, err := VerifyAzSnp([]byte(raw))
+	res, err := VerifyAzVTPM([]byte(raw))
 	if err != nil {
 		return nil, fmt.Errorf("flow A: %w", err)
 	}
@@ -100,18 +101,19 @@ func (tlsHeaderVerifier) Verify(in Input) (*Result, error) {
 	}
 
 	// Freshness: the client nonce must be bound into the evidence. Accept either
-	// SNP attestation shape so one tls-header remote can be backed by bare-metal
-	// SNP or an Azure CVM.
+	// attestation shape so one tls-header remote can be backed by bare-metal SNP
+	// or an Azure CVM (az-snp or az-tdx).
 	if len(in.Nonce) > 0 {
 		switch {
 		case reportDataBindsNonce(res.ReportData, in.Nonce):
 			// Direct binding (bare-metal SEV-SNP): the hardware report_data
 			// carries the nonce (raw prefix or SHA-384 digest).
-		case res.TPMQuote != nil:
-			// vTPM binding (Azure az-snp): the nonce lives in the AK-signed TPM
-			// quote because the hardware report_data binds the AK, not the nonce.
+		case res.HasTPMQuote:
+			// vTPM binding (Azure az-snp / az-tdx): the nonce lives in the
+			// AK-signed TPM quote because the hardware report_data binds the AK,
+			// not the nonce.
 			if err := res.VerifyVTPMFreshness(in.Nonce); err != nil {
-				return nil, fmt.Errorf("flow A (az-snp vTPM): %w", err)
+				return nil, fmt.Errorf("flow A (%s vTPM): %w", res.Platform, err)
 			}
 		default:
 			return nil, fmt.Errorf("flow A: report_data does not bind the request nonce and no vTPM quote is present (stale or replayed evidence)")
@@ -149,7 +151,7 @@ func checkMeasurement(measurement string, allowed []string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("flow A: launch measurement %s is not in the allowlist", measurement)
+	return fmt.Errorf("launch measurement %s is not in the allowlist", measurement)
 }
 
 type notImplemented struct{ mode string }

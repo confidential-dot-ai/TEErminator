@@ -16,7 +16,6 @@ import (
 	"net/url"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
-	"github.com/confidential-dot-ai/attestation-go/attestation/azsnp"
 )
 
 // Flow B (config.AttestEndpoint, "attest") performs the same challenge/response
@@ -159,11 +158,11 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 }
 
 // verifyEndpointEvidence verifies the hardware evidence and that report_data
-// binds expectedReportData. Today only az-snp (Azure node-as-CVM) is wired in Go
-// here; bare-metal snp Flow B is a known gap (use the c8s-verify-js client).
+// binds expectedReportData. Both Azure vTPM platforms (az-snp and az-tdx) are
+// wired; bare-metal snp Flow B is a known gap (use the c8s-verify-js client).
 func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte) (string, error) {
 	switch b.Platform {
-	case "az-snp":
+	case "az-snp", "az-tdx":
 		raw, err := json.Marshal(struct {
 			Platform string          `json:"platform"`
 			Evidence json.RawMessage `json:"evidence"`
@@ -171,19 +170,21 @@ func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte) (str
 		if err != nil {
 			return "", fmt.Errorf("flow B: re-encode evidence: %w", err)
 		}
-		res, err := azsnp.Verify(raw) // SNP report signature + VCEK chain + measurement
+		// Hardware layer (SNP report + VCEK, or TD quote + Intel DCAP) via the
+		// shared attestation-go verifier, dispatched on the platform.
+		res, err := VerifyAzVTPM(raw)
 		if err != nil {
-			return "", fmt.Errorf("flow B (az-snp): %w", err)
+			return "", fmt.Errorf("flow B (%s): %w", b.Platform, err)
 		}
 		// Bind freshness + the serving leaf: the AK-signed vTPM quote's extraData
 		// must equal expectedReportData. Same chain Flow A verifies, but the anchor
 		// is SHA-384(leaf_spki || nonce) rather than a bare nonce.
 		if err := res.VerifyVTPMFreshness(expectedReportData); err != nil {
-			return "", fmt.Errorf("flow B (az-snp vTPM): %w", err)
+			return "", fmt.Errorf("flow B (%s vTPM): %w", b.Platform, err)
 		}
 		return res.Measurement, nil
 	case "snp":
-		return "", fmt.Errorf("flow B: bare-metal snp is not yet supported by TEErminator; use the c8s-verify-js client (az-snp is supported)")
+		return "", fmt.Errorf("flow B: bare-metal snp is not yet supported by TEErminator; use the c8s-verify-js client (az-snp and az-tdx are supported)")
 	default:
 		return "", fmt.Errorf("flow B: unsupported platform %q", b.Platform)
 	}
