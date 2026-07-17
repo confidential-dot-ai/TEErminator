@@ -31,15 +31,15 @@ type AttestMode string
 const (
 	// AttestNone disables attestation verification (current default behaviour).
 	AttestNone AttestMode = ""
-	// AttestEndpoint (Flow B) fetches a fresh attestation from a dedicated
-	// endpoint at session start and pins the session to the attested TLS leaf.
+	// AttestEndpoint fetches a fresh attestation from a dedicated endpoint at
+	// session start and pins the session to the attested TLS leaf.
 	AttestEndpoint AttestMode = "attest"
-	// AttestCDSCert (Flow C) fetches and pins the CDS cert before trusting the
+	// AttestCDSCert fetches and pins the CDS cert before trusting the
 	// connection.
 	AttestCDSCert AttestMode = "cds-cert"
 )
 
-// CertPin records a certificate pinned by a Flow C bootstrap so later sessions
+// CertPin records a certificate pinned by a cds-cert bootstrap so later sessions
 // trust the same cert without re-fetching.
 type CertPin struct {
 	SHA256   string `json:"sha256"`

@@ -1,6 +1,6 @@
 - [x] Live `status` command: every configured remote is checked at invocation
       time over the same upstream TLS trust the proxy uses
-      (`internal/proxy/check.go`) — `attest` remotes run the full Flow B
+      (`internal/proxy/check.go`) — `attest` remotes run the full
       session attestation (Verified/Failed, with the measurement or failure
       reason printed below the table), unattested remotes are probed for
       reachability (Untrusted/Failed), unimplemented modes report Failed. The
@@ -16,7 +16,7 @@
       still dialing the URL host — so a backend reached by raw IP whose cert only
       carries an internal DNS SAN (e.g. a c8s LB serving `c8s-tls-lb.c8s-system.svc`)
       now connects instead of failing `x509: ... doesn't contain any IP SANs`.
-- [x] Support /attest remote endpoints (Flow B): `remote add --mode attest`
+- [x] Support /attest remote endpoints: `remote add --mode attest`
       performs the session-start challenge/response against the LB's
       `/.well-known/c8s/attestation` endpoint (tls-cert binding, `pq=false`),
       verifies `report_data == SHA-384(serving_leaf_spki || nonce)`, and pins
@@ -25,10 +25,10 @@
       `attestation-go`'s `teeverify` dispatcher, so every platform it supports
       (snp, az-snp, tdx, az-tdx, gcp-snp, gcp-tdx) is accepted; TEErminator only
       computes the binding anchor and enforces the measurement allowlist.
-- [ ] Support `/cds-cert` pinning (Flow C). Config model (`Mode`, `Measurements`,
+- [ ] Support `/cds-cert` pinning. Config model (`Mode`, `Measurements`,
       `DiscoveryURL`, `Pin`) is in place; configuring the mode blocks every
       request before it reaches the backend (fail closed) rather than forwarding
-      unverified. The Flow C HTTP client + `remote pin` CLI are the remaining
+      unverified. The cds-cert HTTP client + `remote pin` CLI are the remaining
       work. The browser client (`c8s-verify-js`) already implements the
       equivalent over the c8s LB `/.well-known/c8s/*` endpoints, so the wire
       contract is settled (see `c8s-verify-js/PROTOCOL.md`).

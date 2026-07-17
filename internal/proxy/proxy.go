@@ -156,7 +156,7 @@ type h3Transport struct {
 
 	// attestation enforcement (per-remote, independent of other tunnels)
 	remote    config.Remote
-	ea        *verifier.EndpointAttester // Flow B: active session-start attester
+	ea        *verifier.EndpointAttester // attest mode: active session-start attester
 	blocked   error                      // set for recognised-but-unimplemented modes: fail closed without forwarding
 	cache     *verifier.SessionCache
 	remoteKey string
@@ -210,7 +210,7 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 	case config.AttestNone:
 		// No attestation: plain forwarding.
 	case config.AttestEndpoint:
-		// Flow B fetches the attestation bundle itself, over the same TLS trust
+		// The endpoint attester fetches the attestation bundle itself, over the same TLS trust
 		// the proxy uses for the upstream, so the leaf it observes (and binds to)
 		// is the one forwarded traffic rides.
 		attestClient := &http.Client{
@@ -263,7 +263,7 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 //
 // Attestation handling is driven entirely by this remote's configured Mode:
 //   - AttestNone: forward without attestation.
-//   - AttestEndpoint (Flow B): attest the session against the remote's
+//   - AttestEndpoint: attest the session against the remote's
 //     attestation endpoint before forwarding, and pin traffic to the attested
 //     TLS leaf.
 //   - any recognised-but-unimplemented mode: fail closed without ever
@@ -306,7 +306,7 @@ func (t *h3Transport) do(req *http.Request, host string) (*http.Response, error)
 	return resp, err
 }
 
-// roundTripEndpoint is the Flow B (AttestEndpoint) path: attest the session
+// roundTripEndpoint is the AttestEndpoint path: attest the session
 // against the LB's /.well-known/c8s/attestation endpoint at session start, then
 // forward over the validated upstream TLS. The verdict is scoped to the attested
 // LB leaf (TLS-session scoped TEE binding): forwarded traffic must run on a
@@ -333,7 +333,7 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	}
 
 	// Forward over the fallback transport (HTTP/1.1 or H2) so resp.TLS reliably
-	// carries the peer leaf we pin against; Flow B does not use HTTP/3.
+	// carries the peer leaf we pin against; attested sessions do not use HTTP/3.
 	resp, err := t.fallback.RoundTrip(req)
 	if err != nil || resp == nil {
 		return resp, err

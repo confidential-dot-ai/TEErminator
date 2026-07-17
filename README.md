@@ -50,7 +50,7 @@ $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
 
 `--mode` selects how each remote is verified:
 
-- **`attest` (Flow B)** — the same challenge/response attestation the `c8s-verify-js`
+- **`attest`** — the same challenge/response attestation the `c8s-verify-js`
   browser client performs, against the LB's `/.well-known/c8s/attestation` endpoint, but
   riding the validated upstream TLS instead of the post-quantum tunnel. At session start
   TEErminator fetches a fresh, nonce-bound bundle (requesting the LB's **tls-cert binding**,
@@ -64,11 +64,11 @@ $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
   verifier (`teeverify`), so every platform it supports works here: bare-metal/GCP SNP
   (binding in `report_data`), Azure az-snp (binding in the AK-signed vTPM quote), and the
   TDX variants.
-- **`cds-cert` (Flow C)** — planned CDS-cert pinning flow; configuring it today fails
+- **`cds-cert`** — planned CDS-cert pinning; configuring it today fails
   closed (requests are blocked before reaching the backend).
 
 ```
-# Flow B against an Azure node-as-CVM LB:
+# Endpoint attestation against an Azure node-as-CVM LB:
 $ ./teerminator certs add ./mesh-ca.pem
 $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
     --mode attest --server-name c8s-tls-lb.c8s-system.svc --measurements <hex,...>

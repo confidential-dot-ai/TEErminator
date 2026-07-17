@@ -26,9 +26,10 @@ import (
 // yet wired up; the proxy fails closed on them instead of forwarding.
 var ErrNotImplemented = errors.New("attestation flow not implemented")
 
-// Flow B (config.AttestEndpoint, "attest") performs the same challenge/response
-// attestation as the c8s-verify-js browser client, but instead of establishing
-// the post-quantum over-encryption tunnel it rides the mesh-CA-validated upstream
+// Endpoint attestation (config.AttestEndpoint, "attest") performs the same
+// challenge/response attestation as the c8s-verify-js browser client, but
+// instead of establishing the post-quantum over-encryption tunnel it rides the
+// mesh-CA-validated upstream
 // TLS connection. To make that binding cryptographic rather than trust-on-first
 // connection, it requests the LB's tls-cert binding (pq=false): the hardware
 // report_data commits to the LB serving leaf's SPKI, which the proxy then pins
@@ -43,7 +44,7 @@ const wellKnownAttestation = "/.well-known/c8s/attestation"
 // report_data to its serving-leaf SPKI rather than a per-session key.
 const bindingTLSCert = "tls-cert"
 
-// SessionVerdict is the outcome of a Flow B session attestation. LeafSPKI is the
+// SessionVerdict is the outcome of a session attestation. LeafSPKI is the
 // SHA-256 of the LB serving leaf's SubjectPublicKeyInfo that the attestation was
 // bound to; the transport pins forwarded requests to a connection presenting the
 // same leaf and re-attests otherwise.
@@ -62,7 +63,7 @@ type attestationBundle struct {
 	Binding  string          `json:"binding"`
 }
 
-// EndpointAttester implements Flow B. baseURL is the LB origin (scheme://host);
+// EndpointAttester implements the attest mode. baseURL is the LB origin (scheme://host);
 // client must carry the same TLS trust the proxy uses for the upstream (pinned
 // mesh CA + ServerName), so the leaf it observes is the one the proxy forwards
 // over. pinnedRoots is that mesh-CA trust anchor, required: without it the LB's
@@ -74,11 +75,11 @@ type EndpointAttester struct {
 	pinnedRoots *x509.CertPool
 }
 
-// NewEndpointAttester builds a Flow B attester.
+// NewEndpointAttester builds an endpoint attester.
 func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remote, pinnedRoots *x509.CertPool) (*EndpointAttester, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("flow B: parse base URL: %w", err)
+		return nil, fmt.Errorf("attest: parse base URL: %w", err)
 	}
 	u.Path = wellKnownAttestation
 	u.RawQuery = ""
@@ -95,12 +96,12 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 // serving-leaf SPKI into the hardware evidence (pq=false).
 func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) {
 	if e.pinnedRoots == nil {
-		return nil, fmt.Errorf("flow B: no pinned mesh CA — add one with `teerminator certs add mesh-ca.pem` so the LB's mesh-signed leaf can be trusted")
+		return nil, fmt.Errorf("attest: no pinned mesh CA — add one with `teerminator certs add mesh-ca.pem` so the LB's mesh-signed leaf can be trusted")
 	}
 
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("flow B: generate nonce: %w", err)
+		return nil, fmt.Errorf("attest: generate nonce: %w", err)
 	}
 
 	u := *e.attestURL
@@ -111,11 +112,11 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("flow B: build request: %w", err)
+		return nil, fmt.Errorf("attest: build request: %w", err)
 	}
 	resp, err := e.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("flow B: fetch attestation: %w", err)
+		return nil, fmt.Errorf("attest: fetch attestation: %w", err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -124,25 +125,25 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	}()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("flow B: attestation endpoint returned %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("attest: attestation endpoint returned %d: %s", resp.StatusCode, body)
 	}
 
 	// The leaf on this (mesh-CA-validated) connection is what the LB bound and
 	// what the proxy will pin forwarded traffic to.
 	leafSPKI, err := leafSPKIFromTLS(resp.TLS)
 	if err != nil {
-		return nil, fmt.Errorf("flow B: %w", err)
+		return nil, fmt.Errorf("attest: %w", err)
 	}
 
 	var bundle attestationBundle
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&bundle); err != nil {
-		return nil, fmt.Errorf("flow B: decode bundle: %w", err)
+		return nil, fmt.Errorf("attest: decode bundle: %w", err)
 	}
 	if bundle.Nonce != base64.RawURLEncoding.EncodeToString(nonce) {
-		return nil, fmt.Errorf("flow B: nonce mismatch (LB echoed %q)", bundle.Nonce)
+		return nil, fmt.Errorf("attest: nonce mismatch (LB echoed %q)", bundle.Nonce)
 	}
 	if bundle.Binding != bindingTLSCert {
-		return nil, fmt.Errorf("flow B: LB did not honor pq=false (binding=%q); the cluster's tls-lb must be built with the tls-cert binding (cds-attest --serving-cert-file)", bundle.Binding)
+		return nil, fmt.Errorf("attest: LB did not honor pq=false (binding=%q); the cluster's tls-lb must be built with the tls-cert binding (cds-attest --serving-cert-file)", bundle.Binding)
 	}
 
 	// expected = SHA-384(serving_leaf_spki || nonce): the value the LB committed
@@ -178,11 +179,11 @@ func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte) (str
 		Evidence: b.Evidence,
 	})
 	if err != nil {
-		return "", fmt.Errorf("flow B: re-encode evidence: %w", err)
+		return "", fmt.Errorf("attest: re-encode evidence: %w", err)
 	}
 	res, err := teeverify.Verify(raw, teetypes.VerifyParams{ExpectedReportData: expectedReportData})
 	if err != nil {
-		return "", fmt.Errorf("flow B (%s): %w", b.Platform, err)
+		return "", fmt.Errorf("attest (%s): %w", b.Platform, err)
 	}
 	return res.Claims.LaunchDigest, nil
 }

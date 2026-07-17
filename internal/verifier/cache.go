@@ -31,7 +31,7 @@ func NewSessionCache(ttl time.Duration) *SessionCache {
 	return &SessionCache{ttl: ttl, now: time.Now, state: make(map[string]verdict)}
 }
 
-// RecordSession stores a Flow B verdict together with the attested LB leaf SPKI
+// RecordSession stores an attestation verdict together with the attested LB leaf SPKI
 // the session is pinned to.
 func (c *SessionCache) RecordSession(key string, ok bool, spki [32]byte, err error) {
 	c.mu.Lock()
@@ -39,7 +39,7 @@ func (c *SessionCache) RecordSession(key string, ok bool, spki [32]byte, err err
 	c.state[key] = verdict{ok: ok, verifAt: c.now(), err: err, spki: spki}
 }
 
-// FreshSession returns the pinned leaf SPKI for a still-valid passing Flow B
+// FreshSession returns the pinned leaf SPKI for a still-valid passing
 // verdict. fresh is false when there is no unexpired verdict; ok reports whether
 // that verdict passed.
 func (c *SessionCache) FreshSession(key string) (spki [32]byte, fresh, ok bool) {

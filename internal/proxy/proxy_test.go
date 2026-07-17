@@ -508,7 +508,7 @@ func newTrustingTransport(t *testing.T, backend *httptest.Server, opts Options) 
 }
 
 // TestPerRemoteAttestationMethods verifies each tunnel enforces its own remote's
-// attestation method independently: AttestNone forwards, Flow B fails closed
+// attestation method independently: AttestNone forwards, attest fails closed
 // when the backend cannot attest, and a recognised but not-yet-implemented
 // method blocks the request before it ever reaches the backend.
 func TestPerRemoteAttestationMethods(t *testing.T) {

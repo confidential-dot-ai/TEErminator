@@ -21,7 +21,7 @@ type CheckResult struct {
 // CheckRemote actively determines the remote's trust status right now, using
 // the same upstream TLS trust (ServerName override + operator CAs) the proxy
 // forwards over:
-//   - AttestEndpoint (Flow B): run the session-start attestation; Verified on
+//   - AttestEndpoint: run the session-start attestation; Verified on
 //     success, Failed otherwise.
 //   - AttestNone: probe the remote over its validated TLS; Untrusted when
 //     reachable (nothing attests the workload), Failed when not.
