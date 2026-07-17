@@ -16,7 +16,7 @@ func newRootCmd() *cobra.Command {
 		Use:   DefaultName,
 		Short: "Localhost proxy for verifying and enforcing TEE-attestation from remote hosts",
 		Long: `TEErminator is a localhost daemon that lets you connect to remote TEE APIs
-verified through attested TLS headers or dedicated session-scoped attestation.`,
+verified through dedicated session-scoped attestation bound to the upstream TLS session.`,
 	}
 }
 

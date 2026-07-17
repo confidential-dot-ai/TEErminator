@@ -2,12 +2,10 @@ package proxy
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"fmt"
 	"log"
 	"log/slog"
@@ -158,8 +156,8 @@ type h3Transport struct {
 
 	// attestation enforcement (per-remote, independent of other tunnels)
 	remote    config.Remote
-	vf        verifier.Verifier         // Flow A: passive response-header verifier
 	ea        *verifier.EndpointAttester // Flow B: active session-start attester
+	blocked   error                      // set for recognised-but-unimplemented modes: fail closed without forwarding
 	cache     *verifier.SessionCache
 	remoteKey string
 
@@ -167,39 +165,50 @@ type h3Transport struct {
 	noH3 map[string]bool
 }
 
-func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
-	// Validate the upstream cert against the configured ServerName when set,
-	// otherwise the URL host. The override covers backends reached by an IP (or
-	// any name) whose certificate only carries a different SAN.
+// upstreamTLSConfig builds the TLS client config used to validate an upstream:
+// the certificate is checked against the remote's ServerName override when set
+// (otherwise the URL host — the override covers backends reached by an IP or
+// any name whose certificate only carries a different SAN), and operator-added
+// CAs (`certs add`) are appended to the system trust store so a
+// privately-issued upstream cert (e.g. c8s mesh CA) verifies. With no extra
+// CAs, RootCAs stays nil and the system roots are used unchanged.
+func upstreamTLSConfig(target *url.URL, remote config.Remote, extraCAs []config.Cert) (*tls.Config, error) {
 	serverName := target.Hostname()
-	if opts.Remote.ServerName != "" {
-		serverName = opts.Remote.ServerName
+	if remote.ServerName != "" {
+		serverName = remote.ServerName
 	}
 	tlsCfg := &tls.Config{
 		ServerName: serverName,
 	}
-	// Append any operator-added CAs (`certs add`) to the system trust store so a
-	// privately-issued upstream cert (e.g. c8s mesh CA) verifies. With no extra
-	// CAs, RootCAs stays nil and the system roots are used unchanged.
-	if len(opts.ExtraCAs) > 0 {
+	if len(extraCAs) > 0 {
 		pool, err := x509.SystemCertPool()
 		if err != nil || pool == nil {
 			pool = x509.NewCertPool()
 		}
-		for _, c := range opts.ExtraCAs {
+		for _, c := range extraCAs {
 			if !pool.AppendCertsFromPEM([]byte(c.PEM)) {
 				return nil, fmt.Errorf("trust store: failed to parse stored CA %q", c.CommonName)
 			}
 		}
 		tlsCfg.RootCAs = pool
 	}
+	return tlsCfg, nil
+}
+
+func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
+	tlsCfg, err := upstreamTLSConfig(target, opts.Remote, opts.ExtraCAs)
+	if err != nil {
+		return nil, err
+	}
 
 	var (
-		vf    verifier.Verifier
-		ea    *verifier.EndpointAttester
-		cache *verifier.SessionCache
+		ea      *verifier.EndpointAttester
+		blocked error
+		cache   *verifier.SessionCache
 	)
 	switch opts.Remote.Mode {
+	case config.AttestNone:
+		// No attestation: plain forwarding.
 	case config.AttestEndpoint:
 		// Flow B fetches the attestation bundle itself, over the same TLS trust
 		// the proxy uses for the upstream, so the leaf it observes (and binds to)
@@ -215,15 +224,13 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 			return nil, err
 		}
 		cache = verifier.NewSessionCache(opts.ReattestInterval)
+	case config.AttestCDSCert:
+		// Recognised but not yet implemented: block every request rather than
+		// forwarding it to an unverified backend.
+		blocked = fmt.Errorf("%w: %s (use the c8s-verify-js browser client for this flow today)",
+			verifier.ErrNotImplemented, opts.Remote.Mode)
 	default:
-		var err error
-		vf, err = verifier.For(opts.Remote.Mode)
-		if err != nil {
-			return nil, err
-		}
-		if vf != nil {
-			cache = verifier.NewSessionCache(opts.ReattestInterval)
-		}
+		return nil, fmt.Errorf("unknown attestation mode %q", opts.Remote.Mode)
 	}
 
 	return &h3Transport{
@@ -241,8 +248,8 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 			IdleConnTimeout:   90 * time.Second,
 		},
 		remote:    opts.Remote,
-		vf:        vf,
 		ea:        ea,
+		blocked:   blocked,
 		cache:     cache,
 		remoteKey: target.Host,
 		noH3:      make(map[string]bool),
@@ -255,65 +262,22 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 // original request can safely be forwarded via the fallback transport.
 //
 // Attestation handling is driven entirely by this remote's configured Mode:
-//   - AttestNone (nil verifier): legacy best-effort — log any Attestation-Report
-//     header without enforcing.
-//   - any other mode: enforce that remote's method and fail closed (a
-//     verification error drops the response). Any mode that is recognised but not
-//     yet implemented therefore blocks traffic rather than forwarding it
-//     unverified.
+//   - AttestNone: forward without attestation.
+//   - AttestEndpoint (Flow B): attest the session against the remote's
+//     attestation endpoint before forwarding, and pin traffic to the attested
+//     TLS leaf.
+//   - any recognised-but-unimplemented mode: fail closed without ever
+//     forwarding the request to the unverified backend.
 func (t *h3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Host
 
 	if t.ea != nil {
 		return t.roundTripEndpoint(req, host)
 	}
-
-	if t.vf == nil {
-		return t.roundTripLegacy(req, host)
+	if t.blocked != nil {
+		return nil, fmt.Errorf("attestation mode %q for %s: %w", t.remote.Mode, host, t.blocked)
 	}
-
-	// If this remote was verified within the re-attest interval, reuse the
-	// verdict and skip per-request attestation work — the established TLS session
-	// already carries the security guarantee between periodic freshness checks.
-	if fresh, ok := t.cache.Fresh(t.remoteKey); fresh {
-		if !ok {
-			return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
-		}
-		return t.do(req, host)
-	}
-
-	// Flow A binds a fresh per-request nonce into the evidence so a report
-	// captured from an earlier session cannot be replayed.
-	var nonce []byte
-	if t.remote.Mode == config.AttestTLSHeader {
-		nonce = make([]byte, 32)
-		if _, err := rand.Read(nonce); err != nil {
-			return nil, fmt.Errorf("generate attestation nonce: %w", err)
-		}
-		req.Header.Set(verifier.NonceHeader, base64.RawURLEncoding.EncodeToString(nonce))
-	}
-
-	resp, err := t.do(req, host)
-	if err != nil || resp == nil {
-		return resp, err
-	}
-
-	// Fail closed: a verification error drops the response.
-	res, verifyErr := t.vf.Verify(verifier.Input{
-		Remote:           &t.remote,
-		Nonce:            nonce,
-		ResponseHeader:   resp.Header,
-		PeerCertificates: peerCerts(resp),
-	})
-	t.cache.Record(t.remoteKey, verifyErr == nil, verifyErr)
-	if verifyErr != nil {
-		_ = resp.Body.Close()
-		slog.Warn("attestation verification failed; dropping response",
-			"mode", t.remote.Mode, "url", req.URL.String(), "error", verifyErr)
-		return nil, fmt.Errorf("attestation verification failed for %s: %w", host, verifyErr)
-	}
-	slog.Info("attestation verified", "mode", t.remote.Mode, "url", req.URL.String(), "measurement", res.Measurement)
-	return resp, nil
+	return t.do(req, host)
 }
 
 // do performs the actual HTTP/3-then-fallback round trip without any attestation
@@ -338,23 +302,6 @@ func (t *h3Transport) do(req *http.Request, host string) (*http.Response, error)
 
 	if resp == nil {
 		resp, err = t.fallback.RoundTrip(req)
-	}
-	return resp, err
-}
-
-// roundTripLegacy is the AttestNone path: forward the request and log any
-// Attestation-Report header without enforcing a verdict.
-func (t *h3Transport) roundTripLegacy(req *http.Request, host string) (*http.Response, error) {
-	resp, err := t.do(req, host)
-	if err != nil || resp == nil {
-		return resp, err
-	}
-	if reportHeader := resp.Header.Get(verifier.AttestationHeader); reportHeader != "" {
-		if verifyErr := verifier.VerifyAzSnpAttestation([]byte(reportHeader)); verifyErr != nil {
-			slog.Warn("attestation report verification failed", "url", req.URL.String(), "error", verifyErr)
-		} else {
-			slog.Info("attestation report verified successfully", "url", req.URL.String())
-		}
 	}
 	return resp, err
 }
@@ -412,14 +359,6 @@ func sessionLeafMatches(resp *http.Response, want [32]byte) bool {
 	}
 	got := sha256.Sum256(resp.TLS.PeerCertificates[0].RawSubjectPublicKeyInfo)
 	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
-}
-
-// peerCerts returns the verified TLS peer chain from a response, if any.
-func peerCerts(resp *http.Response) []*x509.Certificate {
-	if resp.TLS == nil {
-		return nil
-	}
-	return resp.TLS.PeerCertificates
 }
 
 // Close releases resources held by both transports.

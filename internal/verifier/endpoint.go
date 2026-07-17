@@ -9,15 +9,22 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
-	"github.com/confidential-dot-ai/attestation-go/attestation/azsnp"
+	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
+	"github.com/confidential-dot-ai/attestation-go/attestation/teeverify"
 )
+
+// ErrNotImplemented is returned for attestation modes that are defined but not
+// yet wired up; the proxy fails closed on them instead of forwarding.
+var ErrNotImplemented = errors.New("attestation flow not implemented")
 
 // Flow B (config.AttestEndpoint, "attest") performs the same challenge/response
 // attestation as the c8s-verify-js browser client, but instead of establishing
@@ -158,35 +165,26 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	return v, nil
 }
 
-// verifyEndpointEvidence verifies the hardware evidence and that report_data
-// binds expectedReportData. Today only az-snp (Azure node-as-CVM) is wired in Go
-// here; bare-metal snp Flow B is a known gap (use the c8s-verify-js client).
+// verifyEndpointEvidence verifies the hardware evidence through the shared
+// attestation-go verifier (teeverify dispatches on the bundle's platform tag)
+// and requires that the evidence binds expectedReportData, i.e.
+// SHA-384(serving_leaf_spki || nonce): directly in the report_data for
+// bare-metal platforms, or in the AK-signed vTPM quote for the Azure ones. All
+// evidence parsing and cryptographic verification lives in attestation-go;
+// only the binding anchor and the measurement policy are computed here.
 func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte) (string, error) {
-	switch b.Platform {
-	case "az-snp":
-		raw, err := json.Marshal(struct {
-			Platform string          `json:"platform"`
-			Evidence json.RawMessage `json:"evidence"`
-		}{Platform: b.Platform, Evidence: b.Evidence})
-		if err != nil {
-			return "", fmt.Errorf("flow B: re-encode evidence: %w", err)
-		}
-		res, err := azsnp.Verify(raw) // SNP report signature + VCEK chain + measurement
-		if err != nil {
-			return "", fmt.Errorf("flow B (az-snp): %w", err)
-		}
-		// Bind freshness + the serving leaf: the AK-signed vTPM quote's extraData
-		// must equal expectedReportData. Same chain Flow A verifies, but the anchor
-		// is SHA-384(leaf_spki || nonce) rather than a bare nonce.
-		if err := res.VerifyVTPMFreshness(expectedReportData); err != nil {
-			return "", fmt.Errorf("flow B (az-snp vTPM): %w", err)
-		}
-		return res.Measurement, nil
-	case "snp":
-		return "", fmt.Errorf("flow B: bare-metal snp is not yet supported by TEErminator; use the c8s-verify-js client (az-snp is supported)")
-	default:
-		return "", fmt.Errorf("flow B: unsupported platform %q", b.Platform)
+	raw, err := json.Marshal(teetypes.AttestationEvidence{
+		Platform: teetypes.PlatformType(b.Platform),
+		Evidence: b.Evidence,
+	})
+	if err != nil {
+		return "", fmt.Errorf("flow B: re-encode evidence: %w", err)
 	}
+	res, err := teeverify.Verify(raw, teetypes.VerifyParams{ExpectedReportData: expectedReportData})
+	if err != nil {
+		return "", fmt.Errorf("flow B (%s): %w", b.Platform, err)
+	}
+	return res.Claims.LaunchDigest, nil
 }
 
 // leafSPKIFromTLS returns the raw SubjectPublicKeyInfo (DER) of the peer leaf.
@@ -195,4 +193,20 @@ func leafSPKIFromTLS(state *tls.ConnectionState) ([]byte, error) {
 		return nil, fmt.Errorf("no TLS peer certificate to bind the session to")
 	}
 	return state.PeerCertificates[0].RawSubjectPublicKeyInfo, nil
+}
+
+// checkMeasurement enforces the remote's launch-digest allowlist.
+func checkMeasurement(measurement string, allowed []string) error {
+	if len(allowed) == 0 {
+		// No allowlist: the signature is verified but the workload identity is
+		// not pinned. Permit, but the caller should warn.
+		return nil
+	}
+	m := strings.ToLower(measurement)
+	for i := range allowed {
+		if strings.ToLower(allowed[i]) == m {
+			return nil
+		}
+	}
+	return fmt.Errorf("launch measurement %s is not in the allowlist", measurement)
 }

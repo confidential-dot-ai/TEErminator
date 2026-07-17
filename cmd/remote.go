@@ -43,7 +43,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			remoteURL := args[1]
 
 			if !config.ValidAttestMode(mode) {
-				return fmt.Errorf("invalid --mode %q (want one of: tls-header, attest, cds-cert, or empty)", mode)
+				return fmt.Errorf("invalid --mode %q (want one of: attest, cds-cert, or empty)", mode)
 			}
 
 			cfg, err := config.Load()
@@ -78,9 +78,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	}
 
 	f := cmd.Flags()
-	f.StringVar(&mode, "mode", "", "attestation mode: tls-header (Flow A), attest (Flow B), cds-cert (Flow C), or empty to disable")
+	f.StringVar(&mode, "mode", "", "attestation mode: attest (Flow B, session-scoped endpoint attestation), cds-cert (Flow C), or empty to disable")
 	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated")
-	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL for Flow B/C (e.g. https://host/.well-known/c8s/)")
+	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for Flow C (Flow B always uses the remote's origin)")
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Pair with `%s certs add <ca.pem>` to trust the issuing CA", name))
 	return cmd
 }

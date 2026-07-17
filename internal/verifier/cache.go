@@ -23,34 +23,12 @@ type verdict struct {
 	ok      bool
 	verifAt time.Time
 	err     error
-	spki    [32]byte // Flow B: the attested LB leaf SPKI the session is pinned to
+	spki    [32]byte // the attested LB leaf SPKI the session is pinned to
 }
 
 // NewSessionCache returns a cache whose verdicts are valid for ttl.
 func NewSessionCache(ttl time.Duration) *SessionCache {
 	return &SessionCache{ttl: ttl, now: time.Now, state: make(map[string]verdict)}
-}
-
-// Fresh reports whether key has a still-valid verdict, and whether it passed.
-// ok is only meaningful when fresh is true.
-func (c *SessionCache) Fresh(key string) (fresh, ok bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	v, present := c.state[key]
-	if !present {
-		return false, false
-	}
-	if c.now().Sub(v.verifAt) > c.ttl {
-		return false, false
-	}
-	return true, v.ok
-}
-
-// Record stores the verdict for key as of now.
-func (c *SessionCache) Record(key string, ok bool, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.state[key] = verdict{ok: ok, verifAt: c.now(), err: err}
 }
 
 // RecordSession stores a Flow B verdict together with the attested LB leaf SPKI
