@@ -3,6 +3,7 @@ package verifier
 import (
 	"context"
 	"crypto/x509"
+	_ "embed"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,9 @@ import (
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
 )
+
+//go:embed testdata/attestation.json
+var azSnpFixture []byte
 
 // bundleHandler serves a c8s-verify/v1 attestation bundle whose fields the test
 // controls. It echoes the client nonce unless echoNonce overrides it.
@@ -72,12 +76,50 @@ func TestEndpointAttesterRejectsNonceMismatch(t *testing.T) {
 	}
 }
 
-func TestEndpointAttesterBareSNPUnsupported(t *testing.T) {
-	// Correct binding + nonce, but bare-metal snp Flow B is not wired in Go yet.
-	ea := newTestAttester(t, bundleHandler("snp", "tls-cert", ""))
+func TestEndpointAttesterRejectsUnsupportedPlatform(t *testing.T) {
+	ea := newTestAttester(t, bundleHandler("commodore-64", "tls-cert", ""))
 	_, err := ea.Attest(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "bare-metal snp") {
-		t.Fatalf("want bare-metal snp unsupported error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "unsupported platform") {
+		t.Fatalf("want unsupported-platform error, got %v", err)
+	}
+}
+
+func TestEndpointAttesterRejectsGarbageEvidence(t *testing.T) {
+	// Correct binding + nonce, but the evidence payload is not a valid snp
+	// envelope: verification (delegated to attestation-go) must fail closed.
+	ea := newTestAttester(t, bundleHandler("snp", "tls-cert", ""))
+	if _, err := ea.Attest(context.Background()); err == nil {
+		t.Fatal("want verification failure for garbage snp evidence")
+	}
+}
+
+// TestEndpointAttesterRejectsRecordedEvidence serves real az-snp evidence
+// captured from an Azure CVM. The hardware report itself verifies (SNP
+// signature + VCEK chain), but its vTPM quote is not bound to
+// SHA-384(serving_leaf_spki || nonce) for this session, so the attester must
+// fail closed rather than accept replayed evidence.
+func TestEndpointAttesterRejectsRecordedEvidence(t *testing.T) {
+	var envelope struct {
+		Platform string          `json:"platform"`
+		Evidence json.RawMessage `json:"evidence"`
+	}
+	if err := json.Unmarshal(azSnpFixture, &envelope); err != nil {
+		t.Fatalf("parsing fixture: %v", err)
+	}
+
+	ea := newTestAttester(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"version":  "c8s-verify/v1",
+			"platform": envelope.Platform,
+			"nonce":    r.URL.Query().Get("nonce"),
+			"binding":  bindingTLSCert,
+			"evidence": envelope.Evidence,
+		})
+	}))
+	_, err := ea.Attest(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "vTPM") {
+		t.Fatalf("want vTPM freshness-binding failure for recorded evidence, got %v", err)
 	}
 }
 

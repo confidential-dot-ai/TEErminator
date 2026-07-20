@@ -508,30 +508,32 @@ func newTrustingTransport(t *testing.T, backend *httptest.Server, opts Options) 
 }
 
 // TestPerRemoteAttestationMethods verifies each tunnel enforces its own remote's
-// attestation method independently: AttestNone forwards, a configured method
-// fails closed when the backend supplies no valid evidence, and a recognised but
-// not-yet-implemented method blocks the response rather than forwarding it
-// unverified.
+// attestation method independently: AttestNone forwards, attest fails closed
+// when the backend cannot attest, and a recognised but not-yet-implemented
+// method blocks the request before it ever reaches the backend.
 func TestPerRemoteAttestationMethods(t *testing.T) {
-	// A backend that does not emit any Attestation-Report header.
+	// A backend that serves no attestation endpoint.
+	var hits atomic.Int64
 	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
 		fmt.Fprint(w, "backend-ok")
 	}))
 	defer backend.Close()
 
 	cases := []struct {
-		name      string
-		mode      config.AttestMode
-		wantError bool
+		name        string
+		mode        config.AttestMode
+		wantError   bool
+		wantForward bool // whether the backend may see the request
 	}{
-		{"none forwards", config.AttestNone, false},
-		{"tls-header fails closed without evidence", config.AttestTLSHeader, true},
-		{"attest (unimplemented) fails closed", config.AttestEndpoint, true},
-		{"cds-cert (unimplemented) fails closed", config.AttestCDSCert, true},
+		{"none forwards", config.AttestNone, false, true},
+		{"attest fails closed without valid attestation", config.AttestEndpoint, true, true},
+		{"cds-cert (unimplemented) blocks before forwarding", config.AttestCDSCert, true, false},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			hits.Store(0)
 			tr := newTrustingTransport(t, backend, Options{Remote: config.Remote{Mode: tc.mode}})
 			req, _ := http.NewRequest("GET", backend.URL, nil)
 			resp, err := tr.RoundTrip(req)
@@ -544,7 +546,20 @@ func TestPerRemoteAttestationMethods(t *testing.T) {
 			if !tc.wantError && err != nil {
 				t.Fatalf("mode %q: expected forward, got error %v", tc.mode, err)
 			}
+			if !tc.wantForward && hits.Load() != 0 {
+				t.Fatalf("mode %q: request reached the backend %d times; want it blocked at the proxy", tc.mode, hits.Load())
+			}
 		})
+	}
+}
+
+// TestUnknownAttestationModeRejected ensures a config carrying an unrecognised
+// (e.g. removed) attestation mode refuses to build a transport instead of
+// silently forwarding unverified.
+func TestUnknownAttestationModeRejected(t *testing.T) {
+	target, _ := url.Parse("https://example.com")
+	if _, err := newH3Transport(target, Options{Remote: config.Remote{Mode: "bogus-mode"}}); err == nil {
+		t.Fatal("expected an error for an unrecognised attestation mode")
 	}
 }
 

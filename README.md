@@ -1,35 +1,40 @@
 # TEErminator
-Localhost proxy for verifying and enforcing TEE-attestation from remote hosts through TLS-headers.
+Localhost proxy for verifying and enforcing TEE-attestation from remote hosts through session-scoped attestation bound to the upstream TLS session.
 
 ## Usage
 
-TEErminator is a little daemon meant to allow anyone to connect to remote TEE APIs that are verified through attested TLS headers, or through dedicated session-scoped attestation.
+TEErminator is a little daemon meant to allow anyone to connect to remote TEE APIs that are verified through dedicated session-scoped attestation.
 
-In particular it is meant to support Confidential.ai stack and its confidential Kubernetes, C8s, which uses a ceritficate-backed attestation flow that abstracts away attestation verification form the end processes.
+In particular it is meant to support the Confidential.ai stack and its confidential Kubernetes, C8s, which uses a certificate-backed attestation flow that abstracts away attestation verification from the end processes.
+
+`status` checks every remote live, over the same upstream TLS trust the proxy
+forwards over: `--mode attest` remotes run the full session attestation,
+unattested remotes are probed for reachability, and modes the proxy cannot
+enforce yet report `Failed`. Details (the verified measurement, or the failure
+reason) are printed below the table, and results are persisted so `remote ls`
+shows the last checked status.
 
 ```
 $ ./teerminator status
-Local           Remote                                                  Auth        Status
-127.0.0.1:8080  https://api.openai.com/v1/                              Token       Untrusted
-127.0.0.1:14323 https://confidential-vllm-production-stack.lunal.dev/   None        Verified
-127.0.2.1:443   https://api.baremetal.customer.com/                     mTLS        Verified
-[::1]:8080      https://api.ollama.provider.com/v1/                     Token       Failed
+Local            Remote                                                 Auth   Mode    Status
+127.0.0.1:8080   https://api.openai.com/v1/                             Token  None    Untrusted
+127.0.0.1:14323  https://confidential-vllm-production-stack.lunal.dev/  None   attest  Verified
+[::1]:8080       https://api.ollama.provider.com/v1/                    Token  None    Failed
+
+127.0.0.1:14323: measurement 6d86eef8bfaea0f34a2a8dda5b8b0a97c9174a01d0a3546b930b16fceccb6d9e1e0d1cbc35e4a839e00e2b71c50ee2e2
 ```
 
 Adding new remote TEE APIs:
 ```
 $ ./teerminator remote add localhost:12345 https://example.com/v2/
-$ cat SECRETTOKEN | ./teerminatore remote auth localhost:12345 -
+$ cat SECRETTOKEN | ./teerminator remote auth localhost:12345 -
 ```
 
-Other supported commands include:
+Remotes are deleted with `remote rm`, by local address or by the index printed by `remote ls`:
 
-``` 
-$ ./teerminator remote rm <common-name>
 ```
-
-In particular it is meant to support Confidential.ai stack and its confidential Kubernetes, C8s, which uses a ceritficate-backed attestation flow tha     t abstracts away attestation verification form the end processes.
-And the command `remote remove` or `remote rm` allows you to delete a remote.
+$ ./teerminator remote rm <local-addr|index>
+```
 
 For certificate-backed attestations, you might have to trust custom certificate authorities, especially when testing using localhost certs that might having been created using mkcert. Certificates added with `certs add` are appended to the system trust store and used as **upstream** TLS trust anchors for every remote, so a backend served by a private CA (e.g. a c8s mesh CA) verifies.
 
@@ -38,17 +43,14 @@ When the upstream's certificate does not match the host you dial — for example
 ```
 $ ./teerminator certs add ./mesh-ca.pem
 $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
-    --mode tls-header --server-name c8s-tls-lb.c8s-system.svc --measurements <hex,...>
+    --mode attest --server-name c8s-tls-lb.c8s-system.svc --measurements <hex,...>
 ```
 
 ### Attestation modes
 
 `--mode` selects how each remote is verified:
 
-- **`tls-header` (Flow A)** — verify SEV-SNP evidence carried in an `Attestation-Report`
-  response header, binding a fresh per-request nonce. Works for bare-metal SNP
-  (`report_data == nonce`) and Azure az-snp (nonce in the AK-signed vTPM quote).
-- **`attest` (Flow B)** — the same challenge/response attestation the `c8s-verify-js`
+- **`attest`** — the same challenge/response attestation the `c8s-verify-js`
   browser client performs, against the LB's `/.well-known/c8s/attestation` endpoint, but
   riding the validated upstream TLS instead of the post-quantum tunnel. At session start
   TEErminator fetches a fresh, nonce-bound bundle (requesting the LB's **tls-cert binding**,
@@ -57,18 +59,23 @@ $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
   forwarded requests must ride a connection presenting the same leaf, otherwise the session
   re-attests (fail closed). This is a *TLS-session-scoped* TEE binding: the hardware report
   commits to the very certificate the traffic flows over. Requires a cluster whose `tls-lb`
-  serves the tls-cert binding (`cds-attest --serving-cert-file`); az-snp is supported today
-  (bare-metal snp Flow B is not yet wired — use the browser client).
+  serves the tls-cert binding (`cds-attest --serving-cert-file`). Evidence verification is
+  delegated entirely to the shared [`attestation-go`](https://github.com/confidential-dot-ai/attestation-go)
+  verifier (`teeverify`), so every platform it supports works here: bare-metal/GCP SNP
+  (binding in `report_data`), Azure az-snp (binding in the AK-signed vTPM quote), and the
+  TDX variants.
+- **`cds-cert`** — planned CDS-cert pinning; configuring it today fails
+  closed (requests are blocked before reaching the backend).
 
 ```
-# Flow B against an Azure node-as-CVM LB:
+# Endpoint attestation against an Azure node-as-CVM LB:
 $ ./teerminator certs add ./mesh-ca.pem
 $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
     --mode attest --server-name c8s-tls-lb.c8s-system.svc --measurements <hex,...>
 ```
 ```
-$ ./terminator certs add <CA PEM File>
-$ ./terminator certs
+$ ./teerminator certs add <CA PEM File>
+$ ./teerminator certs
 common name:
     Issued To:
         ...
@@ -84,7 +91,7 @@ common name:
 
 other common name:
     ...
-$ ./terminator certs rm <common name>
+$ ./teerminator certs rm <common name>
 ```
 
 

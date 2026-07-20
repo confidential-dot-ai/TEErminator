@@ -31,18 +31,15 @@ type AttestMode string
 const (
 	// AttestNone disables attestation verification (current default behaviour).
 	AttestNone AttestMode = ""
-	// AttestTLSHeader (Flow A) verifies an Attestation-Report response header,
-	// binding the client nonce, then reuses that verdict for the session.
-	AttestTLSHeader AttestMode = "tls-header"
-	// AttestEndpoint (Flow B) fetches a fresh attestation from a dedicated
-	// endpoint at session start.
+	// AttestEndpoint fetches a fresh attestation from a dedicated endpoint at
+	// session start and pins the session to the attested TLS leaf.
 	AttestEndpoint AttestMode = "attest"
-	// AttestCDSCert (Flow C) fetches and pins the CDS cert before trusting the
+	// AttestCDSCert fetches and pins the CDS cert before trusting the
 	// connection.
 	AttestCDSCert AttestMode = "cds-cert"
 )
 
-// CertPin records a certificate pinned by a Flow C bootstrap so later sessions
+// CertPin records a certificate pinned by a cds-cert bootstrap so later sessions
 // trust the same cert without re-fetching.
 type CertPin struct {
 	SHA256   string `json:"sha256"`
@@ -73,7 +70,7 @@ type Remote struct {
 // ValidAttestMode reports whether s is a recognised attestation mode.
 func ValidAttestMode(s string) bool {
 	switch AttestMode(s) {
-	case AttestNone, AttestTLSHeader, AttestEndpoint, AttestCDSCert:
+	case AttestNone, AttestEndpoint, AttestCDSCert:
 		return true
 	default:
 		return false
