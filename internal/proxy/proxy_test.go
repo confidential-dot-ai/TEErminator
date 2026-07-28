@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 )
 
 // startTunnel is a test helper that creates a tunnel pointing at backend and
@@ -659,5 +661,129 @@ func TestUpstreamServerNameAndCustomCA(t *testing.T) {
 	// ServerName overridden but CA not trusted -> fails closed.
 	if err := roundTrip(Options{Remote: config.Remote{ServerName: sanName}}); err == nil {
 		t.Error("expected TLS failure without trusting the custom CA")
+	}
+}
+
+// spkiOf returns the SHA-256 of a certificate's SubjectPublicKeyInfo, the value
+// attestation verdicts pin sessions to.
+func spkiOf(cert *x509.Certificate) [32]byte {
+	return sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+}
+
+// TestAttestedLeafVerifier unit-tests the handshake-time pin: it must admit
+// handshakes when no fresh passing verdict pins a leaf (first connect and
+// failed-verdict windows are handled by the round-trip path), accept the
+// pinned leaf, and refuse anything else before application data flows.
+func TestAttestedLeafVerifier(t *testing.T) {
+	parse := func(pemBytes []byte) *x509.Certificate {
+		block, _ := pem.Decode(pemBytes)
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cert
+	}
+	pinnedPEM, _ := selfSignedCert(t, "pinned.example")
+	otherPEM, _ := selfSignedCert(t, "other.example")
+	pinned, other := parse(pinnedPEM), parse(otherPEM)
+
+	const key = "lb.example:443"
+	cache := verifier.NewSessionCache(time.Minute)
+	verify := attestedLeafVerifier(cache, key)
+
+	state := func(cert *x509.Certificate) tls.ConnectionState {
+		if cert == nil {
+			return tls.ConnectionState{}
+		}
+		return tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
+	}
+
+	// No verdict yet: the handshake must be admitted so the attester can run.
+	if err := verify(state(other)); err != nil {
+		t.Fatalf("no verdict: want handshake admitted, got %v", err)
+	}
+
+	cache.RecordSession(key, true, spkiOf(pinned), nil)
+	if err := verify(state(pinned)); err != nil {
+		t.Fatalf("pinned leaf: want handshake admitted, got %v", err)
+	}
+	if err := verify(state(other)); err == nil {
+		t.Fatal("mismatched leaf: want handshake refused, got nil")
+	}
+	if err := verify(state(nil)); err == nil {
+		t.Fatal("no peer certificate: want handshake refused, got nil")
+	}
+
+	// A failed verdict pins nothing; the round-trip path fails fast instead.
+	cache.RecordSession(key, false, [32]byte{}, fmt.Errorf("attestation failed"))
+	if err := verify(state(other)); err != nil {
+		t.Fatalf("failed verdict: want handshake admitted (round-trip path rejects), got %v", err)
+	}
+}
+
+// TestHandshakePinBlocksBeforeSend covers the leak-one-request gap: with a
+// fresh verdict pinning a leaf that is NOT the upstream's, the request must be
+// refused during the TLS handshake — zero bytes reach the backend — while a
+// verdict pinning the upstream's actual leaf forwards normally over the same
+// transport construction.
+func TestHandshakePinBlocksBeforeSend(t *testing.T) {
+	var hits atomic.Int32
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, "attested-ok")
+	}))
+	defer backend.Close()
+
+	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: backend.Certificate().Raw})
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{
+		Remote:           config.Remote{Mode: config.AttestEndpoint},
+		ExtraCAs:         []config.Cert{{CommonName: "test-backend", PEM: string(leafPEM)}},
+		ReattestInterval: time.Minute,
+	}
+
+	roundTrip := func(pin [32]byte) (string, error) {
+		tr, err := newH3Transport(target, opts)
+		if err != nil {
+			t.Fatalf("newH3Transport: %v", err)
+		}
+		defer func() { _ = tr.Close() }()
+		// Seed a fresh passing verdict directly so the round trip skips the
+		// attester and exercises only the handshake-time pin.
+		tr.cache.RecordSession(target.Host, true, pin, nil)
+		req, _ := http.NewRequest("GET", backend.URL, nil)
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		return string(body), nil
+	}
+
+	// Pin a leaf the upstream does not hold: the handshake must be refused and
+	// the request must never reach the backend.
+	if _, err := roundTrip([32]byte{0xde, 0xad}); err == nil {
+		t.Fatal("mismatched pin: want a handshake error, got a forwarded response")
+	} else if !strings.Contains(err.Error(), "does not match the attested SPKI") {
+		t.Fatalf("mismatched pin: want the handshake pin error, got %v", err)
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("mismatched pin: %d request(s) reached the backend; want 0", got)
+	}
+
+	// Pin the upstream's actual leaf: forwards normally.
+	body, err := roundTrip(spkiOf(backend.Certificate()))
+	if err != nil {
+		t.Fatalf("matching pin: %v", err)
+	}
+	if body != "attested-ok" {
+		t.Fatalf("matching pin: body = %q, want attested-ok", body)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("matching pin: backend hits = %d, want 1", got)
 	}
 }

@@ -233,6 +233,15 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 		return nil, fmt.Errorf("unknown attestation mode %q", opts.Remote.Mode)
 	}
 
+	// Attested traffic forwards over the fallback transport, so that is where
+	// the handshake-time leaf pin lives: refusing a mismatched leaf during the
+	// handshake means no request bytes (body, bearer token) are ever written
+	// to an endpoint other than the attested one.
+	fallbackTLS := tlsCfg.Clone()
+	if cache != nil {
+		fallbackTLS.VerifyConnection = attestedLeafVerifier(cache, target.Host)
+	}
+
 	return &h3Transport{
 		h3: &http3.Transport{
 			TLSClientConfig: tlsCfg,
@@ -242,7 +251,7 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 			QUICConfig: &quic.Config{HandshakeIdleTimeout: 2 * time.Second},
 		},
 		fallback: &http.Transport{
-			TLSClientConfig:   tlsCfg.Clone(),
+			TLSClientConfig:   fallbackTLS,
 			ForceAttemptHTTP2: true,
 			MaxIdleConns:      100,
 			IdleConnTimeout:   90 * time.Second,
@@ -340,7 +349,9 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	}
 
 	// Pin: the serving connection must present the attested LB leaf. A swapped or
-	// rotated upstream leaf forces re-attestation rather than silent reuse.
+	// rotated upstream leaf forces re-attestation rather than silent reuse. New
+	// connections are already refused at handshake time (attestedLeafVerifier);
+	// this response-time check covers connections pooled before the pin changed.
 	if !sessionLeafMatches(resp, spki) {
 		_ = resp.Body.Close()
 		t.cache.Invalidate(t.remoteKey)
@@ -349,6 +360,31 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 		return nil, fmt.Errorf("attestation binding broken for %s: upstream TLS leaf changed (re-attest required)", host)
 	}
 	return resp, nil
+}
+
+// attestedLeafVerifier returns a handshake-time check for the forwarding
+// transport: while a fresh attestation verdict pins a leaf SPKI, every new TLS
+// handshake (VerifyConnection also runs on resumptions) must present that same
+// leaf, aborting before any application data is written. Without a fresh
+// verdict it admits the handshake — roundTripEndpoint handles first-connect
+// and re-attestation, and the response-time sessionLeafMatches check still
+// covers pooled connections that outlive a pin change. Standard chain
+// validation against RootCAs/ServerName has already passed when this runs.
+func attestedLeafVerifier(cache *verifier.SessionCache, key string) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		spki, fresh, ok := cache.FreshSession(key)
+		if !fresh || !ok {
+			return nil
+		}
+		if len(cs.PeerCertificates) == 0 {
+			return fmt.Errorf("attestation binding for %s: upstream presented no certificate", key)
+		}
+		got := sha256.Sum256(cs.PeerCertificates[0].RawSubjectPublicKeyInfo)
+		if subtle.ConstantTimeCompare(got[:], spki[:]) != 1 {
+			return fmt.Errorf("attestation binding for %s: upstream TLS leaf does not match the attested SPKI (re-attest required)", key)
+		}
+		return nil
+	}
 }
 
 // sessionLeafMatches reports whether the response's TLS peer leaf SPKI equals the
