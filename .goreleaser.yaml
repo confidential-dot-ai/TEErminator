@@ -1,0 +1,54 @@
+version: 2
+
+project_name: teerminator
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: teerminator
+    binary: teerminator
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/confidential-dot-ai/TEErminator/cmd.Version={{.Version}}
+      - -X github.com/confidential-dot-ai/TEErminator/cmd.Commit={{.Commit}}
+      - -X github.com/confidential-dot-ai/TEErminator/cmd.Date={{.Date}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: false
+  prerelease: auto

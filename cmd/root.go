@@ -13,8 +13,9 @@ const DefaultName = "teerminator"
 // newRootCmd builds the root command for the standalone TEErminator binary.
 func newRootCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   DefaultName,
-		Short: "Localhost proxy for verifying and enforcing TEE-attestation from remote hosts",
+		Use:     DefaultName,
+		Version: versionString(),
+		Short:   "Localhost proxy for verifying and enforcing TEE-attestation from remote hosts",
 		Long: `TEErminator is a localhost daemon that lets you connect to remote TEE APIs
 verified through dedicated session-scoped attestation bound to the upstream TLS session.`,
 	}
