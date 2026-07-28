@@ -46,6 +46,8 @@ $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
     --mode attest --server-name c8s-tls-lb.c8s-system.svc --measurements <hex,...>
 ```
 
+When the remote URL host is a raw IP and `--server-name` is omitted, it defaults to `c8s-tls-lb.c8s-system.svc` (the standard c8s LB SAN) and `remote add` prints a note saying so. Pass `--server-name` explicitly — e.g. the IP itself, for a certificate that does carry an IP SAN — to override the default.
+
 ### Attestation modes
 
 `--mode` selects how each remote is verified:

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -11,6 +13,26 @@ import (
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
 	"github.com/spf13/cobra"
 )
+
+// defaultC8sServerName is the internal DNS SAN a stock c8s TLS LoadBalancer
+// serves. Remotes added by raw IP without --server-name default to it, since
+// an IP-reached c8s LB is the common case and its cert carries no IP SAN.
+const defaultC8sServerName = "c8s-tls-lb.c8s-system.svc"
+
+// defaultServerName returns the ServerName to store for a remote: the explicit
+// override when given, otherwise defaultC8sServerName when remoteURL's host is
+// a raw IP (whose cert can't be expected to match the dial address). The bool
+// reports whether the default was applied.
+func defaultServerName(remoteURL, explicit string) (string, bool) {
+	if explicit != "" {
+		return explicit, false
+	}
+	u, err := url.Parse(remoteURL)
+	if err != nil || net.ParseIP(u.Hostname()) == nil {
+		return "", false
+	}
+	return defaultC8sServerName, true
+}
 
 // newRemoteCmd builds the `remote` command group and its subcommands. name is
 // the invocation prefix used in help-text examples.
@@ -51,6 +73,12 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				return fmt.Errorf("loading config: %w", err)
 			}
 
+			serverName, defaulted := defaultServerName(remoteURL, serverName)
+			if defaulted {
+				fmt.Printf("Note: %s is reached by IP and no --server-name was given; defaulting the TLS server name to %q (the standard c8s LB SAN). Pass --server-name (e.g. the IP itself, for a cert with an IP SAN) to override.\n",
+					remoteURL, defaultC8sServerName)
+			}
+
 			r := config.Remote{
 				Local:        localAddr,
 				Remote:       remoteURL,
@@ -81,7 +109,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringVar(&mode, "mode", "", "attestation mode: attest (session-scoped endpoint attestation), cds-cert (CDS-cert pinning, not yet implemented), or empty to disable")
 	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated")
 	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest always uses the remote's origin)")
-	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Pair with `%s certs add <ca.pem>` to trust the issuing CA", name))
+	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
 	return cmd
 }
 
