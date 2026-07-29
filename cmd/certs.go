@@ -69,6 +69,7 @@ func newCertsCmd() *cobra.Command {
 		},
 	}
 	certsCmd.AddCommand(newCertsAddCmd())
+	certsCmd.AddCommand(newCertsDeriveCmd())
 	certsCmd.AddCommand(newCertsRmCmd())
 	return certsCmd
 }
