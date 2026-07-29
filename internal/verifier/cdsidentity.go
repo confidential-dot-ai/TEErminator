@@ -117,12 +117,27 @@ type attestationASN1 struct {
 // staleness window to tune, and a changed fingerprint is exactly when to
 // re-attest.
 type CDSIdentity struct {
-	Fingerprint     [32]byte
-	LaunchDigest    string
+	Fingerprint  [32]byte
+	LaunchDigest string
+	// RTMR3 is the signature-verified rtmr_3 claim (lowercase hex), empty when
+	// the platform carries none. Cached so a later RTMR[3] pin can be
+	// evaluated against an already-verified quote.
+	RTMR3           string
 	MeshCADigest    []byte
 	AllowlistDigest []byte
-	NotAfter        time.Time
+	// NotBefore and NotAfter are the certificate's validity window. They are
+	// trustworthy: the SPKI is REPORTDATA-bound, and AttestCDSIdentity
+	// verifies the certificate's self-signature with that key, which extends
+	// the hardware binding to the entire tbsCertificate — including these
+	// fields. NotBefore is the monotonic floor rollback detection compares
+	// against (CachedAttestor).
+	NotBefore time.Time
+	NotAfter  time.Time
 }
+
+// timeNow is the clock AttestCDSIdentity validates the certificate window
+// against. A variable so tests can pin it.
+var timeNow = time.Now
 
 // FingerprintHex renders the cache key.
 func (id *CDSIdentity) FingerprintHex() string { return hex.EncodeToString(id.Fingerprint[:]) }
@@ -190,6 +205,36 @@ func AttestCDSIdentity(certPEM []byte, policy CDSPolicy) (*CDSIdentity, error) {
 		return nil, fmt.Errorf("cds-identity: parse certificate: %w", err)
 	}
 
+	// The certificate must be inside its validity window, and its
+	// self-signature must verify with its own key. REPORTDATA binds only the
+	// SPKI and the claims extension value — not NotBefore/NotAfter — so
+	// without the self-signature check an attacker holding genuine evidence
+	// could re-wrap the same key and claims in a fresh certificate with any
+	// validity window (they cannot: producing the signature needs the private
+	// key, which never leaves the TEE). With it, the whole tbsCertificate
+	// carries the hardware binding, which is what makes the validity window —
+	// and the rollback floor built on NotBefore — trustworthy.
+	//
+	// x509.Certificate.CheckSignatureFrom is deliberately not used: it
+	// enforces CA basic constraints on the issuer, and CDS's identity
+	// certificate is a serving certificate, not a CA (c8s pkg/ratls cert.go
+	// sets BasicConstraintsValid without IsCA). CheckSignature over the raw
+	// TBS with the certificate's own key is the exact primitive needed.
+	now := timeNow()
+	if now.Before(cert.NotBefore) {
+		return nil, fmt.Errorf("cds-identity: certificate is not yet valid (notBefore %s, now %s)",
+			cert.NotBefore.Format(time.RFC3339), now.Format(time.RFC3339))
+	}
+	if now.After(cert.NotAfter) {
+		return nil, fmt.Errorf("cds-identity: certificate expired %s (now %s) — "+
+			"CDS re-issues long before expiry, so an expired certificate is stale at best and a replay at worst",
+			cert.NotAfter.Format(time.RFC3339), now.Format(time.RFC3339))
+	}
+	if err := cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature); err != nil {
+		return nil, fmt.Errorf("cds-identity: certificate self-signature does not verify: %w "+
+			"(the validity window cannot be trusted without it)", err)
+	}
+
 	attExt := extensionValue(cert, oidRATLSAttestation)
 	if attExt == nil {
 		return nil, fmt.Errorf("cds-identity: certificate carries no RA-TLS attestation extension (%s) — "+
@@ -254,11 +299,17 @@ func AttestCDSIdentity(certPEM []byte, policy CDSPolicy) (*CDSIdentity, error) {
 		return nil, err
 	}
 
+	// Record rtmr_3 even when no pin was asked for, so a cached verdict can
+	// satisfy a pin added later without re-running quote verification.
+	rtmr3, _ := res.Claims.PlatformData["rtmr_3"].(string)
+
 	return &CDSIdentity{
 		Fingerprint:     sha256.Sum256(cert.Raw),
 		LaunchDigest:    res.Claims.LaunchDigest,
+		RTMR3:           strings.ToLower(strings.TrimSpace(rtmr3)),
 		MeshCADigest:    claims.MeshCADigest,
 		AllowlistDigest: claims.AllowlistDigest,
+		NotBefore:       cert.NotBefore,
 		NotAfter:        cert.NotAfter,
 	}, nil
 }
@@ -513,23 +564,8 @@ func DeriveMeshCA(
 	discoveryURL, meshCAURL string,
 	policy CDSPolicy,
 ) ([]byte, *CDSIdentity, error) {
-	certPEM, err := FetchCDSIdentityPEM(ctx, client, discoveryURL)
-	if err != nil {
-		return nil, nil, err
-	}
-	id, err := AttestCDSIdentity(certPEM, policy)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	caPEM, err := fetchPEM(ctx, client, meshCAURL)
-	if err != nil {
-		return nil, nil, fmt.Errorf("cds-identity: fetch mesh CA: %w", err)
-	}
-	if _, err := id.VerifyMeshCA(caPEM); err != nil {
-		return nil, nil, err
-	}
-	return caPEM, id, nil
+	caPEM, id, _, _, err := (&CachedAttestor{}).DeriveMeshCAWithCache(ctx, client, discoveryURL, meshCAURL, policy, nil)
+	return caPEM, id, err
 }
 
 func fetchPEM(ctx context.Context, client *http.Client, rawURL string) ([]byte, error) {

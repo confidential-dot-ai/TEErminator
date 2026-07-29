@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 type AuthType string
@@ -96,9 +97,48 @@ type Cert struct {
 	PEM        string `json:"pem"`
 }
 
+// CDSIdentityCache is the persisted verdict of one CDS attestation, keyed by
+// the derive target (the front-door base URL).
+//
+// The CDS RA-TLS certificate is immutable once issued, so its SHA-256
+// fingerprint is both the cache key and the invalidation signal: as long as the
+// freshly fetched certificate's fingerprint equals Fingerprint and the clock is
+// inside [NotBefore, NotAfter], the previous quote verification still stands
+// and can be skipped. A changed fingerprint means CDS re-issued (allowlist
+// change or restart) and forces a full re-attestation.
+//
+// NotBefore is also the monotonic rollback floor: a re-issued certificate must
+// not be older than the one last verified (see verifier.CachedAttestor).
+type CDSIdentityCache struct {
+	// Target is the front-door base URL the identity was derived from.
+	Target string `json:"target"`
+	// Fingerprint is hex SHA-256 of the verified certificate's DER.
+	Fingerprint string `json:"fingerprint"`
+	// NotBefore/NotAfter are the verified certificate's validity window. They
+	// are trustworthy because AttestCDSIdentity verifies the certificate's
+	// self-signature against its REPORTDATA-bound key, extending the hardware
+	// binding to the whole tbsCertificate.
+	NotBefore time.Time `json:"not_before"`
+	NotAfter  time.Time `json:"not_after"`
+	// VerifiedAt is when the full quote verification last ran (never updated
+	// by a cache hit — a hit reuses this verdict, it does not mint a new one).
+	VerifiedAt time.Time `json:"verified_at"`
+	// LaunchDigest and RTMR3 are the signature-verified claims the policy was
+	// evaluated against, kept so a cache hit can re-evaluate a *changed*
+	// policy without re-running quote verification.
+	LaunchDigest string `json:"launch_digest,omitempty"`
+	RTMR3        string `json:"rtmr_3,omitempty"`
+	// MeshCADigest and AllowlistDigest are the attested config-claims digests
+	// (hex), exactly as returned by the verified attestation.
+	MeshCADigest    string `json:"mesh_ca_digest"`
+	AllowlistDigest string `json:"allowlist_digest,omitempty"`
+}
+
 type Config struct {
 	Remotes []Remote `json:"remotes"`
 	Certs   []Cert   `json:"certs,omitempty"`
+	// CDSIdentities caches verified CDS attestations, one per derive target.
+	CDSIdentities []CDSIdentityCache `json:"cds_identities,omitempty"`
 }
 
 func configPath() (string, error) {
@@ -206,6 +246,29 @@ func (c *Config) AddCert(cert Cert) error {
 	}
 	c.Certs = append(c.Certs, cert)
 	return nil
+}
+
+// FindCDSIdentity returns the cached CDS attestation for a derive target, or
+// nil when none has been recorded.
+func (c *Config) FindCDSIdentity(target string) *CDSIdentityCache {
+	for i := range c.CDSIdentities {
+		if c.CDSIdentities[i].Target == target {
+			return &c.CDSIdentities[i]
+		}
+	}
+	return nil
+}
+
+// UpsertCDSIdentity records a verified CDS attestation for its target,
+// replacing any previous entry for the same target.
+func (c *Config) UpsertCDSIdentity(entry CDSIdentityCache) {
+	for i := range c.CDSIdentities {
+		if c.CDSIdentities[i].Target == entry.Target {
+			c.CDSIdentities[i] = entry
+			return
+		}
+	}
+	c.CDSIdentities = append(c.CDSIdentities, entry)
 }
 
 func (c *Config) RemoveCert(commonName string) bool {

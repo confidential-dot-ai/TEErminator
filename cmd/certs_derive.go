@@ -33,6 +33,7 @@ func newCertsDeriveCmd() *cobra.Command {
 		meshCAPath    string
 		timeout       time.Duration
 		insecure      bool
+		allowRollback bool
 	)
 
 	cmd := &cobra.Command{
@@ -72,11 +73,27 @@ to a specific image and deployment.`,
 				fmt.Println("WARNING: no --measurements pinned — any genuine TEE is accepted (UNSAFE outside development)")
 			}
 
-			caPEM, id, err := verifier.DeriveMeshCA(ctx, client,
+			// Config is loaded up front because the cached attestation verdict
+			// for this target feeds the verification step itself: a fingerprint
+			// match skips the quote verification, a mismatch triggers the
+			// rollback check against the cached NotBefore.
+			cfg, err := config.Load()
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			cached := cfg.FindCDSIdentity(base)
+
+			attestor := &verifier.CachedAttestor{AllowRollback: allowRollback}
+			caPEM, id, entry, hit, err := attestor.DeriveMeshCAWithCache(ctx, client,
 				base+discoveryPath, base+meshCAPath,
-				verifier.CDSPolicy{Measurements: measurements, ExpectedRTMR3: expectedRTMR3})
+				verifier.CDSPolicy{Measurements: measurements, ExpectedRTMR3: expectedRTMR3},
+				cached)
 			if err != nil {
 				return err
+			}
+			if hit {
+				fmt.Printf("CDS attestation cache hit (%.12s…): certificate unchanged since last full verification at %s — quote verification skipped\n",
+					entry.Fingerprint, entry.VerifiedAt.Format(time.RFC3339))
 			}
 
 			block, _ := pem.Decode(caPEM)
@@ -92,10 +109,6 @@ to a specific image and deployment.`,
 				return fmt.Errorf("derived mesh CA has no common name")
 			}
 
-			cfg, err := config.Load()
-			if err != nil {
-				return fmt.Errorf("loading config: %w", err)
-			}
 			// Replace rather than duplicate: the mesh CA regenerates whenever
 			// CDS restarts, so re-deriving is routine and must converge on one
 			// entry instead of accumulating stale anchors.
@@ -103,6 +116,12 @@ to a specific image and deployment.`,
 			if err := cfg.AddCert(config.Cert{CommonName: commonName, PEM: string(caPEM)}); err != nil {
 				return err
 			}
+			// The cache entry exists only because full verification (or a
+			// still-valid cached verdict) succeeded above; persisting it here —
+			// after every check has passed and alongside the CA it vouches for
+			// — is what makes the write ordering safe.
+			entry.Target = base
+			cfg.UpsertCDSIdentity(*entry)
 			if err := cfg.Save(); err != nil {
 				return fmt.Errorf("saving config: %w", err)
 			}
@@ -127,6 +146,7 @@ to a specific image and deployment.`,
 	f.StringVar(&meshCAPath, "mesh-ca-path", defaultMeshCAPath, "path the front door serves the mesh CA PEM at")
 	f.DurationVar(&timeout, "timeout", 30*time.Second, "overall timeout")
 	f.BoolVar(&insecure, "insecure-transport", false, "skip TLS verification of the front door itself; the CDS certificate and mesh CA are still fully verified (needed to bootstrap before the CA is installed)")
+	f.BoolVar(&allowRollback, "allow-rollback", false, "accept a CDS certificate OLDER (by notBefore) than the last verified one; normally refused as a replayed (cert, allowlist) pair — use only for a deliberate re-bootstrap, e.g. against a restored cluster")
 	return cmd
 }
 
