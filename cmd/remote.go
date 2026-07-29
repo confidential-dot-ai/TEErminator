@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -50,10 +51,11 @@ func newRemoteCmd(name string) *cobra.Command {
 
 func newRemoteAddCmd(name string) *cobra.Command {
 	var (
-		mode         string
-		measurements []string
-		discoveryURL string
-		serverName   string
+		mode          string
+		measurements  []string
+		discoveryURL  string
+		serverName    string
+		expectedRTMR3 string
 	)
 
 	cmd := &cobra.Command{
@@ -66,6 +68,20 @@ func newRemoteAddCmd(name string) *cobra.Command {
 
 			if !config.ValidAttestMode(mode) {
 				return fmt.Errorf("invalid --mode %q (want one of: attest, cds-cert, or empty)", mode)
+			}
+			// Reject a malformed pin here rather than at first connect: a
+			// remote saved with an unusable pin looks configured and would
+			// only fail much later, when the operator has moved on.
+			expectedRTMR3 = strings.TrimSpace(expectedRTMR3)
+			if expectedRTMR3 != "" {
+				if config.AttestMode(mode) != config.AttestEndpoint {
+					return fmt.Errorf("--expected-rtmr3 requires --mode attest (nothing verifies the register otherwise)")
+				}
+				if b, err := hex.DecodeString(expectedRTMR3); err != nil {
+					return fmt.Errorf("--expected-rtmr3: not hex: %w", err)
+				} else if len(b) != 48 {
+					return fmt.Errorf("--expected-rtmr3 is %d bytes (%d hex chars), want 48 (96 hex chars)", len(b), len(expectedRTMR3))
+				}
 			}
 
 			cfg, err := config.Load()
@@ -80,14 +96,15 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			}
 
 			r := config.Remote{
-				Local:        localAddr,
-				Remote:       remoteURL,
-				Auth:         config.AuthNone,
-				Status:       config.StatusUnknown,
-				Mode:         config.AttestMode(mode),
-				Measurements: measurements,
-				DiscoveryURL: discoveryURL,
-				ServerName:   serverName,
+				Local:         localAddr,
+				Remote:        remoteURL,
+				Auth:          config.AuthNone,
+				Status:        config.StatusUnknown,
+				Mode:          config.AttestMode(mode),
+				Measurements:  measurements,
+				DiscoveryURL:  discoveryURL,
+				ServerName:    serverName,
+				ExpectedRTMR3: expectedRTMR3,
 			}
 			if err := cfg.AddRemote(r); err != nil {
 				return err
@@ -108,6 +125,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f := cmd.Flags()
 	f.StringVar(&mode, "mode", "", "attestation mode: attest (session-scoped endpoint attestation), cds-cert (CDS-cert pinning, not yet implemented), or empty to disable")
 	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated")
+	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] (96 hex chars); the session fails unless the remote's runtime measurement register matches. Where --measurements pins the code, this pins the deployment: the operator key bound at launch is unique to the cluster, a launch digest is not. Requires --mode attest; TDX remotes only")
 	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest always uses the remote's origin)")
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
 	return cmd

@@ -55,6 +55,15 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		if len(r.Measurements) == 0 {
 			detail += " (no --measurements allowlist: workload identity not pinned)"
 		}
+		// Say which checks actually ran. A verified verdict backed only by a
+		// launch digest proves audited code on real silicon, not that this is
+		// the operator's own deployment; the difference should not be
+		// invisible in the output.
+		if r.ExpectedRTMR3 != "" {
+			detail += "; RTMR[3] " + r.ExpectedRTMR3 + " matched (deployment identity pinned)"
+		} else {
+			detail += "; RTMR[3] not pinned (deployment identity not verified)"
+		}
 		return CheckResult{config.StatusVerified, detail}
 	case config.AttestNone:
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, origin, nil)

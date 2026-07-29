@@ -64,7 +64,21 @@ type Remote struct {
 	// trust anchor so the chain also verifies.
 	ServerName   string   `json:"server_name,omitempty"`
 	Measurements []string `json:"measurements,omitempty"` // accepted hex launch digests
-	Pin          *CertPin `json:"pin,omitempty"`
+	// ExpectedRTMR3 pins the remote's TDX runtime measurement register as 96
+	// hex chars. Empty = no pin.
+	//
+	// Measurements pin the *code* — but the image is open source and
+	// reproducible, so a valid launch digest only proves "a genuine instance of
+	// the audited build on real silicon", which an attacker can also stand up.
+	// RTMR[3] carries what is unique to a deployment: the operator key bound at
+	// launch, plus any per-workload extends. Pinning it is what makes the
+	// verdict "this operator's cluster" rather than "some genuine cluster".
+	//
+	// TDX only — SNP has no runtime-extend register, and attestation-go
+	// consults RTMR pins only on the TDX path, so a pin set for any other
+	// platform would be silently ignored.
+	ExpectedRTMR3 string   `json:"expected_rtmr3,omitempty"`
+	Pin           *CertPin `json:"pin,omitempty"`
 }
 
 // ValidAttestMode reports whether s is a recognised attestation mode.

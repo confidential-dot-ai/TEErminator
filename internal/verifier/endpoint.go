@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -153,7 +155,7 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	bind = append(bind, nonce...)
 	expected := sha512.Sum384(bind)
 
-	measurement, err := verifyEndpointEvidence(bundle, expected[:])
+	measurement, err := verifyEndpointEvidence(bundle, expected[:], e.remote.ExpectedRTMR3)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +175,7 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 // bare-metal platforms, or in the AK-signed vTPM quote for the Azure ones. All
 // evidence parsing and cryptographic verification lives in attestation-go;
 // only the binding anchor and the measurement policy are computed here.
-func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte) (string, error) {
+func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte, expectedRTMR3Hex string) (string, error) {
 	raw, err := json.Marshal(teetypes.AttestationEvidence{
 		Platform: teetypes.PlatformType(b.Platform),
 		Evidence: b.Evidence,
@@ -181,11 +183,64 @@ func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte) (str
 	if err != nil {
 		return "", fmt.Errorf("attest: re-encode evidence: %w", err)
 	}
+	var wantRTMR3 []byte
+	if expectedRTMR3Hex != "" {
+		wantRTMR3, err = parseRTMR3(expectedRTMR3Hex)
+		if err != nil {
+			return "", err
+		}
+		// Only the TDX verifier consults RTMR pins. Accepting one for any other
+		// platform would drop it silently, leaving a remote that looks pinned
+		// and is not — fail closed instead.
+		if b.Platform != string(teetypes.PlatformTDX) {
+			return "", fmt.Errorf("attest: remote platform is %q but expected_rtmr3 is set: the runtime measurement register is TDX-only and the pin cannot be enforced here", b.Platform)
+		}
+	}
+
+	// The pin is deliberately not passed as VerifyParams.ExpectedRTMRs:
+	// go-tdx-guest numbers the registers 1-4, so its rejection reads
+	// "RTMR[4]" for RTMR[3] and never mentions the operator key — which looks
+	// like a hardware fault rather than the identity mismatch it is. The
+	// rtmr_3 claim below is read off the same signature-verified quote body,
+	// so checking it here is equally binding and can say what went wrong.
 	res, err := teeverify.Verify(raw, teetypes.VerifyParams{ExpectedReportData: expectedReportData})
 	if err != nil {
 		return "", fmt.Errorf("attest (%s): %w", b.Platform, err)
 	}
+
+	if wantRTMR3 != nil {
+		got, _ := res.Claims.PlatformData["rtmr_3"].(string)
+		got = strings.ToLower(strings.TrimSpace(got))
+		if got == "" {
+			return "", fmt.Errorf("attest: quote carries no rtmr_3, so expected_rtmr3 cannot be enforced")
+		}
+		gotBytes, err := hex.DecodeString(got)
+		if err != nil {
+			return "", fmt.Errorf("attest: rtmr_3 claim is malformed (%q)", got)
+		}
+		if !bytes.Equal(gotBytes, wantRTMR3) {
+			return "", fmt.Errorf("attest: RTMR[3] mismatch: remote reports %s, expected %s "+
+				"(this is not the deployment the pin was taken from — the node was not launched with that operator key)",
+				got, hex.EncodeToString(wantRTMR3))
+		}
+	}
 	return res.Claims.LaunchDigest, nil
+}
+
+// rtmr3Len is the SHA-384 width of the TDX runtime measurement register.
+const rtmr3Len = 48
+
+// parseRTMR3 decodes a 96-hex-char register pin. A malformed pin is an error,
+// never a skipped check.
+func parseRTMR3(s string) ([]byte, error) {
+	b, err := hex.DecodeString(strings.TrimSpace(s))
+	if err != nil {
+		return nil, fmt.Errorf("expected_rtmr3: not hex: %w", err)
+	}
+	if len(b) != rtmr3Len {
+		return nil, fmt.Errorf("expected_rtmr3 is %d bytes, want %d (%d hex chars)", len(b), rtmr3Len, rtmr3Len*2)
+	}
+	return b, nil
 }
 
 // leafSPKIFromTLS returns the raw SubjectPublicKeyInfo (DER) of the peer leaf.
