@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ func newCertsDeriveCmd() *cobra.Command {
 		expectedRTMR3 string
 		discoveryPath string
 		meshCAPath    string
+		allowlistPath string
 		timeout       time.Duration
 		insecure      bool
 		allowRollback bool
@@ -96,6 +98,31 @@ to a specific image and deployment.`,
 					entry.Fingerprint, entry.VerifiedAt.Format(time.RFC3339))
 			}
 
+			// Check the allowlist the endpoint serves RIGHT NOW against the
+			// digest the certificate attests, before anything is written to
+			// the trust store.
+			//
+			// Printing the attested digest without this check was misleading in
+			// exactly the case that matters. CDS re-issues its serving
+			// certificate within seconds of an allowlist change, but the
+			// certificate republished in the discovery document is a copy
+			// recorded when get-cert last ran, so it can lag arbitrarily. A
+			// stale copy still verifies — its evidence is self-consistent — and
+			// the digest it carries then describes a policy that is no longer
+			// in force. Comparing against the served bytes is what turns
+			// "this certificate says X" into "X is what this endpoint enforces".
+			if hasAttestedAllowlist(id) {
+				raw, err := fetchAllowlist(ctx, client, base+allowlistPath)
+				if err != nil {
+					return fmt.Errorf("fetch %s: %w", base+allowlistPath, err)
+				}
+				if err := id.VerifyAllowlist(raw); err != nil {
+					return fmt.Errorf("%w\n\nThe attested certificate and the served allowlist disagree. Either the "+
+						"allowlist changed and the discovery document still publishes an older CDS certificate, "+
+						"or the endpoint is serving a policy it cannot attest", err)
+				}
+			}
+
 			block, _ := pem.Decode(caPEM)
 			if block == nil {
 				return fmt.Errorf("derived mesh CA is not PEM")
@@ -131,7 +158,7 @@ to a specific image and deployment.`,
 			fmt.Printf("  CDS cert SHA-256    %s\n", id.FingerprintHex())
 			fmt.Printf("  mesh CA digest      %s (attested)\n", hex.EncodeToString(id.MeshCADigest))
 			if hasAttestedAllowlist(id) {
-				fmt.Printf("  live allowlist      %s (attested)\n", hex.EncodeToString(id.AllowlistDigest))
+				fmt.Printf("  live allowlist      %s (matches the bytes served now)\n", hex.EncodeToString(id.AllowlistDigest))
 			}
 			fmt.Printf("\nRe-run this when the CDS cert SHA-256 changes; CDS re-issues on every\n")
 			fmt.Printf("allowlist change, so a changed fingerprint is exactly when to re-attest.\n")
@@ -144,6 +171,7 @@ to a specific image and deployment.`,
 	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 hex chars — pins the deployment (operator key), not just the image")
 	f.StringVar(&discoveryPath, "discovery-path", defaultDiscoveryPath, "path of the discovery document on the front door")
 	f.StringVar(&meshCAPath, "mesh-ca-path", defaultMeshCAPath, "path the front door serves the mesh CA PEM at")
+	f.StringVar(&allowlistPath, "allowlist-path", defaultAllowlistPath, "path the front door serves the live allowlist at; its exact bytes are checked against the attested digest")
 	f.DurationVar(&timeout, "timeout", 30*time.Second, "overall timeout")
 	f.BoolVar(&insecure, "insecure-transport", false, "skip TLS verification of the front door itself; the CDS certificate and mesh CA are still fully verified (needed to bootstrap before the CA is installed)")
 	f.BoolVar(&allowRollback, "allow-rollback", false, "accept a CDS certificate OLDER (by notBefore) than the last verified one; normally refused as a replayed (cert, allowlist) pair — use only for a deliberate re-bootstrap, e.g. against a restored cluster")
@@ -153,6 +181,7 @@ to a specific image and deployment.`,
 const (
 	defaultDiscoveryPath = "/v1/discovery"
 	defaultMeshCAPath    = "/.well-known/mesh-ca.pem"
+	defaultAllowlistPath = "/allowlist"
 )
 
 func hasAttestedAllowlist(id *verifier.CDSIdentity) bool {
@@ -170,4 +199,24 @@ func hasAttestedAllowlist(id *verifier.CDSIdentity) bool {
 // solely on a digest match against those verified claims.
 func insecureTLSConfig() *tls.Config {
 	return &tls.Config{InsecureSkipVerify: true} //nolint:gosec // see comment
+}
+
+// fetchAllowlist reads the allowlist response verbatim. The digest CDS attests
+// is taken over the canonical bytes it serves, so the body must not be parsed
+// and re-encoded on the way here: a semantically identical re-serialization
+// hashes differently and the mismatch would read as an attack.
+func fetchAllowlist(ctx context.Context, client *http.Client, rawURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close() //nolint:errcheck // read-only
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s returned %d", rawURL, resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 }
