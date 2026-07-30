@@ -664,10 +664,10 @@ func TestUpstreamServerNameAndCustomCA(t *testing.T) {
 	}
 }
 
-// spkiOf returns the SHA-256 of a certificate's SubjectPublicKeyInfo, the value
-// attestation verdicts pin sessions to.
-func spkiOf(cert *x509.Certificate) [32]byte {
-	return sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+// leafHashOf returns the SHA-256 of a certificate's full DER, the exact-leaf
+// value attestation verdicts pin sessions to.
+func leafHashOf(cert *x509.Certificate) [32]byte {
+	return sha256.Sum256(cert.Raw)
 }
 
 // TestAttestedLeafVerifier unit-tests the handshake-time pin: it must admit
@@ -683,7 +683,7 @@ func TestAttestedLeafVerifier(t *testing.T) {
 		}
 		return cert
 	}
-	pinnedPEM, _ := selfSignedCert(t, "pinned.example")
+	pinnedPEM, pinnedKeyPEM := selfSignedCert(t, "pinned.example")
 	otherPEM, _ := selfSignedCert(t, "other.example")
 	pinned, other := parse(pinnedPEM), parse(otherPEM)
 
@@ -703,7 +703,7 @@ func TestAttestedLeafVerifier(t *testing.T) {
 		t.Fatalf("no verdict: want handshake admitted, got %v", err)
 	}
 
-	cache.RecordSession(key, true, spkiOf(pinned), nil)
+	cache.RecordSession(key, true, leafHashOf(pinned), nil)
 	if err := verify(state(pinned)); err != nil {
 		t.Fatalf("pinned leaf: want handshake admitted, got %v", err)
 	}
@@ -712,6 +712,33 @@ func TestAttestedLeafVerifier(t *testing.T) {
 	}
 	if err := verify(state(nil)); err == nil {
 		t.Fatal("no peer certificate: want handshake refused, got nil")
+	}
+
+	// A different certificate over the SAME key must also be refused: the pin
+	// is the exact leaf DER, not the SPKI.
+	keyBlock, _ := pem.Decode(pinnedKeyPEM)
+	keyAny, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedKey := keyAny.(*ecdsa.PrivateKey)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(99),
+		Subject:      pkix.Name{CommonName: "pinned.example"},
+		DNSNames:     []string{"pinned.example"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	sameKeyDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &pinnedKey.PublicKey, pinnedKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameKey, err := x509.ParseCertificate(sameKeyDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verify(state(sameKey)); err == nil {
+		t.Fatal("substituted certificate with the attested key: want handshake refused, got nil")
 	}
 
 	// A failed verdict pins nothing; the round-trip path fails fast instead.
@@ -753,7 +780,7 @@ func TestHandshakePinBlocksBeforeSend(t *testing.T) {
 		defer func() { _ = tr.Close() }()
 		// Seed a fresh passing verdict directly so the round trip skips the
 		// attester and exercises only the handshake-time pin.
-		tr.cache.RecordSession(target.Host, true, pin, nil)
+		tr.cache.RecordSession(tr.remoteKey, true, pin, nil)
 		req, _ := http.NewRequest("GET", backend.URL, nil)
 		resp, err := tr.RoundTrip(req)
 		if err != nil {
@@ -768,7 +795,7 @@ func TestHandshakePinBlocksBeforeSend(t *testing.T) {
 	// the request must never reach the backend.
 	if _, err := roundTrip([32]byte{0xde, 0xad}); err == nil {
 		t.Fatal("mismatched pin: want a handshake error, got a forwarded response")
-	} else if !strings.Contains(err.Error(), "does not match the attested SPKI") {
+	} else if !strings.Contains(err.Error(), "does not match the attested leaf") {
 		t.Fatalf("mismatched pin: want the handshake pin error, got %v", err)
 	}
 	if got := hits.Load(); got != 0 {
@@ -776,7 +803,7 @@ func TestHandshakePinBlocksBeforeSend(t *testing.T) {
 	}
 
 	// Pin the upstream's actual leaf: forwards normally.
-	body, err := roundTrip(spkiOf(backend.Certificate()))
+	body, err := roundTrip(leafHashOf(backend.Certificate()))
 	if err != nil {
 		t.Fatalf("matching pin: %v", err)
 	}

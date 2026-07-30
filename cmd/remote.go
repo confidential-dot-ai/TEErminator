@@ -7,10 +7,12 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 	"github.com/spf13/cobra"
 )
 
@@ -48,12 +50,46 @@ func newRemoteCmd(name string) *cobra.Command {
 	return remoteCmd
 }
 
+// validateWorkloadFlags checks the --workload/--allowlist pins at add time:
+// the name must satisfy the workload-name grammar, the allowlist file must
+// exist and parse as a c8s.allowlist/v1 document, and when both are given the
+// name must resolve in the document. It returns the allowlist path to store
+// (absolute, so the daemon finds it regardless of working directory).
+func validateWorkloadFlags(workload, allowlistPath string) (string, error) {
+	if workload != "" && !verifier.ValidWorkloadName(workload) {
+		return "", fmt.Errorf("invalid --workload %q: want 1..%d bytes matching [A-Za-z0-9][A-Za-z0-9._-]*", workload, verifier.MaxWorkloadNameLen)
+	}
+	if allowlistPath == "" {
+		return "", nil
+	}
+	raw, err := os.ReadFile(allowlistPath)
+	if err != nil {
+		return "", fmt.Errorf("reading --allowlist: %w", err)
+	}
+	doc, err := verifier.ParsePinnedAllowlist(raw)
+	if err != nil {
+		return "", fmt.Errorf("--allowlist %s: %w", allowlistPath, err)
+	}
+	if workload != "" {
+		if _, ok := doc.Workloads[workload]; !ok {
+			return "", fmt.Errorf("--allowlist %s does not contain workload %q", allowlistPath, workload)
+		}
+	}
+	abs, err := filepath.Abs(allowlistPath)
+	if err != nil {
+		return "", fmt.Errorf("resolving --allowlist path: %w", err)
+	}
+	return abs, nil
+}
+
 func newRemoteAddCmd(name string) *cobra.Command {
 	var (
-		mode         string
-		measurements []string
-		discoveryURL string
-		serverName   string
+		mode          string
+		measurements  []string
+		discoveryURL  string
+		serverName    string
+		workload      string
+		allowlistPath string
 	)
 
 	cmd := &cobra.Command{
@@ -64,8 +100,17 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			localAddr := args[0]
 			remoteURL := args[1]
 
-			if !config.ValidAttestMode(mode) {
-				return fmt.Errorf("invalid --mode %q (want one of: attest, cds-cert, or empty)", mode)
+			attestMode, normalized, ok := config.ParseAttestMode(mode)
+			if !ok {
+				return fmt.Errorf("invalid --mode %q (want one of: attest-lb, cds-cert, or empty)", mode)
+			}
+			if normalized {
+				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
+			}
+
+			allowlistStored, err := validateWorkloadFlags(workload, allowlistPath)
+			if err != nil {
+				return err
 			}
 
 			cfg, err := config.Load()
@@ -80,14 +125,16 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			}
 
 			r := config.Remote{
-				Local:        localAddr,
-				Remote:       remoteURL,
-				Auth:         config.AuthNone,
-				Status:       config.StatusUnknown,
-				Mode:         config.AttestMode(mode),
-				Measurements: measurements,
-				DiscoveryURL: discoveryURL,
-				ServerName:   serverName,
+				Local:         localAddr,
+				Remote:        remoteURL,
+				Auth:          config.AuthNone,
+				Status:        config.StatusUnknown,
+				Mode:          attestMode,
+				Measurements:  measurements,
+				DiscoveryURL:  discoveryURL,
+				ServerName:    serverName,
+				WorkloadName:  workload,
+				AllowlistPath: allowlistStored,
 			}
 			if err := cfg.AddRemote(r); err != nil {
 				return err
@@ -106,10 +153,12 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	}
 
 	f := cmd.Flags()
-	f.StringVar(&mode, "mode", "", "attestation mode: attest (session-scoped endpoint attestation), cds-cert (CDS-cert pinning, not yet implemented), or empty to disable")
-	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated")
-	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest always uses the remote's origin)")
+	f.StringVar(&mode, "mode", "", "attestation mode: attest-lb (per-handshake attestation binding the exact serving leaf, over ordinary TLS), cds-cert (CDS-cert pinning, not yet implemented), or empty to disable")
+	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated; required for attest-lb (an empty measurement policy is a configuration error)")
+	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest-lb always uses the remote's origin)")
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
+	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb)")
+	f.StringVar(&allowlistPath, "allowlist", "", "path to a pinned canonical-allowlist JSON file; hashed exactly as read against the stamp's digest, and the stamped name must resolve in it (attest-lb)")
 	return cmd
 }
 
