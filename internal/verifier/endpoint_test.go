@@ -149,3 +149,63 @@ func TestSessionCachePinning(t *testing.T) {
 		t.Fatal("invalidated entry should not be fresh")
 	}
 }
+
+// Current c8s omits the binding field entirely: its attestation endpoint takes
+// no binding parameter, so pq=false is the whole selection and there is nothing
+// to echo. Requiring the echo made every such LB unverifiable, which is how
+// this was found. The binding is established by the report_data check, not by
+// the label, so an absent field must proceed to that check rather than fail.
+func TestAttestAcceptsAbsentBinding(t *testing.T) {
+	var envelope struct {
+		Platform string          `json:"platform"`
+		Evidence json.RawMessage `json:"evidence"`
+	}
+	if err := json.Unmarshal(azSnpFixture, &envelope); err != nil {
+		t.Fatalf("parsing fixture: %v", err)
+	}
+
+	ea := newTestAttester(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"version":  "c8s-verify/v1",
+			"platform": envelope.Platform,
+			"nonce":    r.URL.Query().Get("nonce"),
+			// no "binding" key at all
+			"evidence": envelope.Evidence,
+		})
+	}))
+	_, err := ea.Attest(context.Background())
+	if err == nil {
+		t.Fatal("recorded evidence should still fail its freshness binding")
+	}
+	if strings.Contains(err.Error(), "binding") && strings.Contains(err.Error(), "pq=false") {
+		t.Fatalf("absent binding rejected on the label instead of reaching the report_data check: %v", err)
+	}
+}
+
+// A named binding that is not the one pq=false selects is still refused: that
+// is an LB answering a different question from the one asked.
+func TestAttestRejectsMismatchedBinding(t *testing.T) {
+	var envelope struct {
+		Platform string          `json:"platform"`
+		Evidence json.RawMessage `json:"evidence"`
+	}
+	if err := json.Unmarshal(azSnpFixture, &envelope); err != nil {
+		t.Fatalf("parsing fixture: %v", err)
+	}
+
+	ea := newTestAttester(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"version":  "c8s-verify/v1",
+			"platform": envelope.Platform,
+			"nonce":    r.URL.Query().Get("nonce"),
+			"binding":  "identity-pq",
+			"evidence": envelope.Evidence,
+		})
+	}))
+	_, err := ea.Attest(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "identity-pq") {
+		t.Fatalf("want a refusal naming the selected binding, got %v", err)
+	}
+}

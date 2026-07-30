@@ -144,8 +144,20 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	if bundle.Nonce != base64.RawURLEncoding.EncodeToString(nonce) {
 		return nil, fmt.Errorf("attest: nonce mismatch (LB echoed %q)", bundle.Nonce)
 	}
-	if bundle.Binding != bindingTLSCert {
-		return nil, fmt.Errorf("attest: LB did not honor pq=false (binding=%q); the cluster's tls-lb must be built with the tls-cert binding (cds-attest --serving-cert-file)", bundle.Binding)
+	// A binding is only rejected when the LB names one and it is not the one
+	// pq=false selects. An ABSENT field is accepted: current c8s does not echo
+	// the binding at all, because the endpoint takes no binding parameter and
+	// pq=false is the whole selection, so there is nothing to negotiate or
+	// confirm (c8s internal/cmds/cdsattest/server.go).
+	//
+	// Requiring the echo added nothing to the security of this path and broke
+	// it entirely against those servers. What actually establishes the binding
+	// is the report_data check below: the evidence must commit to
+	// SHA-384(serving_leaf_spki ‖ nonce) computed from the leaf on the wire. An
+	// LB that used a different binding cannot produce that value, so this fails
+	// closed on the cryptography rather than on a label.
+	if bundle.Binding != "" && bundle.Binding != bindingTLSCert {
+		return nil, fmt.Errorf("attest: LB selected binding %q, not the tls-cert binding pq=false asks for", bundle.Binding)
 	}
 
 	// expected = SHA-384(serving_leaf_spki || nonce): the value the LB committed
