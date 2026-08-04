@@ -56,13 +56,13 @@ const attestLBVersion = "c8s/attest-lb/v1"
 // proofAlgorithmECDSASHA384 is the only identity-proof algorithm accepted.
 const proofAlgorithmECDSASHA384 = "ecdsa-sha384"
 
-// notBeforeSkew is the single documented clock-skew allowance (PLAN3 §9): a
+// notBeforeSkew is the single documented clock-skew allowance: a
 // certificate whose NotBefore is at most this far in the future is accepted, so
 // a freshly rotated mesh CA/leaf remains usable by a client whose clock trails
 // the cluster's. NotAfter has no allowance.
 const notBeforeSkew = 5 * time.Minute
 
-// Trust modes a verdict can carry (PLAN3 §1/§9): deployment-class means the
+// Trust modes a verdict can carry: deployment-class means the
 // mesh CA was derived from the hardware-committed response; specific-cluster
 // means it additionally byte-equals an operator-pinned CA (`certs add`).
 const (
@@ -72,7 +72,7 @@ const (
 
 // ProfileCAVouched is the workload-stamp guarantee label this client reports.
 // TEErminator cannot see the deployment's enforcement profile (preventive vs
-// observed), so it always reports the weaker generic label (PLAN3 §7).
+// observed), so it always reports the weaker generic label.
 const ProfileCAVouched = "ca-vouched"
 
 // SessionVerdict is the outcome of a session attestation. LeafSHA256 is the
@@ -431,7 +431,7 @@ func (e *EndpointAttester) checkWorkloadPolicy(meshLeaf *x509.Certificate) (*Mat
 	}
 	if e.remote.AllowlistPath != "" {
 		// Hash EXACTLY the file bytes as read — canonical bytes only, never a
-		// reserialization (PLAN3 §9).
+		// reserialization.
 		raw, err := os.ReadFile(e.remote.AllowlistPath)
 		if err != nil {
 			return nil, fmt.Errorf("workload policy: read pinned allowlist: %w", err)
@@ -488,7 +488,7 @@ func servingLeafFromTLS(state *tls.ConnectionState) (*x509.Certificate, error) {
 
 // checkMeasurement enforces the remote's launch-digest allowlist. In attest-lb
 // mode an all-empty measurement policy is a configuration error, not a
-// permissive default (PLAN3 §9/§11): nothing else in this flow pins WHAT
+// permissive default: nothing else in this flow pins WHAT
 // software the attested front door runs.
 func checkMeasurement(measurement string, allowed []string) error {
 	if len(allowed) == 0 {

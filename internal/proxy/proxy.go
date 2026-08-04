@@ -261,7 +261,7 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 		// response rather than pinning out of band — so Go's PKI chain
 		// verification cannot succeed here without a `certs add` pin. Instead
 		// of the WebPKI check, trust is deferred entirely to attest-lb
-		// verification, which is strictly stronger (PLAN3 §5): the exact
+		// verification, which is strictly stronger: the exact
 		// serving-leaf DER observed on the connection is bound into fresh
 		// hardware evidence and must chain to the hardware-committed CA, and no
 		// application bytes flow before that verdict (roundTripEndpoint).
