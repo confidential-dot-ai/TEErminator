@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -75,10 +76,11 @@ func (c *SessionCache) Invalidate(key string) {
 // where the pin digest covers, in order and each length-prefixed with a
 // one-byte tag and uint32-BE length: the sorted lowercased measurement
 // allowlist, the pinned workload name, the pinned allowlist file digest (when
-// set), and the sorted pinned-CA DER SHA-256 fingerprints. Every policy input
-// is part of the key, so a verdict cached under one policy or endpoint mode can
-// never authorize traffic under another.
-func RemoteKey(host string, r config.Remote, allowlistDigest []byte, pinnedCAs []*x509.Certificate) string {
+// set), the pinned image-manifest file digest (when set), the expected-RTMR[3]
+// pin, the SNP TCB floor (when set), and the sorted pinned-CA DER SHA-256
+// fingerprints. Every policy input is part of the key, so a verdict cached
+// under one policy or endpoint mode can never authorize traffic under another.
+func RemoteKey(host string, r config.Remote, allowlistDigest, imageManifestDigest []byte, pinnedCAs []*x509.Certificate) string {
 	h := sha256.New()
 	field := func(tag byte, b []byte) {
 		var n [5]byte
@@ -99,6 +101,14 @@ func RemoteKey(host string, r config.Remote, allowlistDigest []byte, pinnedCAs [
 	field('w', []byte(r.WorkloadName))
 	if allowlistDigest != nil {
 		field('a', allowlistDigest)
+	}
+	if imageManifestDigest != nil {
+		field('i', imageManifestDigest)
+	}
+	field('r', []byte(strings.ToLower(r.ExpectedRTMR3)))
+	if r.MinTCB != nil {
+		field('t', fmt.Appendf(nil, "%d,%d,%d,%d",
+			r.MinTCB.Bootloader, r.MinTCB.TEE, r.MinTCB.SNP, r.MinTCB.Microcode))
 	}
 	fps := make([]string, len(pinnedCAs))
 	for i, ca := range pinnedCAs {

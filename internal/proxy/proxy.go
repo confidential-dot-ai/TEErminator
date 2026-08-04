@@ -253,7 +253,16 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 			sum := sha256.Sum256(raw)
 			allowlistDigest = sum[:]
 		}
-		remoteKey = verifier.RemoteKey(target.Host, opts.Remote, allowlistDigest, pinnedCAs)
+		var imageManifestDigest []byte
+		if opts.Remote.ImageManifestPath != "" {
+			raw, err := os.ReadFile(opts.Remote.ImageManifestPath)
+			if err != nil {
+				return nil, fmt.Errorf("attest-lb: read pinned image manifest: %w", err)
+			}
+			sum := sha256.Sum256(raw)
+			imageManifestDigest = sum[:]
+		}
+		remoteKey = verifier.RemoteKey(target.Host, opts.Remote, allowlistDigest, imageManifestDigest, pinnedCAs)
 		cache = verifier.NewSessionCache(opts.ReattestInterval)
 
 		// attest-lb TLS trust: the front door's serving leaf chains to the

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -82,6 +83,45 @@ func validateWorkloadFlags(workload, allowlistPath string) (string, error) {
 	return abs, nil
 }
 
+// validateImageManifestFlag checks --image-manifest at add time — the file must
+// exist and parse as a complete mrtd+rtmr1+rtmr2 tuple — and returns the
+// absolute path to store, so the daemon finds it regardless of working
+// directory.
+func validateImageManifestFlag(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	if _, err := verifier.LoadImageManifest(path); err != nil {
+		return "", fmt.Errorf("--image-manifest: %w", err)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolving --image-manifest path: %w", err)
+	}
+	return abs, nil
+}
+
+// parseMinTCBFlag parses --min-tcb's four comma-separated components
+// (bootloader,tee,snp,microcode), each 0-255. Empty means no floor.
+func parseMinTCBFlag(s string) (*config.TCBFloor, error) {
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	if len(parts) != 4 {
+		return nil, fmt.Errorf("invalid --min-tcb %q: want four comma-separated components <bootloader,tee,snp,microcode>", s)
+	}
+	vals := make([]uint8, 4)
+	for i, p := range parts {
+		n, err := strconv.ParseUint(strings.TrimSpace(p), 10, 8)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --min-tcb component %q: want an integer 0-255", p)
+		}
+		vals[i] = uint8(n)
+	}
+	return &config.TCBFloor{Bootloader: vals[0], TEE: vals[1], SNP: vals[2], Microcode: vals[3]}, nil
+}
+
 func newRemoteAddCmd(name string) *cobra.Command {
 	var (
 		mode          string
@@ -90,6 +130,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 		serverName    string
 		workload      string
 		allowlistPath string
+		imageManifest string
+		expectedRTMR3 string
+		minTCB        string
 	)
 
 	cmd := &cobra.Command{
@@ -112,6 +155,19 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			manifestStored, err := validateImageManifestFlag(imageManifest)
+			if err != nil {
+				return err
+			}
+			if expectedRTMR3 != "" {
+				if _, err := verifier.ParseRegisterHex(expectedRTMR3); err != nil {
+					return fmt.Errorf("--expected-rtmr3 %w", err)
+				}
+			}
+			tcbFloor, err := parseMinTCBFlag(minTCB)
+			if err != nil {
+				return err
+			}
 
 			cfg, err := config.Load()
 			if err != nil {
@@ -125,16 +181,19 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			}
 
 			r := config.Remote{
-				Local:         localAddr,
-				Remote:        remoteURL,
-				Auth:          config.AuthNone,
-				Status:        config.StatusUnknown,
-				Mode:          attestMode,
-				Measurements:  measurements,
-				DiscoveryURL:  discoveryURL,
-				ServerName:    serverName,
-				WorkloadName:  workload,
-				AllowlistPath: allowlistStored,
+				Local:             localAddr,
+				Remote:            remoteURL,
+				Auth:              config.AuthNone,
+				Status:            config.StatusUnknown,
+				Mode:              attestMode,
+				Measurements:      measurements,
+				DiscoveryURL:      discoveryURL,
+				ServerName:        serverName,
+				WorkloadName:      workload,
+				AllowlistPath:     allowlistStored,
+				ImageManifestPath: manifestStored,
+				ExpectedRTMR3:     expectedRTMR3,
+				MinTCB:            tcbFloor,
 			}
 			if err := cfg.AddRemote(r); err != nil {
 				return err
@@ -159,6 +218,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
 	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb)")
 	f.StringVar(&allowlistPath, "allowlist", "", "path to a pinned canonical-allowlist JSON file; hashed exactly as read against the stamp's digest, and the stamped name must resolve in it (attest-lb)")
+	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (JSON object with mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, published with the image build); its MRTD joins the --measurements allowlist and RTMR[1]/RTMR[2] are pinned exactly, so the guest kernel and rootfs are verified rather than only the firmware. TDX evidence only — with SNP evidence this is a policy error")
+	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 lowercase hex chars — pins the runtime measurement register, i.e. the ordered operator-key/workload-event chain extended after boot. This is a deployment property, NOT a cluster identity, and cannot replace an image pin. TDX evidence only — with SNP evidence this is a policy error")
+	f.StringVar(&minTCB, "min-tcb", "", "minimum SNP TCB floor as four comma-separated components <bootloader,tee,snp,microcode> (each 0-255), enforced component-wise on the verified evidence. SNP evidence only — with TDX evidence this is a policy error")
 	return cmd
 }
 

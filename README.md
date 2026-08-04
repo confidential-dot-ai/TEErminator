@@ -83,6 +83,24 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
     the exact file bytes and the stamped name to resolve in the document. The stamp is
     CA-vouched (`ca-vouched` profile in the verdict) — the mesh CA signature, not the
     hardware evidence, vouches for it.
+  - **Platform-complete pinning.** The `--measurements` allowlist pins the launch
+    digest, which means different things per platform. On **Intel TDX** the launch
+    digest (MRTD) measures only the TDVF firmware — the guest kernel and rootfs live in
+    RTMR[1]/RTMR[2] — so a complete image policy is the MRTD+RTMR[1]+RTMR[2] tuple,
+    pinned with `--image-manifest <file>` (a JSON build-artifact manifest with `mrtd`,
+    `rtmr1`, `rtmr2`, each 96 lowercase hex chars; the same format c8s
+    `pkg/runtimemeasure` reads). The manifest's MRTD joins the measurement allowlist and
+    RTMR[1]/[2] must match the verified claims exactly. `--expected-rtmr3 <hex>`
+    optionally pins the runtime operator-key/workload chain on top. Because MRTD alone is
+    not an image identity, a *deployment-class* TDX verdict without `--image-manifest` is
+    a configuration error; with a specific-cluster CA pin it passes but the verdict
+    carries a prominent MRTD-only warning. On **AMD SEV-SNP** the launch digest already
+    covers the full image (with kernel-hashes: firmware, kernel, initrd, cmdline), so no
+    extra register pin exists; `--min-tcb <bootloader,tee,snp,microcode>` adds a
+    component-wise minimum TCB floor, and debug-launched guests are always rejected.
+    Cross-platform pins fail closed: a TDX pin (`--image-manifest`/`--expected-rtmr3`)
+    against SNP evidence is a hard error naming the platform, as is `--min-tcb` against
+    TDX evidence — never a silently ignored option.
   - **Requires `public_tls.mode=cds`.** The serving key must be TEE-held and mesh-chained;
     a WebPKI front door refuses the endpoint with `400 unsupported_front_door` and can
     only be used through the encrypted-tunnel `attest-pq` protocol (browser client).
@@ -99,6 +117,14 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
 $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
     --mode attest-lb --server-name c8s-tls-lb.c8s-system.svc \
     --measurements <hex,...> --workload api --allowlist ./allowlist.json
+
+# TDX: pin the complete image tuple (MRTD+RTMR[1]+RTMR[2]) from the build's manifest.
+$ ./teerminator remote add 127.0.0.1:8081 https://<LB-IP>/ \
+    --mode attest-lb --image-manifest ./image-manifest.json
+
+# SNP: add a minimum TCB floor on top of the launch-digest allowlist.
+$ ./teerminator remote add 127.0.0.1:8082 https://<LB-IP>/ \
+    --mode attest-lb --measurements <hex,...> --min-tcb 3,0,8,209
 
 # Optional hardening: pin the mesh CA to upgrade the verdict to specific-cluster.
 $ ./teerminator certs add ./mesh-ca.pem

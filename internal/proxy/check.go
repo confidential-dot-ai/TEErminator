@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
 	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
@@ -14,8 +15,9 @@ import (
 // CheckResult is the outcome of a live trust check for one remote.
 type CheckResult struct {
 	Status config.TrustStatus
-	// Detail explains the status: measurement, workload, and trust mode for
-	// StatusVerified, the failure reason for StatusFailed.
+	// Detail explains the status: measurement, workload, trust mode, and any
+	// enforced platform pins (TDX runtime registers, SNP TCB floor) or policy
+	// warnings for StatusVerified, the failure reason for StatusFailed.
 	Detail string
 }
 
@@ -66,6 +68,15 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		}
 		detail := fmt.Sprintf("measurement %s, workload %s, trust %s (%s)",
 			v.Measurement, workload, v.TrustMode, v.Profile)
+		if len(v.RTMRsPinned) > 0 {
+			detail += ", rtmrs pinned " + strings.Join(v.RTMRsPinned, " ")
+		}
+		if v.TCBFloor != "" {
+			detail += ", tcb floor " + v.TCBFloor
+		}
+		if v.Warning != "" {
+			detail += " — WARNING: " + v.Warning
+		}
 		return CheckResult{config.StatusVerified, detail}
 	case config.AttestNone:
 		tlsCfg, err := upstreamTLSConfig(target, r, extraCAs)
