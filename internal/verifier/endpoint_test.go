@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 )
 
 //go:embed testdata/attestation.json
@@ -304,29 +305,63 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 	return ts
 }
 
+// stubClaims parameterizes the evidence stub's verified result; the zero value
+// yields launch digest "m1" with no platform-specific claims. The result's
+// Platform always echoes the bundle's tag, as the real verifier does.
+type stubClaims struct {
+	launchDigest string
+	platformData map[string]any
+	tcb          teetypes.TcbInfo
+}
+
+// stubCalls records what the attester handed the evidence seam.
+type stubCalls struct {
+	minTCB *teetypes.SnpTcb
+}
+
 // stubEvidence swaps the evidence-verification seam for a stub that only
 // checks the bundle's report_data against the client's recomputed transcript,
 // so the full ordered attest-lb flow runs without live hardware evidence.
 func stubEvidence(t *testing.T) {
+	stubEvidenceClaims(t, stubClaims{})
+}
+
+// stubEvidenceClaims is stubEvidence with a configurable verified result, and
+// returns a recorder of what reached the seam.
+func stubEvidenceClaims(t *testing.T, sc stubClaims) *stubCalls {
 	t.Helper()
+	if sc.launchDigest == "" {
+		sc.launchDigest = "m1"
+	}
+	calls := &stubCalls{}
 	orig := verifyEvidence
-	verifyEvidence = func(b attestationBundle, expected []byte) (string, error) {
+	verifyEvidence = func(b attestationBundle, expected []byte, minTCB *teetypes.SnpTcb) (*teetypes.VerificationResult, error) {
+		calls.minTCB = minTCB
 		var ev struct {
 			ReportData string `json:"report_data"`
 		}
 		if err := json.Unmarshal(b.Evidence, &ev); err != nil {
-			return "", err
+			return nil, err
 		}
 		got, err := base64.RawURLEncoding.DecodeString(ev.ReportData)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		if !bytes.Equal(got, expected) {
-			return "", errors.New("stub evidence: report_data does not match the recomputed transcript")
+			return nil, errors.New("stub evidence: report_data does not match the recomputed transcript")
 		}
-		return "m1", nil
+		return &teetypes.VerificationResult{
+			SignatureValid: true,
+			Platform:       teetypes.PlatformType(b.Platform),
+			Claims: teetypes.Claims{
+				LaunchDigest: sc.launchDigest,
+				TCB:          sc.tcb,
+				PlatformData: sc.platformData,
+			},
+		}, nil
 	}
 	t.Cleanup(func() { verifyEvidence = orig })
+	return calls
 }
 
 // newLBAttester builds an attester against ts, mirroring the proxy's attest-lb
@@ -633,6 +668,263 @@ func TestAttestLBWorkloadPolicy(t *testing.T) {
 		_, err := attest(t, f, config.Remote{AllowlistPath: writeAllowlist(t, doc)})
 		if err == nil || !strings.Contains(err.Error(), "does not resolve") {
 			t.Fatalf("want unresolved-name failure, got %v", err)
+		}
+	})
+}
+
+var rtmr3Hex = strings.Repeat("4d", RegisterSize)
+
+// pinManifest writes an image manifest carrying the shared register fixtures
+// (mrtdHex/rtmr1Hex/rtmr2Hex) and returns its path.
+func pinManifest(t *testing.T) string {
+	t.Helper()
+	return writeManifest(t, `{"mrtd":"`+mrtdHex+`","rtmr1":"`+rtmr1Hex+`","rtmr2":"`+rtmr2Hex+`"}`)
+}
+
+// tdxStubClaims is the verified-claims shape of a TDX guest matching the
+// shared register fixtures: launch digest MRTD, all runtime registers present.
+func tdxStubClaims() stubClaims {
+	return stubClaims{
+		launchDigest: mrtdHex,
+		platformData: map[string]any{
+			"rtmr_0": strings.Repeat("00", RegisterSize),
+			"rtmr_1": rtmr1Hex,
+			"rtmr_2": rtmr2Hex,
+			"rtmr_3": rtmr3Hex,
+		},
+	}
+}
+
+func TestAttestLBTDXImagePins(t *testing.T) {
+	t.Run("happy path pins all three runtime registers", func(t *testing.T) {
+		stubEvidenceClaims(t, tdxStubClaims())
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		// No --measurements: the manifest's MRTD joins the allowlist, so the
+		// tuple alone is a complete policy.
+		remote := config.Remote{
+			Mode:              config.AttestEndpoint,
+			ImageManifestPath: pinManifest(t),
+			ExpectedRTMR3:     rtmr3Hex,
+		}
+		ea := newLBAttester(t, ts, remote, nil)
+		v, err := ea.Attest(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Measurement != mrtdHex {
+			t.Errorf("Measurement = %q, want the manifest MRTD", v.Measurement)
+		}
+		if v.Platform != "tdx" {
+			t.Errorf("Platform = %q, want tdx", v.Platform)
+		}
+		want := []string{"1:" + rtmr1Hex, "2:" + rtmr2Hex, "3:" + rtmr3Hex}
+		if len(v.RTMRsPinned) != len(want) {
+			t.Fatalf("RTMRsPinned = %v, want %v", v.RTMRsPinned, want)
+		}
+		for i := range want {
+			if v.RTMRsPinned[i] != want[i] {
+				t.Errorf("RTMRsPinned[%d] = %q, want %q", i, v.RTMRsPinned[i], want[i])
+			}
+		}
+		if v.Warning != "" {
+			t.Errorf("complete TDX policy must not warn, got %q", v.Warning)
+		}
+	})
+
+	t.Run("RTMR mismatch fails", func(t *testing.T) {
+		sc := tdxStubClaims()
+		sc.platformData["rtmr_1"] = strings.Repeat("ee", RegisterSize)
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{Mode: config.AttestEndpoint, ImageManifestPath: pinManifest(t)}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "RTMR[1]") {
+			t.Fatalf("want RTMR[1] mismatch, got %v", err)
+		}
+	})
+
+	t.Run("absent rtmr claim fails closed", func(t *testing.T) {
+		sc := tdxStubClaims()
+		delete(sc.platformData, "rtmr_2")
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{Mode: config.AttestEndpoint, ImageManifestPath: pinManifest(t)}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "carry no rtmr_2") {
+			t.Fatalf("want absent-claim failure, got %v", err)
+		}
+	})
+
+	t.Run("absent rtmr3 claim fails closed", func(t *testing.T) {
+		sc := tdxStubClaims()
+		delete(sc.platformData, "rtmr_3")
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{
+			Mode:              config.AttestEndpoint,
+			ImageManifestPath: pinManifest(t),
+			ExpectedRTMR3:     rtmr3Hex,
+		}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "carry no rtmr_3") {
+			t.Fatalf("want absent-claim failure, got %v", err)
+		}
+	})
+
+	t.Run("TDX pins against SNP evidence fail closed", func(t *testing.T) {
+		stubEvidence(t)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "snp"})
+		remote := config.Remote{
+			Mode:              config.AttestEndpoint,
+			Measurements:      []string{"m1"},
+			ImageManifestPath: pinManifest(t),
+		}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), `evidence platform is "snp"`) {
+			t.Fatalf("want cross-platform failure naming snp, got %v", err)
+		}
+	})
+
+	t.Run("malformed manifest is a config error before any round trip", func(t *testing.T) {
+		stubEvidence(t)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{
+			Mode:              config.AttestEndpoint,
+			ImageManifestPath: writeManifest(t, `{"mrtd":"`+mrtdHex+`"}`),
+		}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), `missing "rtmr1"`) {
+			t.Fatalf("want manifest load failure, got %v", err)
+		}
+	})
+}
+
+func p8(v uint8) *uint8 { return &v }
+
+func snpStubTCB() teetypes.TcbInfo {
+	return teetypes.TcbInfo{Type: "Snp", Bootloader: p8(4), Tee: p8(0), Snp: p8(8), Microcode: p8(210)}
+}
+
+func TestAttestLBMinTCB(t *testing.T) {
+	floor := &config.TCBFloor{Bootloader: 3, TEE: 0, SNP: 8, Microcode: 209}
+	remote := func() config.Remote {
+		return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"m1"}, MinTCB: floor}
+	}
+
+	t.Run("floor reaches the verifier engine and passes on the claims", func(t *testing.T) {
+		calls := stubEvidenceClaims(t, stubClaims{tcb: snpStubTCB()})
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "snp"})
+		ea := newLBAttester(t, ts, remote(), nil)
+		v, err := ea.Attest(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantEngine := &teetypes.SnpTcb{Bootloader: 3, Tee: 0, Snp: 8, Microcode: 209}
+		if calls.minTCB == nil || *calls.minTCB != *wantEngine {
+			t.Errorf("engine received MinTCB %+v, want %+v", calls.minTCB, wantEngine)
+		}
+		if v.TCBFloor != "bootloader=3,tee=0,snp=8,microcode=209" {
+			t.Errorf("TCBFloor = %q", v.TCBFloor)
+		}
+	})
+
+	t.Run("claims below the floor fail", func(t *testing.T) {
+		tcb := snpStubTCB()
+		tcb.Microcode = p8(100)
+		stubEvidenceClaims(t, stubClaims{tcb: tcb})
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "snp"})
+		ea := newLBAttester(t, ts, remote(), nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "below the pinned minimum") {
+			t.Fatalf("want floor violation, got %v", err)
+		}
+	})
+
+	t.Run("absent TCB component fails closed", func(t *testing.T) {
+		tcb := snpStubTCB()
+		tcb.Snp = nil
+		stubEvidenceClaims(t, stubClaims{tcb: tcb})
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "snp"})
+		ea := newLBAttester(t, ts, remote(), nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "carry no snp TCB component") {
+			t.Fatalf("want absent-component failure, got %v", err)
+		}
+	})
+
+	t.Run("min-tcb against TDX evidence fails closed", func(t *testing.T) {
+		stubEvidenceClaims(t, tdxStubClaims())
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		r := remote()
+		r.Measurements = []string{mrtdHex}
+		ea := newLBAttester(t, ts, r, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), `evidence platform is "tdx"`) {
+			t.Fatalf("want cross-platform failure naming tdx, got %v", err)
+		}
+	})
+}
+
+// TestAttestLBTDXCompleteness covers the TDX completeness rule: MRTD alone is
+// not a complete image policy, so a deployment-class verdict without an image
+// pin is refused, while a specific-cluster one passes with a warning.
+func TestAttestLBTDXCompleteness(t *testing.T) {
+	t.Run("deployment-class TDX without image manifest is a config error", func(t *testing.T) {
+		stubEvidenceClaims(t, tdxStubClaims())
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{Mode: config.AttestEndpoint, Measurements: []string{mrtdHex}}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "configuration error") || !strings.Contains(err.Error(), "--image-manifest") {
+			t.Fatalf("want MRTD-only configuration error, got %v", err)
+		}
+	})
+
+	t.Run("specific-cluster TDX without image manifest warns", func(t *testing.T) {
+		stubEvidenceClaims(t, tdxStubClaims())
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{Mode: config.AttestEndpoint, Measurements: []string{mrtdHex}}
+		ea := newLBAttester(t, ts, remote, []*x509.Certificate{f.ca.cert})
+		v, err := ea.Attest(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.TrustMode != TrustSpecificCluster {
+			t.Fatalf("TrustMode = %q, want %q", v.TrustMode, TrustSpecificCluster)
+		}
+		if !strings.Contains(v.Warning, "MRTD only") {
+			t.Errorf("Warning = %q, want the MRTD-only note", v.Warning)
+		}
+	})
+
+	t.Run("SNP needs no image manifest", func(t *testing.T) {
+		stubEvidence(t)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "snp"})
+		ea := newLBAttester(t, ts, measuredRemote(), nil)
+		v, err := ea.Attest(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Warning != "" {
+			t.Errorf("SNP verdict must not warn, got %q", v.Warning)
 		}
 	})
 }
