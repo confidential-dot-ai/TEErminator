@@ -18,8 +18,8 @@ import (
 
 // oidMatchedWorkload identifies the matched-workload extension:
 //
-//	1.3.6.1.4.1.59888.1.5 - matched workload extension
-var oidMatchedWorkload = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 59888, 1, 5}
+//	1.3.6.1.4.1.66378.1.5 - matched workload extension
+var oidMatchedWorkload = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 66378, 1, 5}
 
 // matchedWorkloadVersion is the only encoding version this package parses. An
 // unknown version fails closed.

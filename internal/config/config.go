@@ -69,7 +69,7 @@ type Remote struct {
 	// trust anchor so the chain also verifies.
 	ServerName   string   `json:"server_name,omitempty"`
 	Measurements []string `json:"measurements,omitempty"` // accepted hex launch digests
-	// WorkloadName pins the matched-workload stamp (OID …59888.1.5) the
+	// WorkloadName pins the matched-workload stamp (OID …66378.1.5) the
 	// committed mesh leaf must carry in attest-lb mode.
 	WorkloadName string `json:"workload_name,omitempty"`
 	// AllowlistPath points at a pinned canonical-allowlist JSON file. It is

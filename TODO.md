@@ -28,7 +28,7 @@
       (`internal/verifier/endpoint.go`, `internal/proxy/proxy.go`). Evidence
       verification stays fully delegated to `attestation-go`'s `teeverify`.
 - [x] Workload identity pins: `remote add --workload <name> --allowlist <file>`
-      enforce the mesh leaf's matched-workload stamp (OID `…59888.1.5`, vendored
+      enforce the mesh leaf's matched-workload stamp (OID `…66378.1.5`, vendored
       strict parser in `internal/verifier/workloadext.go` with cross-repo golden
       vectors) and the pinned canonical-allowlist digest; verdicts report the
       workload, trust mode (deployment-class vs specific-cluster via an optional

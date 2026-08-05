@@ -78,7 +78,7 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
   - **Measurements are mandatory.** An empty `--measurements` allowlist is a
     configuration error in this mode, never a permissive default.
   - **Workload pin.** `--workload <name>` requires the committed mesh leaf to carry a
-    matched-workload stamp (OID `1.3.6.1.4.1.59888.1.5`) naming `<name>`;
+    matched-workload stamp (OID `1.3.6.1.4.1.66378.1.5`) naming `<name>`;
     `--allowlist <file>` additionally requires the stamp's digest to equal the SHA-256 of
     the exact file bytes and the stamped name to resolve in the document. The stamp is
     CA-vouched (`ca-vouched` profile in the verdict) — the mesh CA signature, not the
