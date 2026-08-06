@@ -35,17 +35,20 @@
       `certs add` mesh-CA pin), and the `ca-vouched` profile. An empty
       `--measurements` policy is now a configuration error in attest-lb mode.
 - [x] Platform-complete measurement policy, generic across Intel TDX and AMD
-      SEV-SNP. `remote add --image-manifest <file>` pins the TDX image tuple
-      (MRTD joins the measurement allowlist, RTMR[1]/RTMR[2] compare exactly
-      against the verified claims; vendored parser in
-      `internal/verifier/imagemanifest.go` mirroring c8s `pkg/runtimemeasure`,
-      kept honest by the shared `testdata/image_manifest.json` fixture),
+      SEV-SNP. `remote add --image-manifest <file>` pins the TDX image tuple —
+      MRTD, RTMR[1] and RTMR[2] all compare byte-exactly against the verified
+      claims, so the manifest REPLACES `--measurements` rather than adding to
+      it and the two flags are mutually exclusive (vendored parser in
+      `internal/verifier/imagemanifest.go`, maintained as a verbatim copy of
+      c8s `pkg/runtimemeasure` along with its reject table, which is what keeps
+      the two from drifting — there is no shared fixture),
       `--expected-rtmr3 <hex>` pins the runtime operator-key/workload chain, and
       `--min-tcb <bootloader,tee,snp,microcode>` enforces the SNP TCB floor
       (handed to attestation-go as `VerifyParams.MinTCB` plus a claim-side
-      recheck; debug guests are engine-rejected). Cross-platform pins fail
-      closed, a deployment-class TDX verdict without an image pin is a
-      configuration error (specific-cluster warns instead), verdicts and
+      recheck; debug guests are engine-rejected; an all-zero floor is no floor).
+      Cross-platform pins fail closed, all three pins require
+      `--mode attest-lb`, a deployment-class TDX verdict without an image pin is
+      a configuration error (specific-cluster warns instead), verdicts and
       `status` details report what was enforced, and the verdict-cache key
       covers the new pins (manifest file digest, RTMR[3], TCB floor).
 - [ ] Superseded — do NOT merge: branches `feat/cds-rollup`,

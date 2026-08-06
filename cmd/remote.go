@@ -151,6 +151,13 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
 			}
 
+			// An image manifest pins the launch digest exactly against its own
+			// MRTD, so a second allowlist could only widen the policy past the
+			// image it names. Refused at add time as well as at verify time.
+			if imageManifest != "" && len(measurements) > 0 {
+				return fmt.Errorf("--measurements and --image-manifest are mutually exclusive: the manifest pins MRTD, RTMR[1] and RTMR[2] exactly against this one build, so a separate launch-digest allowlist could only admit an image it does not describe")
+			}
+
 			allowlistStored, err := validateWorkloadFlags(workload, allowlistPath)
 			if err != nil {
 				return err
@@ -213,12 +220,12 @@ func newRemoteAddCmd(name string) *cobra.Command {
 
 	f := cmd.Flags()
 	f.StringVar(&mode, "mode", "", "attestation mode: attest-lb (per-handshake attestation binding the exact serving leaf, over ordinary TLS), cds-cert (CDS-cert pinning, not yet implemented), or empty to disable")
-	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated; required for attest-lb (an empty measurement policy is a configuration error)")
+	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated; required for attest-lb unless --image-manifest is given (an empty measurement policy is a configuration error, and the two flags are mutually exclusive)")
 	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest-lb always uses the remote's origin)")
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
 	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb)")
 	f.StringVar(&allowlistPath, "allowlist", "", "path to a pinned canonical-allowlist JSON file; hashed exactly as read against the stamp's digest, and the stamped name must resolve in it (attest-lb)")
-	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (JSON object with mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, published with the image build); its MRTD joins the --measurements allowlist and RTMR[1]/RTMR[2] are pinned exactly, so the guest kernel and rootfs are verified rather than only the firmware. TDX evidence only — with SNP evidence this is a policy error")
+	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (JSON object with mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, published with the image build); all three registers are pinned exactly against this one manifest, so the guest kernel and rootfs are verified rather than only the firmware. Replaces --measurements rather than adding to it. TDX evidence only — with SNP evidence this is a policy error")
 	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 lowercase hex chars — pins the runtime measurement register, i.e. the ordered operator-key/workload-event chain extended after boot. This is a deployment property, NOT a cluster identity, and cannot replace an image pin. TDX evidence only — with SNP evidence this is a policy error")
 	f.StringVar(&minTCB, "min-tcb", "", "minimum SNP TCB floor as four comma-separated components <bootloader,tee,snp,microcode> (each 0-255), enforced component-wise on the verified evidence. SNP evidence only — with TDX evidence this is a policy error")
 	return cmd

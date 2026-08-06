@@ -279,12 +279,17 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 		return nil, fmt.Errorf("attest-lb: serving leaf: %w", err)
 	}
 
-	// (i) Measurement policy: an empty allowlist is a configuration error in
-	// this mode, never a permissive default. A pinned image manifest
-	// contributes its MRTD to the allowed set — the manifest's launch digest is
-	// part of the same tuple as its RTMR pins.
-	if err := checkMeasurement(measurement, pins.allowedMeasurements(e.remote.Measurements)); err != nil {
-		return nil, err
+	// (i) Measurement policy. Without an image manifest the launch-digest
+	// allowlist is the whole of it, and an empty allowlist is a configuration
+	// error, never a permissive default: nothing else in this flow pins WHAT
+	// software the attested front door runs. With a manifest the allowlist is
+	// not consulted at all — the launch digest is compared byte-exactly against
+	// the manifest's MRTD in pins.enforce, alongside the RTMR[1]/[2] registers
+	// of the same build tuple.
+	if pins.image == nil {
+		if err := checkMeasurement(measurement, e.remote.Measurements); err != nil {
+			return nil, err
+		}
 	}
 
 	v := &SessionVerdict{
@@ -328,7 +333,10 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	// refused; a specific-cluster verdict additionally rests on the operator's
 	// mesh-CA pin, so it passes with a prominent warning instead. SNP needs no
 	// equivalent: its launch digest (with kernel-hashes) already covers
-	// firmware, kernel, initrd, and cmdline.
+	// firmware, kernel, initrd, and cmdline. Keying on pins.image says exactly
+	// "the full tuple was enforced": enforce above already failed the verdict
+	// closed unless the launch digest byte-equalled this manifest's MRTD, so a
+	// run that reaches here with a manifest matched all three registers.
 	if isTDXPlatform(platform) && pins.image == nil {
 		if v.TrustMode == TrustDeploymentClass {
 			return nil, fmt.Errorf("attest-lb: configuration error: deployment-class trust over TDX evidence needs an image pin — the measurement allowlist covers only MRTD, which measures the TDVF firmware, so the guest kernel and rootfs are unmeasured; pin the full MRTD+RTMR[1]+RTMR[2] tuple with `remote add --image-manifest`")
@@ -363,10 +371,10 @@ func isSNPPlatform(p teetypes.PlatformType) bool {
 }
 
 // platformPins are the resolved platform-complete measurement pins of one
-// remote: the TDX image tuple (MRTD joins the launch-digest allowlist,
-// RTMR[1]/[2] compare exactly against the verified claims), the optional TDX
-// runtime-register pin (RTMR[3]), and the SNP TCB floor. Any pin set against
-// evidence from a platform it cannot apply to is a hard error.
+// remote: the TDX image tuple (all three of MRTD, RTMR[1] and RTMR[2] compare
+// exactly against the verified claims), the optional TDX runtime-register pin
+// (RTMR[3]), and the SNP TCB floor. Any pin set against evidence from a
+// platform it cannot apply to is a hard error.
 type platformPins struct {
 	image  *ImagePins
 	rtmr3  *[RegisterSize]byte
@@ -378,6 +386,15 @@ type platformPins struct {
 func loadPlatformPins(r config.Remote) (platformPins, error) {
 	var pins platformPins
 	if r.ImageManifestPath != "" {
+		// An image manifest pins the launch digest exactly, so a second,
+		// looser source of accepted launch digests is not a widening of the
+		// policy but a hole in it: an allowlist entry that is not the
+		// manifest's MRTD would admit a guest the manifest does not describe
+		// while its RTMR[1]/[2] stayed pinned to the manifest. Refuse the
+		// combination rather than silently letting one of the two win.
+		if len(r.Measurements) > 0 {
+			return platformPins{}, fmt.Errorf("configuration error: --measurements and --image-manifest are mutually exclusive: the manifest pins the launch digest exactly against its own MRTD, so a separate allowlist could only admit an image the manifest does not describe")
+		}
 		image, err := LoadImageManifest(r.ImageManifestPath)
 		if err != nil {
 			return platformPins{}, err
@@ -402,18 +419,6 @@ func loadPlatformPins(r config.Remote) (platformPins, error) {
 	return pins, nil
 }
 
-// allowedMeasurements is the launch-digest allowlist for the membership check:
-// the configured measurements plus, when an image manifest is pinned, its
-// MRTD — the manifest's launch digest belongs to the same tuple as its RTMRs.
-func (p platformPins) allowedMeasurements(configured []string) []string {
-	if p.image == nil {
-		return configured
-	}
-	out := make([]string, 0, len(configured)+1)
-	out = append(out, configured...)
-	return append(out, hex.EncodeToString(p.image.MRTD[:]))
-}
-
 // enforce applies the platform pins to the verified claims, recording what was
 // enforced in the verdict. It fails closed on any pin whose platform does not
 // match the evidence, on absent or malformed claims, and on any mismatch —
@@ -424,6 +429,23 @@ func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.Veri
 	}
 	if p.minTCB != nil && !isSNPPlatform(platform) {
 		return fmt.Errorf("an SNP TCB floor (min_tcb) is set but the evidence platform is %q: the four-component TCB exists only on SEV-SNP, so this policy cannot be enforced against %q evidence", platform, platform)
+	}
+
+	if p.image != nil {
+		// On TDX the launch digest IS the MRTD, and it comes out of the same
+		// build as RTMR[1]/[2]. Comparing it byte-exactly — rather than
+		// admitting it into an allowlist that may carry other digests — is what
+		// makes the manifest ONE image pin instead of three independent ones:
+		// otherwise a guest whose firmware differs from the manifest verifies
+		// while the kernel and rootfs registers stay pinned to the manifest.
+		mb, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(res.Claims.LaunchDigest)))
+		if err != nil || len(mb) == 0 {
+			return fmt.Errorf("cannot enforce the image pin: launch_digest is missing or malformed (%q)", res.Claims.LaunchDigest)
+		}
+		if !bytes.Equal(mb, p.image.MRTD[:]) {
+			return fmt.Errorf("MRTD mismatch: launch measurement %s does not match the image manifest MRTD %s (a different guest firmware/image booted)",
+				hex.EncodeToString(mb), hex.EncodeToString(p.image.MRTD[:]))
+		}
 	}
 
 	check := func(idx int, meaning string, want []byte) error {
@@ -711,14 +733,28 @@ func servingLeafFromTLS(state *tls.ConnectionState) (*x509.Certificate, error) {
 // checkMeasurement enforces the remote's launch-digest allowlist. In attest-lb
 // mode an all-empty measurement policy is a configuration error, not a
 // permissive default: nothing else in this flow pins WHAT
-// software the attested front door runs.
+// software the attested front door runs. Both sides are compared as decoded
+// bytes, so an entry that is not a launch digest at all — `--measurements ""`
+// yields one such — is a configuration error rather than a value that could
+// match a platform whose LaunchDigest claim came back empty.
 func checkMeasurement(measurement string, allowed []string) error {
 	if len(allowed) == 0 {
 		return fmt.Errorf("attest-lb: empty measurement policy is a configuration error: pin the accepted launch digests with `remote add --measurements`")
 	}
-	m := strings.ToLower(measurement)
-	for i := range allowed {
-		if strings.ToLower(allowed[i]) == m {
+	want := make([][]byte, 0, len(allowed))
+	for _, a := range allowed {
+		b, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(a)))
+		if err != nil || len(b) == 0 {
+			return fmt.Errorf("attest-lb: configuration error: --measurements entry %q is not a non-empty hex launch digest", a)
+		}
+		want = append(want, b)
+	}
+	m, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(measurement)))
+	if err != nil || len(m) == 0 {
+		return fmt.Errorf("attest-lb: cannot enforce the measurement policy: launch_digest is missing or malformed (%q)", measurement)
+	}
+	for _, w := range want {
+		if bytes.Equal(w, m) {
 			return nil
 		}
 	}

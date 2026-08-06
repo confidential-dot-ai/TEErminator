@@ -306,7 +306,7 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 }
 
 // stubClaims parameterizes the evidence stub's verified result; the zero value
-// yields launch digest "m1" with no platform-specific claims. The result's
+// yields launch digest "a1" with no platform-specific claims. The result's
 // Platform always echoes the bundle's tag, as the real verifier does.
 type stubClaims struct {
 	launchDigest string
@@ -331,7 +331,7 @@ func stubEvidence(t *testing.T) {
 func stubEvidenceClaims(t *testing.T, sc stubClaims) *stubCalls {
 	t.Helper()
 	if sc.launchDigest == "" {
-		sc.launchDigest = "m1"
+		sc.launchDigest = "a1"
 	}
 	calls := &stubCalls{}
 	orig := verifyEvidence
@@ -379,10 +379,10 @@ func newLBAttester(t *testing.T, ts *httptest.Server, remote config.Remote, pinn
 	return ea
 }
 
-// measuredRemote is the minimal valid attest-lb policy; uppercase digests
-// exercise the case-insensitive membership check against the stub's "m1".
+// measuredRemote is the minimal valid attest-lb policy; the uppercase digest
+// exercises the case-insensitive membership check against the stub's "a1".
 func measuredRemote() config.Remote {
-	return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"M1"}}
+	return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"A1"}}
 }
 
 func TestAttestLBHappyPath(t *testing.T) {
@@ -396,7 +396,7 @@ func TestAttestLBHappyPath(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if v.Measurement != "m1" {
+		if v.Measurement != "a1" {
 			t.Errorf("Measurement = %q", v.Measurement)
 		}
 		if v.TrustMode != TrustDeploymentClass {
@@ -585,6 +585,41 @@ func TestAttestLBRejectsMeasurementNotInAllowlist(t *testing.T) {
 	}
 }
 
+// TestCheckMeasurementValidatesHex covers the launch digest as a VALUE rather
+// than as a string: an empty allowlist is already a configuration error, but
+// `--measurements ""` yields one empty entry, which is not empty as a list and
+// would string-match a platform whose LaunchDigest claim came back empty.
+func TestCheckMeasurementValidatesHex(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		measurement string
+		allowed     []string
+		wantErr     string
+	}{
+		{"match", "aabb", []string{"AABB"}, ""},
+		{"no match", "aabb", []string{"ccdd"}, "not in the allowlist"},
+		{"empty allowlist", "aabb", nil, "empty measurement policy"},
+		{"empty allowlist entry", "aabb", []string{""}, "not a non-empty hex launch digest"},
+		{"non-hex allowlist entry", "aabb", []string{"zz"}, "not a non-empty hex launch digest"},
+		{"empty claim against an empty entry", "", []string{""}, "not a non-empty hex launch digest"},
+		{"empty claim", "", []string{"aabb"}, "launch_digest is missing or malformed"},
+		{"non-hex claim", "not-a-digest", []string{"aabb"}, "launch_digest is missing or malformed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkMeasurement(tc.measurement, tc.allowed)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("checkMeasurement = %v, want it accepted", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("checkMeasurement = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // writeAllowlist writes raw to a temp file and returns its path.
 func writeAllowlist(t *testing.T, raw []byte) string {
 	t.Helper()
@@ -601,7 +636,7 @@ func TestAttestLBWorkloadPolicy(t *testing.T) {
 	attest := func(t *testing.T, f *lbFixture, remote config.Remote) (*SessionVerdict, error) {
 		t.Helper()
 		remote.Mode = config.AttestEndpoint
-		remote.Measurements = []string{"m1"}
+		remote.Measurements = []string{"a1"}
 		ts := f.newServer(t, bundleSpec{})
 		ea := newLBAttester(t, ts, remote, nil)
 		return ea.Attest(context.Background())
@@ -700,8 +735,8 @@ func TestAttestLBTDXImagePins(t *testing.T) {
 		stubEvidenceClaims(t, tdxStubClaims())
 		f := newLBFixture(t, fixtureOpts{})
 		ts := f.newServer(t, bundleSpec{platform: "tdx"})
-		// No --measurements: the manifest's MRTD joins the allowlist, so the
-		// tuple alone is a complete policy.
+		// No --measurements: the manifest is the whole launch-digest policy —
+		// MRTD is compared against it exactly, like RTMR[1]/[2].
 		remote := config.Remote{
 			Mode:              config.AttestEndpoint,
 			ImageManifestPath: pinManifest(t),
@@ -778,13 +813,62 @@ func TestAttestLBTDXImagePins(t *testing.T) {
 		}
 	})
 
+	// The MRTD is pinned EXACTLY against the manifest, not unioned into a
+	// launch-digest allowlist. A guest whose firmware differs from the manifest
+	// must fail even though its RTMR[1]/[2] match the manifest — that is the
+	// combination a union admits, and it is a different image.
+	t.Run("MRTD not matching the manifest fails", func(t *testing.T) {
+		sc := tdxStubClaims()
+		sc.launchDigest = strings.Repeat("9f", RegisterSize)
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{Mode: config.AttestEndpoint, ImageManifestPath: pinManifest(t)}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "MRTD mismatch") {
+			t.Fatalf("want an MRTD mismatch, got %v", err)
+		}
+	})
+
+	t.Run("malformed launch digest fails closed", func(t *testing.T) {
+		sc := tdxStubClaims()
+		sc.launchDigest = "not-a-digest"
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{Mode: config.AttestEndpoint, ImageManifestPath: pinManifest(t)}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "launch_digest is missing or malformed") {
+			t.Fatalf("want a malformed-launch-digest failure, got %v", err)
+		}
+	})
+
+	// An allowlist alongside a manifest can only name digests the manifest does
+	// not: refusing the pair is what stopped the MRTD from being negotiable.
+	t.Run("measurements alongside an image manifest is a config error", func(t *testing.T) {
+		stubEvidenceClaims(t, tdxStubClaims())
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{
+			Mode:              config.AttestEndpoint,
+			Measurements:      []string{strings.Repeat("9f", RegisterSize)},
+			ImageManifestPath: pinManifest(t),
+		}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("want a mutually-exclusive configuration error, got %v", err)
+		}
+	})
+
 	t.Run("TDX pins against SNP evidence fail closed", func(t *testing.T) {
 		stubEvidence(t)
 		f := newLBFixture(t, fixtureOpts{})
 		ts := f.newServer(t, bundleSpec{platform: "snp"})
 		remote := config.Remote{
 			Mode:              config.AttestEndpoint,
-			Measurements:      []string{"m1"},
 			ImageManifestPath: pinManifest(t),
 		}
 		ea := newLBAttester(t, ts, remote, nil)
@@ -819,7 +903,7 @@ func snpStubTCB() teetypes.TcbInfo {
 func TestAttestLBMinTCB(t *testing.T) {
 	floor := &config.TCBFloor{Bootloader: 3, TEE: 0, SNP: 8, Microcode: 209}
 	remote := func() config.Remote {
-		return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"m1"}, MinTCB: floor}
+		return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"a1"}, MinTCB: floor}
 	}
 
 	t.Run("floor reaches the verifier engine and passes on the claims", func(t *testing.T) {
@@ -911,6 +995,30 @@ func TestAttestLBTDXCompleteness(t *testing.T) {
 		}
 		if !strings.Contains(v.Warning, "MRTD only") {
 			t.Errorf("Warning = %q, want the MRTD-only note", v.Warning)
+		}
+	})
+
+	// The completeness rule keys on the image pin, so the pin must mean "this
+	// exact image booted" and nothing weaker. With a manifest, a guest whose
+	// MRTD is not the manifest's cannot produce a verdict at all — least of all
+	// one reported as a complete TDX policy with no warning, which is what a
+	// launch-digest allowlist unioned with the manifest's MRTD allowed.
+	t.Run("a manifest verdict is complete only for the manifest's own image", func(t *testing.T) {
+		sc := tdxStubClaims()
+		sc.launchDigest = strings.Repeat("9f", RegisterSize)
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{Mode: config.AttestEndpoint, ImageManifestPath: pinManifest(t)}
+		// Even with the operator's CA pinned — the case that only warns when
+		// no image is pinned at all — a foreign MRTD is a hard failure.
+		ea := newLBAttester(t, ts, remote, []*x509.Certificate{f.ca.cert})
+		v, err := ea.Attest(context.Background())
+		if err == nil {
+			t.Fatalf("a guest outside the pinned image verified: %+v", v)
+		}
+		if !strings.Contains(err.Error(), "MRTD mismatch") {
+			t.Fatalf("want an MRTD mismatch, got %v", err)
 		}
 	})
 

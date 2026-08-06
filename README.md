@@ -76,7 +76,10 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
     upgrades the verdict to *specific-cluster* when the committed CA byte-equals the pin
     ("that particular cluster, not a genuine clone").
   - **Measurements are mandatory.** An empty `--measurements` allowlist is a
-    configuration error in this mode, never a permissive default.
+    configuration error in this mode, never a permissive default — as is an entry that
+    is not a launch digest, so `--measurements ""` cannot stand in for a policy.
+    `--image-manifest` is the other way to pin the launch digest, and supplies it in
+    full; the two flags are mutually exclusive.
   - **Workload pin.** `--workload <name>` requires the committed mesh leaf to carry a
     matched-workload stamp (OID `1.3.6.1.4.1.66378.1.5`) naming `<name>`;
     `--allowlist <file>` additionally requires the stamp's digest to equal the SHA-256 of
@@ -89,8 +92,11 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
     RTMR[1]/RTMR[2] — so a complete image policy is the MRTD+RTMR[1]+RTMR[2] tuple,
     pinned with `--image-manifest <file>` (a JSON build-artifact manifest with `mrtd`,
     `rtmr1`, `rtmr2`, each 96 lowercase hex chars; the same format c8s
-    `pkg/runtimemeasure` reads). The manifest's MRTD joins the measurement allowlist and
-    RTMR[1]/[2] must match the verified claims exactly. `--expected-rtmr3 <hex>`
+    `pkg/runtimemeasure` reads). All three registers are compared byte-exactly against
+    the verified claims — the launch digest against the manifest's own MRTD included — so
+    the manifest replaces `--measurements` rather than widening it: a second allowlist
+    could only admit an image the manifest does not describe, and setting both is a
+    configuration error. `--expected-rtmr3 <hex>`
     optionally pins the runtime operator-key/workload chain on top. Because MRTD alone is
     not an image identity, a *deployment-class* TDX verdict without `--image-manifest` is
     a configuration error; with a specific-cluster CA pin it passes but the verdict
