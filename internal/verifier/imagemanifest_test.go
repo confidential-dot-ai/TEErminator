@@ -50,10 +50,12 @@ func TestLoadImageManifestValid(t *testing.T) {
 	}
 }
 
-// TestLoadImageManifestSharedFixture loads the checked-in fixture that is kept
-// parseable by both this vendored parser and the c8s pkg/runtimemeasure
-// implementation, so the two cannot drift apart on the accepted format.
-func TestLoadImageManifestSharedFixture(t *testing.T) {
+// TestLoadImageManifestFixture loads the checked-in fixture, which exercises
+// the accepted format end to end. c8s holds no copy of this file, so it proves
+// nothing about the c8s parser on its own: what keeps the two aligned is that
+// this file's reject table below is maintained as a verbatim copy of the c8s
+// pkg/runtimemeasure one, so a divergence shows up as a diff.
+func TestLoadImageManifestFixture(t *testing.T) {
 	pins, err := LoadImageManifest(filepath.Join("testdata", "image_manifest.json"))
 	if err != nil {
 		t.Fatalf("LoadImageManifest: %v", err)
@@ -96,6 +98,9 @@ func TestLoadImageManifestRejects(t *testing.T) {
 			"want 96"},
 		{"wrong json type", `{"mrtd":7,"rtmr1":"` + rtmr1Hex + `","rtmr2":"` + rtmr2Hex + `"}`,
 			"not a JSON object"},
+		{"duplicate register key",
+			`{"mrtd":"` + mrtdHex + `","rtmr1":"` + rtmr1Hex + `","rtmr2":"` + rtmr2Hex + `","mrtd":"` + strings.Repeat("ff", RegisterSize) + `"}`,
+			`duplicate "mrtd" key`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := LoadImageManifest(writeManifest(t, tc.content))
