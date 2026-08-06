@@ -423,7 +423,11 @@ func loadPlatformPins(r config.Remote) (platformPins, error) {
 		}
 		pins.rtmr3 = &reg
 	}
-	if r.MinTCB != nil {
+	// An all-zero floor is no floor: every SNP TCB component is >= 0, so it
+	// gates nothing, while a non-nil floor would reject all TDX evidence as a
+	// cross-platform pin. The CLI already drops it (parseMinTCBFlag); this
+	// repeats the rule for a hand-edited config file.
+	if r.MinTCB != nil && *r.MinTCB != (config.TCBFloor{}) {
 		pins.minTCB = &teetypes.SnpTcb{
 			Bootloader: r.MinTCB.Bootloader,
 			Tee:        r.MinTCB.TEE,

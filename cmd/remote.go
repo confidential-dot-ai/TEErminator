@@ -101,8 +101,46 @@ func validateImageManifestFlag(path string) (string, error) {
 	return abs, nil
 }
 
+// validatePinModes rejects a platform pin stored on a remote that can never
+// enforce it. Only attest-lb verifies hardware evidence, so on any other mode
+// these three are inert: the remote reads as configured, and the gap only
+// surfaces much later — if ever — as traffic that was never measured.
+func validatePinModes(mode config.AttestMode, imageManifest, expectedRTMR3, minTCB string) error {
+	if mode == config.AttestEndpoint {
+		return nil
+	}
+	for _, pin := range []struct{ flag, value string }{
+		{"--image-manifest", imageManifest},
+		{"--expected-rtmr3", expectedRTMR3},
+		{"--min-tcb", minTCB},
+	} {
+		if pin.value != "" {
+			return fmt.Errorf("%s requires --mode attest-lb: nothing verifies hardware measurements in mode %q, so the pin would be stored but never enforced", pin.flag, mode)
+		}
+	}
+	return nil
+}
+
+// validateRTMR3Flag validates the --expected-rtmr3 pin and returns the value to
+// store. Surrounding whitespace is trimmed here, at the flag boundary only: a
+// register pin is copy-pasted out of terminal output, so a trailing newline is
+// a typing artefact rather than a different value. The manifest parser stays
+// strict — there the exact file bytes are the reference.
+func validateRTMR3Flag(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", nil
+	}
+	if _, err := verifier.ParseRegisterHex(s); err != nil {
+		return "", fmt.Errorf("--expected-rtmr3 %w", err)
+	}
+	return s, nil
+}
+
 // parseMinTCBFlag parses --min-tcb's four comma-separated components
-// (bootloader,tee,snp,microcode), each 0-255. Empty means no floor.
+// (bootloader,tee,snp,microcode), each 0-255. Empty means no floor, and so does
+// an all-zero floor: every component is >= 0, so it gates nothing, while a
+// stored floor would reject all TDX evidence as a cross-platform pin.
 func parseMinTCBFlag(s string) (*config.TCBFloor, error) {
 	if s == "" {
 		return nil, nil
@@ -119,7 +157,11 @@ func parseMinTCBFlag(s string) (*config.TCBFloor, error) {
 		}
 		vals[i] = uint8(n)
 	}
-	return &config.TCBFloor{Bootloader: vals[0], TEE: vals[1], SNP: vals[2], Microcode: vals[3]}, nil
+	floor := config.TCBFloor{Bootloader: vals[0], TEE: vals[1], SNP: vals[2], Microcode: vals[3]}
+	if floor == (config.TCBFloor{}) {
+		return nil, nil
+	}
+	return &floor, nil
 }
 
 func newRemoteAddCmd(name string) *cobra.Command {
@@ -151,6 +193,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
 			}
 
+			if err := validatePinModes(attestMode, imageManifest, expectedRTMR3, minTCB); err != nil {
+				return err
+			}
 			// An image manifest pins the launch digest exactly against its own
 			// MRTD, so a second allowlist could only widen the policy past the
 			// image it names. Refused at add time as well as at verify time.
@@ -166,10 +211,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if expectedRTMR3 != "" {
-				if _, err := verifier.ParseRegisterHex(expectedRTMR3); err != nil {
-					return fmt.Errorf("--expected-rtmr3 %w", err)
-				}
+			rtmr3Stored, err := validateRTMR3Flag(expectedRTMR3)
+			if err != nil {
+				return err
 			}
 			tcbFloor, err := parseMinTCBFlag(minTCB)
 			if err != nil {
@@ -199,7 +243,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				WorkloadName:      workload,
 				AllowlistPath:     allowlistStored,
 				ImageManifestPath: manifestStored,
-				ExpectedRTMR3:     expectedRTMR3,
+				ExpectedRTMR3:     rtmr3Stored,
 				MinTCB:            tcbFloor,
 			}
 			if err := cfg.AddRemote(r); err != nil {

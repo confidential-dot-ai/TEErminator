@@ -103,10 +103,12 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
     carries a prominent MRTD-only warning. On **AMD SEV-SNP** the launch digest already
     covers the full image (with kernel-hashes: firmware, kernel, initrd, cmdline), so no
     extra register pin exists; `--min-tcb <bootloader,tee,snp,microcode>` adds a
-    component-wise minimum TCB floor, and debug-launched guests are always rejected.
+    component-wise minimum TCB floor (an all-zero floor gates nothing and is treated as
+    no floor), and debug-launched guests are always rejected.
     Cross-platform pins fail closed: a TDX pin (`--image-manifest`/`--expected-rtmr3`)
     against SNP evidence is a hard error naming the platform, as is `--min-tcb` against
-    TDX evidence — never a silently ignored option.
+    TDX evidence — never a silently ignored option. All three require
+    `--mode attest-lb`: on any other mode nothing would read them.
   - **Requires `public_tls.mode=cds`.** The serving key must be TEE-held and mesh-chained;
     a WebPKI front door refuses the endpoint with `400 unsupported_front_door` and can
     only be used through the encrypted-tunnel `attest-pq` protocol (browser client).
