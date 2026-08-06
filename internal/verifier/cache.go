@@ -34,6 +34,9 @@ type verdict struct {
 	verifAt time.Time
 	err     error
 	leaf    [32]byte // SHA-256 of the attested serving-leaf DER the session is pinned to
+	// notAfter is that leaf's expiry, zero when the verdict pins no leaf (a
+	// failure). A verdict is scoped to one certificate and cannot outlive it.
+	notAfter time.Time
 }
 
 // NewSessionCache returns a cache whose verdicts are valid for ttl.
@@ -42,21 +45,34 @@ func NewSessionCache(ttl time.Duration) *SessionCache {
 }
 
 // RecordSession stores an attestation verdict together with the SHA-256 of the
-// attested serving-leaf DER the session is pinned to.
-func (c *SessionCache) RecordSession(key string, ok bool, leaf [32]byte, err error) {
+// attested serving-leaf DER the session is pinned to and that leaf's expiry.
+func (c *SessionCache) RecordSession(key string, ok bool, leaf [32]byte, notAfter time.Time, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.state[key] = verdict{ok: ok, verifAt: c.now(), err: err, leaf: leaf}
+	c.state[key] = verdict{ok: ok, verifAt: c.now(), err: err, leaf: leaf, notAfter: notAfter}
 }
 
 // FreshSession returns the pinned leaf hash for a still-valid passing verdict.
 // fresh is false when there is no unexpired verdict; ok reports whether that
 // verdict passed.
+//
+// Reuse is bounded by min(ttl, the pinned leaf's NotAfter). The ttl alone is
+// not enough: it is the caller-settable ReattestInterval, with no ceiling, so a
+// generous interval would otherwise keep a verdict — and the handshake pin
+// derived from it — alive past the point where the certificate it is scoped to
+// stopped being valid.
 func (c *SessionCache) FreshSession(key string) (leaf [32]byte, fresh, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	v, present := c.state[key]
-	if !present || c.now().Sub(v.verifAt) > c.ttl {
+	if !present {
+		return [32]byte{}, false, false
+	}
+	now := c.now()
+	if now.Sub(v.verifAt) > c.ttl {
+		return [32]byte{}, false, false
+	}
+	if !v.notAfter.IsZero() && !now.Before(v.notAfter) {
 		return [32]byte{}, false, false
 	}
 	return v.leaf, true, v.ok

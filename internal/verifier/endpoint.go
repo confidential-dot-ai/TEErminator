@@ -94,6 +94,11 @@ type SessionVerdict struct {
 	// Profile is always ProfileCAVouched (see the constant).
 	Profile    string
 	LeafSHA256 [32]byte
+	// LeafNotAfter is the serving leaf's expiry. A verdict says nothing past
+	// it — the certificate it is scoped to has stopped being valid — so the
+	// verdict cache bounds reuse at min(ReattestInterval, LeafNotAfter) rather
+	// than at the caller-settable interval alone.
+	LeafNotAfter time.Time
 	// RTMRsPinned lists the TDX runtime measurement registers this verdict
 	// enforced, as "<index>:<hex>". On TDX the launch-digest allowlist covers
 	// only MRTD (the TDVF firmware): without RTMR[1]/[2] the guest kernel and
@@ -302,11 +307,12 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	}
 
 	v := &SessionVerdict{
-		Measurement: measurement,
-		Platform:    string(platform),
-		TrustMode:   TrustDeploymentClass,
-		Profile:     ProfileCAVouched,
-		LeafSHA256:  sha256.Sum256(servingLeaf.Raw),
+		Measurement:  measurement,
+		Platform:     string(platform),
+		TrustMode:    TrustDeploymentClass,
+		Profile:      ProfileCAVouched,
+		LeafSHA256:   sha256.Sum256(servingLeaf.Raw),
+		LeafNotAfter: servingLeaf.NotAfter,
 	}
 
 	// (i') Platform-complete pins: TDX runtime registers and the SNP TCB floor

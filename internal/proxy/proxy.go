@@ -392,10 +392,12 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	if !fresh {
 		v, err := t.ea.Attest(req.Context())
 		var pinned [32]byte
+		var notAfter time.Time
 		if v != nil {
 			pinned = v.LeafSHA256
+			notAfter = v.LeafNotAfter
 		}
-		t.cache.RecordSession(t.remoteKey, err == nil, pinned, err)
+		t.cache.RecordSession(t.remoteKey, err == nil, pinned, notAfter, err)
 		if err != nil {
 			slog.Warn("attestation verification failed; refusing to forward",
 				"mode", t.remote.Mode, "url", req.URL.String(), "error", err)

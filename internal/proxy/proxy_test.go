@@ -703,7 +703,7 @@ func TestAttestedLeafVerifier(t *testing.T) {
 		t.Fatalf("no verdict: want handshake admitted, got %v", err)
 	}
 
-	cache.RecordSession(key, true, leafHashOf(pinned), nil)
+	cache.RecordSession(key, true, leafHashOf(pinned), time.Now().Add(time.Hour), nil)
 	if err := verify(state(pinned)); err != nil {
 		t.Fatalf("pinned leaf: want handshake admitted, got %v", err)
 	}
@@ -742,7 +742,7 @@ func TestAttestedLeafVerifier(t *testing.T) {
 	}
 
 	// A failed verdict pins nothing; the round-trip path fails fast instead.
-	cache.RecordSession(key, false, [32]byte{}, fmt.Errorf("attestation failed"))
+	cache.RecordSession(key, false, [32]byte{}, time.Time{}, fmt.Errorf("attestation failed"))
 	if err := verify(state(other)); err != nil {
 		t.Fatalf("failed verdict: want handshake admitted (round-trip path rejects), got %v", err)
 	}
@@ -780,7 +780,7 @@ func TestHandshakePinBlocksBeforeSend(t *testing.T) {
 		defer func() { _ = tr.Close() }()
 		// Seed a fresh passing verdict directly so the round trip skips the
 		// attester and exercises only the handshake-time pin.
-		tr.cache.RecordSession(tr.remoteKey, true, pin, nil)
+		tr.cache.RecordSession(tr.remoteKey, true, pin, time.Now().Add(time.Hour), nil)
 		req, _ := http.NewRequest("GET", backend.URL, nil)
 		resp, err := tr.RoundTrip(req)
 		if err != nil {

@@ -1180,7 +1180,7 @@ func TestSessionCachePinning(t *testing.T) {
 		t.Fatal("empty cache should not be fresh")
 	}
 	want := [32]byte{1, 2, 3}
-	c.RecordSession("r", true, want, nil)
+	c.RecordSession("r", true, want, time.Now().Add(time.Hour), nil)
 	leaf, fresh, ok := c.FreshSession("r")
 	if !fresh || !ok || leaf != want {
 		t.Fatalf("FreshSession = (%x, %v, %v), want (%x, true, true)", leaf, fresh, ok, want)

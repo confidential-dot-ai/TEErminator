@@ -8,7 +8,9 @@
 - [x] Session-scoped re-attestation: a verified verdict is reused for up to one
       minute (`internal/verifier/cache.go`) so long-lived TLS sessions are not
       re-attested on every request — the TLS channel carries the guarantee between
-      periodic freshness checks.
+      periodic freshness checks. Reuse is bounded by `min(ReattestInterval,
+      the attested leaf's NotAfter)`: the interval is caller-settable with no
+      ceiling, and a verdict scoped to one certificate cannot outlive it.
 - [x] Trust custom upstream CAs and override the validated TLS name. Certs added
       with `certs add` are appended to the system roots and used as upstream trust
       anchors (`internal/proxy/proxy.go`, `Options.ExtraCAs`), and `remote add
