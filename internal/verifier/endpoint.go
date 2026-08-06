@@ -87,7 +87,13 @@ type SessionVerdict struct {
 	Platform string
 	// WorkloadName / AllowlistVersion are set only when a workload policy was
 	// requested and verified against the committed mesh leaf's stamp.
-	WorkloadName     string
+	WorkloadName string
+	// AllowlistVersion is the store's version counter as STAMPED on the mesh
+	// leaf. It is CA-vouched (the stamp sits in the chain-verified leaf) but
+	// UNVERIFIED against any served allowlist: `--allowlist` checks the stamped
+	// digest against the pinned file's bytes, and a canonical-allowlist
+	// document carries no version field to compare this counter with. Report it
+	// as what the deployment claims, never as a checked fact.
 	AllowlistVersion string
 	// TrustMode is TrustDeploymentClass or TrustSpecificCluster.
 	TrustMode string

@@ -39,8 +39,12 @@ var transcriptVectors []byte
 
 // TestAttestLBTranscriptGoldenVectors pins the report_data construction to the
 // golden vectors in testdata — a verbatim copy of c8s
-// pkg/overenc/testdata/attest_lb_transcript_vectors.json, shared across the
-// Go, JS, and TEErminator implementations so the three cannot drift.
+// pkg/overenc/testdata/attest_lb_transcript_vectors.json, so this client and
+// the c8s server cannot drift on the transcript. The browser client is NOT a
+// third party to these: c8s-verify-js implements no attest-lb flow (its
+// PROTOCOL.md scopes the endpoint to native clients and src/verify.ts rejects
+// the binding identifier), so only the matched-workload golden DER is shared
+// three ways.
 func TestAttestLBTranscriptGoldenVectors(t *testing.T) {
 	var vectors []struct {
 		Description       string `json:"description"`
