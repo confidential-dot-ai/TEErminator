@@ -90,8 +90,14 @@ func mintCert(t *testing.T, tmpl *x509.Certificate, parent *certAndKey, curve el
 	}
 	fixtureSerial++
 	tmpl.SerialNumber = big.NewInt(fixtureSerial)
-	tmpl.NotBefore = time.Now().Add(-time.Hour)
-	tmpl.NotAfter = time.Now().Add(time.Hour)
+	// A caller that presets the window keeps it (the validity tests do); every
+	// other fixture gets the default comfortably-valid one.
+	if tmpl.NotBefore.IsZero() {
+		tmpl.NotBefore = time.Now().Add(-time.Hour)
+	}
+	if tmpl.NotAfter.IsZero() {
+		tmpl.NotAfter = time.Now().Add(time.Hour)
+	}
 	signerCert, signerKey := tmpl, key
 	if parent != nil {
 		signerCert, signerKey = parent.cert, parent.key
