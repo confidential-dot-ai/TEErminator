@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
-	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 )
 
 // startTunnel is a test helper that creates a tunnel pointing at backend and
@@ -670,11 +669,11 @@ func leafHashOf(cert *x509.Certificate) [32]byte {
 	return sha256.Sum256(cert.Raw)
 }
 
-// TestAttestedLeafVerifier unit-tests the handshake-time pin: it must admit
-// handshakes when no fresh passing verdict pins a leaf (first connect and
-// failed-verdict windows are handled by the round-trip path), accept the
-// pinned leaf, and refuse anything else before application data flows.
-func TestAttestedLeafVerifier(t *testing.T) {
+// TestPinnedLeafVerifier unit-tests the handshake-time pin. It is built for one
+// decided leaf and has no permissive branch: it accepts that certificate and
+// refuses everything else before application data flows, whatever the verdict
+// cache happens to hold at the time.
+func TestPinnedLeafVerifier(t *testing.T) {
 	parse := func(pemBytes []byte) *x509.Certificate {
 		block, _ := pem.Decode(pemBytes)
 		cert, err := x509.ParseCertificate(block.Bytes)
@@ -687,9 +686,7 @@ func TestAttestedLeafVerifier(t *testing.T) {
 	otherPEM, _ := selfSignedCert(t, "other.example")
 	pinned, other := parse(pinnedPEM), parse(otherPEM)
 
-	const key = "lb.example:443"
-	cache := verifier.NewSessionCache(time.Minute)
-	verify := attestedLeafVerifier(cache, key)
+	verify := pinnedLeafVerifier(leafHashOf(pinned))
 
 	state := func(cert *x509.Certificate) tls.ConnectionState {
 		if cert == nil {
@@ -698,12 +695,6 @@ func TestAttestedLeafVerifier(t *testing.T) {
 		return tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
 	}
 
-	// No verdict yet: the handshake must be admitted so the attester can run.
-	if err := verify(state(other)); err != nil {
-		t.Fatalf("no verdict: want handshake admitted, got %v", err)
-	}
-
-	cache.RecordSession(key, true, leafHashOf(pinned), time.Now().Add(time.Hour), nil)
 	if err := verify(state(pinned)); err != nil {
 		t.Fatalf("pinned leaf: want handshake admitted, got %v", err)
 	}
@@ -741,10 +732,85 @@ func TestAttestedLeafVerifier(t *testing.T) {
 		t.Fatal("substituted certificate with the attested key: want handshake refused, got nil")
 	}
 
-	// A failed verdict pins nothing; the round-trip path fails fast instead.
-	cache.RecordSession(key, false, [32]byte{}, time.Time{}, fmt.Errorf("attestation failed"))
-	if err := verify(state(other)); err != nil {
-		t.Fatalf("failed verdict: want handshake admitted (round-trip path rejects), got %v", err)
+	// The zero pin is not a wildcard. It cannot be reached from
+	// roundTripEndpoint (a failed verdict returns before forwarding, and an
+	// all-zero SHA-256 is not a certificate), but "no pin" must never read as
+	// "any certificate".
+	if err := pinnedLeafVerifier([32]byte{})(state(other)); err == nil {
+		t.Fatal("zero pin: want handshake refused, got nil")
+	}
+}
+
+// TestForwardingPinSurvivesCacheInvalidation is the regression for the
+// fail-open race: the forwarding handshake used to re-read the shared verdict
+// cache instead of using the pin its caller had already decided on, and
+// returned nil — admitting ANY certificate — whenever that read came back
+// stale. A concurrent request failing its response-time check
+// (cache.Invalidate) or a TTL expiry at the boundary was enough to hit it,
+// after which the bearer token and request body were written to an
+// unattested peer.
+//
+// Reproduced deterministically here by invalidating the cache between the
+// decision and the dial: the transport is built for backend A's leaf and then
+// pointed at impostor B with the verdict already gone.
+func TestForwardingPinSurvivesCacheInvalidation(t *testing.T) {
+	attested := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "attested-ok")
+	}))
+	defer attested.Close()
+
+	// httptest serves one shared certificate to every TLS server it starts, so
+	// the impostor is given its own — otherwise it would present the very leaf
+	// under test and prove nothing.
+	impostorPEM, impostorKeyPEM := selfSignedCert(t, "impostor.example")
+	impostorCert, err := tls.X509KeyPair(impostorPEM, impostorKeyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var impostorHits atomic.Int32
+	impostor := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		impostorHits.Add(1)
+		fmt.Fprint(w, "impostor-ok")
+	}))
+	impostor.TLS = &tls.Config{Certificates: []tls.Certificate{impostorCert}}
+	impostor.StartTLS()
+	defer impostor.Close()
+
+	target, err := url.Parse(impostor.URL) // the proxy is pointed at the impostor
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := newH3Transport(target, Options{
+		Remote:           config.Remote{Mode: config.AttestEndpoint},
+		ReattestInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tr.Close() }()
+
+	pin := leafHashOf(attested.Certificate())
+	tr.cache.RecordSession(tr.remoteKey, true, pin, time.Now().Add(time.Hour), nil)
+	forwarding := tr.transportFor(pin)
+
+	// The race: the verdict vanishes after the caller decided on it and before
+	// the handshake runs.
+	tr.cache.Invalidate(tr.remoteKey)
+
+	req, _ := http.NewRequest("GET", impostor.URL, nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := forwarding.RoundTrip(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("request forwarded to an unattested peer after the verdict was invalidated")
+	}
+	if !strings.Contains(err.Error(), "does not match the attested leaf") {
+		t.Fatalf("want the handshake pin error, got %v", err)
+	}
+	if got := impostorHits.Load(); got != 0 {
+		t.Fatalf("%d request(s) reached the unattested backend; want 0", got)
 	}
 }
 
