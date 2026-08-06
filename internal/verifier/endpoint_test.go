@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1037,6 +1038,38 @@ func TestAttestLBTDXCompleteness(t *testing.T) {
 	})
 }
 
+// TestCheckVerificationResult asserts the verifier's own verdict fields are
+// read rather than inferred from a nil error. Every attestation-go platform
+// path happens to return an error on a report-data mismatch today; that is an
+// implementation property, not an interface guarantee.
+func TestCheckVerificationResult(t *testing.T) {
+	yes, no := true, false
+	for _, tc := range []struct {
+		name    string
+		res     *teetypes.VerificationResult
+		wantErr string
+	}{
+		{"valid", &teetypes.VerificationResult{SignatureValid: true, ReportDataMatch: &yes}, ""},
+		{"nil result", nil, "no result"},
+		{"signature not valid", &teetypes.VerificationResult{ReportDataMatch: &yes}, "hardware signature"},
+		{"report data mismatch", &teetypes.VerificationResult{SignatureValid: true, ReportDataMatch: &no}, "report_data mismatch"},
+		{"report data unevaluated", &teetypes.VerificationResult{SignatureValid: true}, "report_data mismatch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkVerificationResult(tc.res, "snp")
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("checkVerificationResult = %v, want it accepted", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("checkVerificationResult = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // The following tests run the REAL evidence verifier (attestation-go teeverify)
 // through the fixture flow, covering the seam's production side.
 
@@ -1087,6 +1120,36 @@ func TestAttestLBRejectsRecordedEvidence(t *testing.T) {
 	_, err := ea.Attest(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "vTPM") {
 		t.Fatalf("want vTPM freshness-binding failure for recorded evidence, got %v", err)
+	}
+}
+
+// TestAttestLBDoesNotFollowRedirects pins "the leaf the attester observes is
+// the leaf traffic rides". The fetch runs over a transport with no PKI
+// verification, so an on-path attacker can terminate it with any certificate;
+// following a redirect to the genuine LB would have the client attest — and
+// pin — a host it was never configured to reach.
+func TestAttestLBDoesNotFollowRedirects(t *testing.T) {
+	stubEvidence(t)
+	f := newLBFixture(t, fixtureOpts{})
+	honest := f.newServer(t, bundleSpec{})
+
+	var honestHits atomic.Int32
+	redirector := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		honestHits.Add(1)
+		http.Redirect(w, r, honest.URL+r.URL.Path+"?"+r.URL.RawQuery, http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	ea, err := NewEndpointAttester(redirector.URL, client, measuredRemote(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ea.Attest(context.Background()); err == nil || !strings.Contains(err.Error(), "302") {
+		t.Fatalf("want the redirect surfaced as a non-200 response, got %v", err)
+	}
+	if got := honestHits.Load(); got != 1 {
+		t.Fatalf("redirector saw %d requests, want exactly 1 (no follow)", got)
 	}
 }
 

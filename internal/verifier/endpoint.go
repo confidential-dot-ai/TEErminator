@@ -149,8 +149,17 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 	}
 	u.Path = wellKnownAttestLB
 	u.RawQuery = ""
+	// The leaf the attester observes must be the leaf traffic rides, so the
+	// fetch is not allowed to move: an on-path attacker who terminates it with
+	// any certificate could otherwise redirect to the genuine LB, and the
+	// client would attest — and pin — a host it was never configured to reach.
+	// A redirect is surfaced as its own non-200 response instead. The client is
+	// copied rather than mutated so a caller's shared client keeps its own
+	// policy.
+	c := *client
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &EndpointAttester{
-		client:    client,
+		client:    &c,
 		attestURL: u,
 		remote:    remote,
 		pinnedCAs: pinnedCAs,
@@ -719,7 +728,31 @@ func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte, minT
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb (%s): %w", b.Platform, err)
 	}
+	if err := checkVerificationResult(res, b.Platform); err != nil {
+		return nil, err
+	}
 	return res, nil
+}
+
+// checkVerificationResult asserts the verifier's own verdict fields rather than
+// inferring them from a nil error. Every attestation-go platform path happens to
+// return an error today when the hardware signature or the report-data binding
+// fails, but that is a property of the current implementations, not of the
+// interface: reading the fields keeps the client fail-closed across a refactor
+// that starts reporting a failure in the result instead of in err.
+func checkVerificationResult(res *teetypes.VerificationResult, platform string) error {
+	if res == nil {
+		return fmt.Errorf("attest-lb (%s): verifier returned no result", platform)
+	}
+	if !res.SignatureValid {
+		return fmt.Errorf("attest-lb (%s): hardware signature on the evidence did not verify", platform)
+	}
+	// We always supply ExpectedReportData, so a nil ReportDataMatch means the
+	// verifier never evaluated the binding — the transcript would be unchecked.
+	if res.ReportDataMatch == nil || !*res.ReportDataMatch {
+		return fmt.Errorf("attest-lb (%s): evidence does not bind the attest-lb transcript (report_data mismatch)", platform)
+	}
+	return nil
 }
 
 // servingLeafFromTLS returns the exact peer leaf certificate of the connection.
