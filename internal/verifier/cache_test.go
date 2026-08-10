@@ -20,7 +20,7 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 	}
 
 	spki := [32]byte{4, 2}
-	c.RecordSession("host", true, spki, nil)
+	c.RecordSession("host", true, spki, now.Add(time.Hour), nil)
 	if got, fresh, ok := c.FreshSession("host"); !fresh || !ok || got != spki {
 		t.Fatal("expected fresh+ok pinned verdict right after RecordSession")
 	}
@@ -40,7 +40,7 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 
 func TestSessionCacheRemembersFailure(t *testing.T) {
 	c := NewSessionCache(time.Minute)
-	c.RecordSession("bad", false, [32]byte{}, errors.New("boom"))
+	c.RecordSession("bad", false, [32]byte{}, time.Time{}, errors.New("boom"))
 	_, fresh, ok := c.FreshSession("bad")
 	if !fresh || ok {
 		t.Fatalf("expected fresh failure verdict, got fresh=%v ok=%v", fresh, ok)
@@ -51,6 +51,39 @@ func TestSessionCacheRemembersFailure(t *testing.T) {
 	}
 }
 
+// TestExpiredServedLeafForcesReverify pins the second freshness bound: a
+// verdict is scoped to one serving leaf, so it stops being reusable when that
+// certificate expires even if the re-attest interval has not elapsed. The
+// interval is caller-settable with no ceiling (StartOptions.ReattestInterval),
+// while c8s caps a stamped leaf at 6h, so without this bound a generous
+// interval would keep both the verdict and the handshake pin derived from it
+// alive past the certificate's own lifetime.
+func TestExpiredServedLeafForcesReverify(t *testing.T) {
+	now := time.Unix(1000, 0)
+	c := NewSessionCache(time.Hour)
+	c.now = func() time.Time { return now }
+
+	leaf := [32]byte{7}
+	c.RecordSession("host", true, leaf, now.Add(10*time.Second), nil)
+	if _, fresh, ok := c.FreshSession("host"); !fresh || !ok {
+		t.Fatal("verdict should be fresh inside both the TTL and the leaf validity")
+	}
+
+	// Past the leaf's NotAfter but well inside the one-hour TTL.
+	now = now.Add(11 * time.Second)
+	if _, fresh, _ := c.FreshSession("host"); fresh {
+		t.Fatal("a verdict must not outlive the serving leaf it is scoped to")
+	}
+
+	// The TTL still binds independently: a long-lived leaf does not extend it.
+	now = time.Unix(2000, 0)
+	c.RecordSession("host", true, leaf, now.Add(24*time.Hour), nil)
+	now = now.Add(time.Hour + time.Second)
+	if _, fresh, _ := c.FreshSession("host"); fresh {
+		t.Fatal("a long-lived leaf must not extend the re-attest interval")
+	}
+}
+
 // TestRemoteKey checks the cache key covers the endpoint mode and every policy
 // pin, and is canonical over measurement order and case.
 func TestRemoteKey(t *testing.T) {
@@ -58,39 +91,56 @@ func TestRemoteKey(t *testing.T) {
 	otherCA := mintCA(t, "other-key-test-ca")
 	base := config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"B2", "a1"}}
 
-	k := RemoteKey("lb.example:443", base, nil, nil)
+	k := RemoteKey("lb.example:443", base, nil, nil, nil)
 	if !strings.HasPrefix(k, "lb.example:443|attest-lb|") {
 		t.Fatalf("key = %q, want host|mode| prefix", k)
 	}
-	if k != RemoteKey("lb.example:443", base, nil, nil) {
+	if k != RemoteKey("lb.example:443", base, nil, nil, nil) {
 		t.Fatal("key is not deterministic")
 	}
 	canon := base
 	canon.Measurements = []string{"A1", "b2"}
-	if k != RemoteKey("lb.example:443", canon, nil, nil) {
+	if k != RemoteKey("lb.example:443", canon, nil, nil, nil) {
 		t.Fatal("key must be invariant under measurement order and case")
 	}
 
 	variants := map[string]string{
-		"different host": RemoteKey("other.example:443", base, nil, nil),
+		"different host": RemoteKey("other.example:443", base, nil, nil, nil),
 		"different mode": func() string {
 			r := base
 			r.Mode = config.AttestCDSCert
-			return RemoteKey("lb.example:443", r, nil, nil)
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
 		}(),
 		"different measurements": func() string {
 			r := base
 			r.Measurements = []string{"a1"}
-			return RemoteKey("lb.example:443", r, nil, nil)
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
 		}(),
 		"workload pin": func() string {
 			r := base
 			r.WorkloadName = "api"
-			return RemoteKey("lb.example:443", r, nil, nil)
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
 		}(),
-		"allowlist digest": RemoteKey("lb.example:443", base, []byte{1, 2, 3}, nil),
-		"pinned CA":        RemoteKey("lb.example:443", base, nil, []*x509.Certificate{ca.cert}),
-		"other pinned CA":  RemoteKey("lb.example:443", base, nil, []*x509.Certificate{otherCA.cert}),
+		"expected rtmr3": func() string {
+			r := base
+			r.ExpectedRTMR3 = strings.Repeat("4d", RegisterSize)
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
+		}(),
+		"tcb floor": func() string {
+			r := base
+			r.MinTCB = &config.TCBFloor{Bootloader: 3, SNP: 8, Microcode: 209}
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
+		}(),
+		"other tcb floor": func() string {
+			r := base
+			r.MinTCB = &config.TCBFloor{Bootloader: 3, SNP: 8, Microcode: 210}
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
+		}(),
+		"allowlist digest":            RemoteKey("lb.example:443", base, []byte{1, 2, 3}, nil, nil),
+		"image manifest digest":       RemoteKey("lb.example:443", base, nil, []byte{1, 2, 3}, nil),
+		"other image manifest digest": RemoteKey("lb.example:443", base, nil, []byte{4, 5, 6}, nil),
+		"pinned CA":                   RemoteKey("lb.example:443", base, nil, nil, []*x509.Certificate{ca.cert}),
+		"other pinned CA":             RemoteKey("lb.example:443", base, nil, nil, []*x509.Certificate{otherCA.cert}),
 	}
 	seen := map[string]string{k: "base"}
 	for name, key := range variants {
@@ -101,8 +151,8 @@ func TestRemoteKey(t *testing.T) {
 	}
 
 	// Pinned-CA order must not matter.
-	a := RemoteKey("h", base, nil, []*x509.Certificate{ca.cert, otherCA.cert})
-	b := RemoteKey("h", base, nil, []*x509.Certificate{otherCA.cert, ca.cert})
+	a := RemoteKey("h", base, nil, nil, []*x509.Certificate{ca.cert, otherCA.cert})
+	b := RemoteKey("h", base, nil, nil, []*x509.Certificate{otherCA.cert, ca.cert})
 	if a != b {
 		t.Fatal("key must be invariant under pinned-CA order")
 	}

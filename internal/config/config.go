@@ -52,6 +52,15 @@ type CertPin struct {
 	PEM      string `json:"pem,omitempty"`
 }
 
+// TCBFloor is a component-wise minimum AMD SEV-SNP TCB (`remote add --min-tcb`).
+// Each component of the verified reported TCB must be at least its floor value.
+type TCBFloor struct {
+	Bootloader uint8 `json:"bootloader"`
+	TEE        uint8 `json:"tee"`
+	SNP        uint8 `json:"snp"`
+	Microcode  uint8 `json:"microcode"`
+}
+
 type Remote struct {
 	Local        string      `json:"local"`
 	Remote       string      `json:"remote"`
@@ -76,8 +85,24 @@ type Remote struct {
 	// hashed exactly as read (SHA-256 over the raw file bytes, never
 	// reserialized) against the stamp's digest, and the stamped name must be a
 	// key of its workloads map.
-	AllowlistPath string   `json:"allowlist_path,omitempty"`
-	Pin           *CertPin `json:"pin,omitempty"`
+	AllowlistPath string `json:"allowlist_path,omitempty"`
+	// ImageManifestPath points at a TDX image-pin manifest (JSON object with
+	// mrtd, rtmr1, rtmr2, each 96 lowercase hex chars). All three registers are
+	// compared byte-exactly against the verified claims — the launch digest
+	// against MRTD included — so the manifest replaces Measurements rather than
+	// adding to it; setting both is a configuration error. TDX evidence only —
+	// with SNP evidence this pin is a policy error, never silently ignored.
+	ImageManifestPath string `json:"image_manifest_path,omitempty"`
+	// ExpectedRTMR3 pins TDX RTMR[3] — the runtime operator-key/workload event
+	// chain extended after boot — as 96 lowercase hex chars. A deployment
+	// property, not a cluster identity: the host chooses which guest extends
+	// the register, so this pin requires ImageManifestPath alongside it and is
+	// a configuration error without one. TDX evidence only.
+	ExpectedRTMR3 string `json:"expected_rtmr3,omitempty"`
+	// MinTCB is the SNP TCB floor enforced on verified evidence. SNP evidence
+	// only — with TDX evidence this pin is a policy error.
+	MinTCB *TCBFloor `json:"min_tcb,omitempty"`
+	Pin    *CertPin  `json:"pin,omitempty"`
 }
 
 // ParseAttestMode parses an attestation-mode string, normalizing the legacy
