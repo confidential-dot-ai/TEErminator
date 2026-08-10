@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -223,6 +224,7 @@ type bundleSpec struct {
 	signKey    *ecdsa.PrivateKey
 	breakSig   bool
 	evidence   func(reportData []byte) json.RawMessage // default: stub shape {"report_data": ...}
+	observe    func(*http.Request)                     // called with the request as received
 }
 
 // newServer serves the attest-lb bundle over TLS with the fixture's serving
@@ -231,6 +233,9 @@ type bundleSpec struct {
 func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 	t.Helper()
 	handler := func(w http.ResponseWriter, r *http.Request) {
+		if spec.observe != nil {
+			spec.observe(r)
+		}
 		nonceB64 := r.URL.Query().Get("nonce")
 		nonce, err := base64.RawURLEncoding.DecodeString(nonceB64)
 		if err != nil {
@@ -394,6 +399,63 @@ func newLBAttester(t *testing.T, ts *httptest.Server, remote config.Remote, pinn
 // exercises the case-insensitive membership check against the stub's "a1".
 func measuredRemote() config.Remote {
 	return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"A1"}}
+}
+
+// TestAttestLBRequestShape pins what goes ON THE WIRE, which the rest of these
+// tests take for granted because the fixture server is lenient and the real one
+// is not. c8s answers the attest-lb endpoint from a handler that rejects, with
+// 400, any request carrying a `pq` or `binding` query key — on PRESENCE, not
+// value, so that a client which thinks it still selects a binding is told so
+// rather than served the wrong one — and any nonce that is not exactly 32
+// bytes, the length both transcripts frame. The retired /attestation endpoint
+// answers 410. A client that drifted on any of those three would fail against
+// every deployed LB, so they are asserted here rather than left to the fixture.
+//
+// The base URL deliberately carries a forwarding path and a query of its own:
+// the attestation fetch is anchored at the LB ORIGIN, independent of whatever
+// the remote forwards to, and neither may leak into the request.
+func TestAttestLBRequestShape(t *testing.T) {
+	stubEvidence(t)
+	f := newLBFixture(t, fixtureOpts{})
+	var got *url.URL
+	ts := f.newServer(t, bundleSpec{observe: func(r *http.Request) {
+		u := *r.URL
+		got = &u
+	}})
+
+	client := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
+	ea, err := NewEndpointAttester(ts.URL+"/api/v1?pq=false&binding=c8s-verify/v1", client, measuredRemote(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ea.Attest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("the endpoint was never called")
+	}
+
+	if got.Path != wellKnownAttestLB {
+		t.Errorf("path = %q, want %q", got.Path, wellKnownAttestLB)
+	}
+	q := got.Query()
+	if len(q) != 1 {
+		t.Errorf("query = %v, want nonce alone: c8s refuses any extra parameter", q)
+	}
+	for _, retired := range []string{"pq", "binding"} {
+		if _, ok := q[retired]; ok {
+			t.Errorf("request carries the retired %q selector: %v", retired, q)
+		}
+	}
+	nonce, err := base64.RawURLEncoding.DecodeString(q.Get("nonce"))
+	if err != nil {
+		t.Fatalf("nonce is not unpadded base64url: %v", err)
+	}
+	if len(nonce) != 32 {
+		t.Errorf("nonce is %d bytes, want the 32 both transcripts frame", len(nonce))
+	}
 }
 
 func TestAttestLBHappyPath(t *testing.T) {
