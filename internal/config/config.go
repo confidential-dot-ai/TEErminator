@@ -95,8 +95,9 @@ type Remote struct {
 	ImageManifestPath string `json:"image_manifest_path,omitempty"`
 	// ExpectedRTMR3 pins TDX RTMR[3] — the runtime operator-key/workload event
 	// chain extended after boot — as 96 lowercase hex chars. A deployment
-	// property, not a cluster identity; it cannot replace an image pin. TDX
-	// evidence only.
+	// property, not a cluster identity: the host chooses which guest extends
+	// the register, so this pin requires ImageManifestPath alongside it and is
+	// a configuration error without one. TDX evidence only.
 	ExpectedRTMR3 string `json:"expected_rtmr3,omitempty"`
 	// MinTCB is the SNP TCB floor enforced on verified evidence. SNP evidence
 	// only — with TDX evidence this pin is a policy error.

@@ -394,28 +394,49 @@ func isSNPPlatform(p teetypes.PlatformType) bool {
 // platformPins are the resolved platform-complete measurement pins of one
 // remote: the TDX image tuple (all three of MRTD, RTMR[1] and RTMR[2] compare
 // exactly against the verified claims), the optional TDX runtime-register pin
-// (RTMR[3]), and the SNP TCB floor. Any pin set against evidence from a
-// platform it cannot apply to is a hard error.
+// (RTMR[3], which only ever rides on top of an image tuple — see
+// ValidatePinCombination), and the SNP TCB floor. Any pin set against evidence
+// from a platform it cannot apply to is a hard error.
 type platformPins struct {
 	image  *ImagePins
 	rtmr3  *[RegisterSize]byte
 	minTCB *teetypes.SnpTcb
 }
 
+// ValidatePinCombination enforces the two rules that relate a remote's TDX
+// pins to each other. They hold independently of any evidence, so both the
+// `remote add` flags and the stored config go through this one implementation
+// — a hand-edited config file must not reach a state the CLI refuses to write.
+//
+//   - An image manifest pins the launch digest exactly against its own MRTD, so
+//     a second, looser source of accepted launch digests is not a widening of
+//     the policy but a hole in it: an allowlist entry that is not the
+//     manifest's MRTD would admit a guest the manifest does not describe while
+//     its RTMR[1]/[2] stayed pinned to the manifest.
+//   - RTMR[3] records events extended into a guest whose image the untrusted
+//     host selects. Without an image pin that host can boot anything and
+//     reproduce the chain, so a lone RTMR[3] pin reads like a proof of identity
+//     — reported as an enforced register — while proving none.
+//
+// c8s applies both rules to `c8s verify` (internal/cmds/verify, buildPolicy).
+func ValidatePinCombination(measurements []string, imageManifestPath, expectedRTMR3 string) error {
+	if imageManifestPath != "" && len(measurements) > 0 {
+		return fmt.Errorf("--measurements and --image-manifest are mutually exclusive: the manifest pins MRTD, RTMR[1] and RTMR[2] exactly against this one build, so a separate launch-digest allowlist could only admit an image it does not describe")
+	}
+	if expectedRTMR3 != "" && imageManifestPath == "" {
+		return fmt.Errorf("--expected-rtmr3 requires --image-manifest: RTMR[3] records events extended into a guest whose image the untrusted host selects, so pinning it without pinning the image proves nothing about what is running")
+	}
+	return nil
+}
+
 // loadPlatformPins resolves a remote's platform pins; every failure is a
 // configuration error.
 func loadPlatformPins(r config.Remote) (platformPins, error) {
 	var pins platformPins
+	if err := ValidatePinCombination(r.Measurements, r.ImageManifestPath, r.ExpectedRTMR3); err != nil {
+		return platformPins{}, fmt.Errorf("configuration error: %w", err)
+	}
 	if r.ImageManifestPath != "" {
-		// An image manifest pins the launch digest exactly, so a second,
-		// looser source of accepted launch digests is not a widening of the
-		// policy but a hole in it: an allowlist entry that is not the
-		// manifest's MRTD would admit a guest the manifest does not describe
-		// while its RTMR[1]/[2] stayed pinned to the manifest. Refuse the
-		// combination rather than silently letting one of the two win.
-		if len(r.Measurements) > 0 {
-			return platformPins{}, fmt.Errorf("configuration error: --measurements and --image-manifest are mutually exclusive: the manifest pins the launch digest exactly against its own MRTD, so a separate allowlist could only admit an image the manifest does not describe")
-		}
 		image, err := LoadImageManifest(r.ImageManifestPath)
 		if err != nil {
 			return platformPins{}, err

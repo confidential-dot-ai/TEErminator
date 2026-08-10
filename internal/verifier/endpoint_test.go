@@ -874,6 +874,31 @@ func TestAttestLBTDXImagePins(t *testing.T) {
 		}
 	})
 
+	// RTMR[3] is extended by software inside a guest the untrusted host chose.
+	// Pinning it alone would put a matched register in RTMRsPinned — the field
+	// that says what this verdict proved — for a guest whose image nothing
+	// pinned. The operator's CA pin is deliberately supplied here: that is the
+	// case the completeness rule only warns about, so this must be refused by
+	// the pin rules themselves rather than by that warning.
+	t.Run("expected-rtmr3 without an image manifest is a config error", func(t *testing.T) {
+		stubEvidenceClaims(t, tdxStubClaims())
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{
+			Mode:          config.AttestEndpoint,
+			Measurements:  []string{mrtdHex},
+			ExpectedRTMR3: rtmr3Hex,
+		}
+		ea := newLBAttester(t, ts, remote, []*x509.Certificate{f.ca.cert})
+		v, err := ea.Attest(context.Background())
+		if err == nil {
+			t.Fatalf("a lone RTMR[3] pin verified: %+v", v)
+		}
+		if !strings.Contains(err.Error(), "--expected-rtmr3 requires --image-manifest") {
+			t.Fatalf("want the RTMR[3] image requirement, got %v", err)
+		}
+	})
+
 	t.Run("TDX pins against SNP evidence fail closed", func(t *testing.T) {
 		stubEvidence(t)
 		f := newLBFixture(t, fixtureOpts{})
@@ -903,6 +928,41 @@ func TestAttestLBTDXImagePins(t *testing.T) {
 			t.Fatalf("want manifest load failure, got %v", err)
 		}
 	})
+}
+
+// TestValidatePinCombination covers the two evidence-independent pin rules as
+// a unit, since both `remote add` and the stored config are gated by them: a
+// config the CLI refuses to write must also be one the daemon refuses to run.
+// c8s applies the same two to `c8s verify` (internal/cmds/verify, buildPolicy).
+func TestValidatePinCombination(t *testing.T) {
+	const manifest = "/tmp/manifest.json"
+	for _, tc := range []struct {
+		name                        string
+		measurements                []string
+		imageManifest, expectedRTMR string
+		wantErr                     string
+	}{
+		{"nothing pinned", nil, "", "", ""},
+		{"allowlist alone", []string{mrtdHex}, "", "", ""},
+		{"manifest alone", nil, manifest, "", ""},
+		{"manifest carries the rtmr3 pin", nil, manifest, rtmr3Hex, ""},
+		{"allowlist beside a manifest", []string{mrtdHex}, manifest, "", "mutually exclusive"},
+		{"rtmr3 without a manifest", nil, "", rtmr3Hex, "--expected-rtmr3 requires --image-manifest"},
+		{"rtmr3 with only an allowlist", []string{mrtdHex}, "", rtmr3Hex, "--expected-rtmr3 requires --image-manifest"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidatePinCombination(tc.measurements, tc.imageManifest, tc.expectedRTMR)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidatePinCombination = %v, want it accepted", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidatePinCombination = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
 }
 
 func p8(v uint8) *uint8 { return &v }

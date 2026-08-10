@@ -44,7 +44,9 @@
       `internal/verifier/imagemanifest.go`, maintained as a verbatim copy of
       c8s `pkg/runtimemeasure` along with its reject table, which is what keeps
       the two from drifting — there is no shared fixture),
-      `--expected-rtmr3 <hex>` pins the runtime operator-key/workload chain, and
+      `--expected-rtmr3 <hex>` pins the runtime operator-key/workload chain on
+      top of an image pin (it requires `--image-manifest`: the host picks the
+      guest that extends RTMR[3], so alone it proves nothing), and
       `--min-tcb <bootloader,tee,snp,microcode>` enforces the SNP TCB floor
       (handed to attestation-go as `VerifyParams.MinTCB` plus a claim-side
       recheck; debug guests are engine-rejected; an all-zero floor is no floor).

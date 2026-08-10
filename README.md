@@ -97,7 +97,10 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
     the manifest replaces `--measurements` rather than widening it: a second allowlist
     could only admit an image the manifest does not describe, and setting both is a
     configuration error. `--expected-rtmr3 <hex>`
-    optionally pins the runtime operator-key/workload chain on top. Because MRTD alone is
+    optionally pins the runtime operator-key/workload chain on top, and *only* on top:
+    RTMR[3] records events extended into a guest whose image the untrusted host selects,
+    so it requires `--image-manifest` and is a configuration error without one. Because
+    MRTD alone is
     not an image identity, a *deployment-class* TDX verdict without `--image-manifest` is
     a configuration error; with a specific-cluster CA pin it passes but the verdict
     carries a prominent MRTD-only warning. On **AMD SEV-SNP** the launch digest already
