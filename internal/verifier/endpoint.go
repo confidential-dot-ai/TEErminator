@@ -87,13 +87,24 @@ type SessionVerdict struct {
 	Platform string
 	// WorkloadName / AllowlistVersion are set only when a workload policy was
 	// requested and verified against the committed mesh leaf's stamp.
-	WorkloadName     string
+	WorkloadName string
+	// AllowlistVersion is the store's version counter as STAMPED on the mesh
+	// leaf. It is CA-vouched (the stamp sits in the chain-verified leaf) but
+	// UNVERIFIED against any served allowlist: `--allowlist` checks the stamped
+	// digest against the pinned file's bytes, and a canonical-allowlist
+	// document carries no version field to compare this counter with. Report it
+	// as what the deployment claims, never as a checked fact.
 	AllowlistVersion string
 	// TrustMode is TrustDeploymentClass or TrustSpecificCluster.
 	TrustMode string
 	// Profile is always ProfileCAVouched (see the constant).
 	Profile    string
 	LeafSHA256 [32]byte
+	// LeafNotAfter is the serving leaf's expiry. A verdict says nothing past
+	// it — the certificate it is scoped to has stopped being valid — so the
+	// verdict cache bounds reuse at min(ReattestInterval, LeafNotAfter) rather
+	// than at the caller-settable interval alone.
+	LeafNotAfter time.Time
 	// RTMRsPinned lists the TDX runtime measurement registers this verdict
 	// enforced, as "<index>:<hex>". On TDX the launch-digest allowlist covers
 	// only MRTD (the TDVF firmware): without RTMR[1]/[2] the guest kernel and
@@ -149,8 +160,17 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 	}
 	u.Path = wellKnownAttestLB
 	u.RawQuery = ""
+	// The leaf the attester observes must be the leaf traffic rides, so the
+	// fetch is not allowed to move: an on-path attacker who terminates it with
+	// any certificate could otherwise redirect to the genuine LB, and the
+	// client would attest — and pin — a host it was never configured to reach.
+	// A redirect is surfaced as its own non-200 response instead. The client is
+	// copied rather than mutated so a caller's shared client keeps its own
+	// policy.
+	c := *client
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &EndpointAttester{
-		client:    client,
+		client:    &c,
 		attestURL: u,
 		remote:    remote,
 		pinnedCAs: pinnedCAs,
@@ -279,20 +299,26 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 		return nil, fmt.Errorf("attest-lb: serving leaf: %w", err)
 	}
 
-	// (i) Measurement policy: an empty allowlist is a configuration error in
-	// this mode, never a permissive default. A pinned image manifest
-	// contributes its MRTD to the allowed set — the manifest's launch digest is
-	// part of the same tuple as its RTMR pins.
-	if err := checkMeasurement(measurement, pins.allowedMeasurements(e.remote.Measurements)); err != nil {
-		return nil, err
+	// (i) Measurement policy. Without an image manifest the launch-digest
+	// allowlist is the whole of it, and an empty allowlist is a configuration
+	// error, never a permissive default: nothing else in this flow pins WHAT
+	// software the attested front door runs. With a manifest the allowlist is
+	// not consulted at all — the launch digest is compared byte-exactly against
+	// the manifest's MRTD in pins.enforce, alongside the RTMR[1]/[2] registers
+	// of the same build tuple.
+	if pins.image == nil {
+		if err := checkMeasurement(measurement, e.remote.Measurements); err != nil {
+			return nil, err
+		}
 	}
 
 	v := &SessionVerdict{
-		Measurement: measurement,
-		Platform:    string(platform),
-		TrustMode:   TrustDeploymentClass,
-		Profile:     ProfileCAVouched,
-		LeafSHA256:  sha256.Sum256(servingLeaf.Raw),
+		Measurement:  measurement,
+		Platform:     string(platform),
+		TrustMode:    TrustDeploymentClass,
+		Profile:      ProfileCAVouched,
+		LeafSHA256:   sha256.Sum256(servingLeaf.Raw),
+		LeafNotAfter: servingLeaf.NotAfter,
 	}
 
 	// (i') Platform-complete pins: TDX runtime registers and the SNP TCB floor
@@ -328,7 +354,10 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	// refused; a specific-cluster verdict additionally rests on the operator's
 	// mesh-CA pin, so it passes with a prominent warning instead. SNP needs no
 	// equivalent: its launch digest (with kernel-hashes) already covers
-	// firmware, kernel, initrd, and cmdline.
+	// firmware, kernel, initrd, and cmdline. Keying on pins.image says exactly
+	// "the full tuple was enforced": enforce above already failed the verdict
+	// closed unless the launch digest byte-equalled this manifest's MRTD, so a
+	// run that reaches here with a manifest matched all three registers.
 	if isTDXPlatform(platform) && pins.image == nil {
 		if v.TrustMode == TrustDeploymentClass {
 			return nil, fmt.Errorf("attest-lb: configuration error: deployment-class trust over TDX evidence needs an image pin — the measurement allowlist covers only MRTD, which measures the TDVF firmware, so the guest kernel and rootfs are unmeasured; pin the full MRTD+RTMR[1]+RTMR[2] tuple with `remote add --image-manifest`")
@@ -363,20 +392,50 @@ func isSNPPlatform(p teetypes.PlatformType) bool {
 }
 
 // platformPins are the resolved platform-complete measurement pins of one
-// remote: the TDX image tuple (MRTD joins the launch-digest allowlist,
-// RTMR[1]/[2] compare exactly against the verified claims), the optional TDX
-// runtime-register pin (RTMR[3]), and the SNP TCB floor. Any pin set against
-// evidence from a platform it cannot apply to is a hard error.
+// remote: the TDX image tuple (all three of MRTD, RTMR[1] and RTMR[2] compare
+// exactly against the verified claims), the optional TDX runtime-register pin
+// (RTMR[3], which only ever rides on top of an image tuple — see
+// ValidatePinCombination), and the SNP TCB floor. Any pin set against evidence
+// from a platform it cannot apply to is a hard error.
 type platformPins struct {
 	image  *ImagePins
 	rtmr3  *[RegisterSize]byte
 	minTCB *teetypes.SnpTcb
 }
 
+// ValidatePinCombination enforces the two rules that relate a remote's TDX
+// pins to each other. They hold independently of any evidence, so both the
+// `remote add` flags and the stored config go through this one implementation
+// — a hand-edited config file must not reach a state the CLI refuses to write.
+//
+//   - An image manifest pins the launch digest exactly against its own MRTD, so
+//     a second, looser source of accepted launch digests is not a widening of
+//     the policy but a hole in it: an allowlist entry that is not the
+//     manifest's MRTD would admit a guest the manifest does not describe while
+//     its RTMR[1]/[2] stayed pinned to the manifest.
+//   - RTMR[3] records events extended into a guest whose image the untrusted
+//     host selects. Without an image pin that host can boot anything and
+//     reproduce the chain, so a lone RTMR[3] pin reads like a proof of identity
+//     — reported as an enforced register — while proving none.
+//
+// c8s applies both rules to `c8s verify` (internal/cmds/verify, buildPolicy).
+func ValidatePinCombination(measurements []string, imageManifestPath, expectedRTMR3 string) error {
+	if imageManifestPath != "" && len(measurements) > 0 {
+		return fmt.Errorf("--measurements and --image-manifest are mutually exclusive: the manifest pins MRTD, RTMR[1] and RTMR[2] exactly against this one build, so a separate launch-digest allowlist could only admit an image it does not describe")
+	}
+	if expectedRTMR3 != "" && imageManifestPath == "" {
+		return fmt.Errorf("--expected-rtmr3 requires --image-manifest: RTMR[3] records events extended into a guest whose image the untrusted host selects, so pinning it without pinning the image proves nothing about what is running")
+	}
+	return nil
+}
+
 // loadPlatformPins resolves a remote's platform pins; every failure is a
 // configuration error.
 func loadPlatformPins(r config.Remote) (platformPins, error) {
 	var pins platformPins
+	if err := ValidatePinCombination(r.Measurements, r.ImageManifestPath, r.ExpectedRTMR3); err != nil {
+		return platformPins{}, fmt.Errorf("configuration error: %w", err)
+	}
 	if r.ImageManifestPath != "" {
 		image, err := LoadImageManifest(r.ImageManifestPath)
 		if err != nil {
@@ -391,7 +450,11 @@ func loadPlatformPins(r config.Remote) (platformPins, error) {
 		}
 		pins.rtmr3 = &reg
 	}
-	if r.MinTCB != nil {
+	// An all-zero floor is no floor: every SNP TCB component is >= 0, so it
+	// gates nothing, while a non-nil floor would reject all TDX evidence as a
+	// cross-platform pin. The CLI already drops it (parseMinTCBFlag); this
+	// repeats the rule for a hand-edited config file.
+	if r.MinTCB != nil && *r.MinTCB != (config.TCBFloor{}) {
 		pins.minTCB = &teetypes.SnpTcb{
 			Bootloader: r.MinTCB.Bootloader,
 			Tee:        r.MinTCB.TEE,
@@ -400,18 +463,6 @@ func loadPlatformPins(r config.Remote) (platformPins, error) {
 		}
 	}
 	return pins, nil
-}
-
-// allowedMeasurements is the launch-digest allowlist for the membership check:
-// the configured measurements plus, when an image manifest is pinned, its
-// MRTD — the manifest's launch digest belongs to the same tuple as its RTMRs.
-func (p platformPins) allowedMeasurements(configured []string) []string {
-	if p.image == nil {
-		return configured
-	}
-	out := make([]string, 0, len(configured)+1)
-	out = append(out, configured...)
-	return append(out, hex.EncodeToString(p.image.MRTD[:]))
 }
 
 // enforce applies the platform pins to the verified claims, recording what was
@@ -424,6 +475,23 @@ func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.Veri
 	}
 	if p.minTCB != nil && !isSNPPlatform(platform) {
 		return fmt.Errorf("an SNP TCB floor (min_tcb) is set but the evidence platform is %q: the four-component TCB exists only on SEV-SNP, so this policy cannot be enforced against %q evidence", platform, platform)
+	}
+
+	if p.image != nil {
+		// On TDX the launch digest IS the MRTD, and it comes out of the same
+		// build as RTMR[1]/[2]. Comparing it byte-exactly — rather than
+		// admitting it into an allowlist that may carry other digests — is what
+		// makes the manifest ONE image pin instead of three independent ones:
+		// otherwise a guest whose firmware differs from the manifest verifies
+		// while the kernel and rootfs registers stay pinned to the manifest.
+		mb, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(res.Claims.LaunchDigest)))
+		if err != nil || len(mb) == 0 {
+			return fmt.Errorf("cannot enforce the image pin: launch_digest is missing or malformed (%q)", res.Claims.LaunchDigest)
+		}
+		if !bytes.Equal(mb, p.image.MRTD[:]) {
+			return fmt.Errorf("MRTD mismatch: launch measurement %s does not match the image manifest MRTD %s (a different guest firmware/image booted)",
+				hex.EncodeToString(mb), hex.EncodeToString(p.image.MRTD[:]))
+		}
 	}
 
 	check := func(idx int, meaning string, want []byte) error {
@@ -697,7 +765,31 @@ func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte, minT
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb (%s): %w", b.Platform, err)
 	}
+	if err := checkVerificationResult(res, b.Platform); err != nil {
+		return nil, err
+	}
 	return res, nil
+}
+
+// checkVerificationResult asserts the verifier's own verdict fields rather than
+// inferring them from a nil error. Every attestation-go platform path happens to
+// return an error today when the hardware signature or the report-data binding
+// fails, but that is a property of the current implementations, not of the
+// interface: reading the fields keeps the client fail-closed across a refactor
+// that starts reporting a failure in the result instead of in err.
+func checkVerificationResult(res *teetypes.VerificationResult, platform string) error {
+	if res == nil {
+		return fmt.Errorf("attest-lb (%s): verifier returned no result", platform)
+	}
+	if !res.SignatureValid {
+		return fmt.Errorf("attest-lb (%s): hardware signature on the evidence did not verify", platform)
+	}
+	// We always supply ExpectedReportData, so a nil ReportDataMatch means the
+	// verifier never evaluated the binding — the transcript would be unchecked.
+	if res.ReportDataMatch == nil || !*res.ReportDataMatch {
+		return fmt.Errorf("attest-lb (%s): evidence does not bind the attest-lb transcript (report_data mismatch)", platform)
+	}
+	return nil
 }
 
 // servingLeafFromTLS returns the exact peer leaf certificate of the connection.
@@ -711,14 +803,28 @@ func servingLeafFromTLS(state *tls.ConnectionState) (*x509.Certificate, error) {
 // checkMeasurement enforces the remote's launch-digest allowlist. In attest-lb
 // mode an all-empty measurement policy is a configuration error, not a
 // permissive default: nothing else in this flow pins WHAT
-// software the attested front door runs.
+// software the attested front door runs. Both sides are compared as decoded
+// bytes, so an entry that is not a launch digest at all — `--measurements ""`
+// yields one such — is a configuration error rather than a value that could
+// match a platform whose LaunchDigest claim came back empty.
 func checkMeasurement(measurement string, allowed []string) error {
 	if len(allowed) == 0 {
 		return fmt.Errorf("attest-lb: empty measurement policy is a configuration error: pin the accepted launch digests with `remote add --measurements`")
 	}
-	m := strings.ToLower(measurement)
-	for i := range allowed {
-		if strings.ToLower(allowed[i]) == m {
+	want := make([][]byte, 0, len(allowed))
+	for _, a := range allowed {
+		b, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(a)))
+		if err != nil || len(b) == 0 {
+			return fmt.Errorf("attest-lb: configuration error: --measurements entry %q is not a non-empty hex launch digest", a)
+		}
+		want = append(want, b)
+	}
+	m, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(measurement)))
+	if err != nil || len(m) == 0 {
+		return fmt.Errorf("attest-lb: cannot enforce the measurement policy: launch_digest is missing or malformed (%q)", measurement)
+	}
+	for _, w := range want {
+		if bytes.Equal(w, m) {
 			return nil
 		}
 	}

@@ -165,6 +165,13 @@ type h3Transport struct {
 
 	mu   sync.RWMutex
 	noH3 map[string]bool
+
+	// pinnedMu guards pinned, the per-leaf forwarding transports built by
+	// transportFor. Keying the connection pool by pin is what makes the
+	// handshake check answerable from the request alone: a pooled connection
+	// can only ever be reused by a request that decided on the same leaf.
+	pinnedMu sync.Mutex
+	pinned   map[[32]byte]*http.Transport
 }
 
 // upstreamTLSConfig builds the TLS client config used to validate an upstream:
@@ -274,14 +281,12 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 		// serving-leaf DER observed on the connection is bound into fresh
 		// hardware evidence and must chain to the hardware-committed CA, and no
 		// application bytes flow before that verdict (roundTripEndpoint).
-		// VerifyConnection still refuses, at handshake time, any leaf other
-		// than the attested one while a verdict is fresh. WebPKI/system-pool
-		// verification stays in force for every mode not gated by an attest-lb
-		// verdict.
+		// Forwarding handshakes additionally carry the decided leaf pin
+		// (transportFor). WebPKI/system-pool verification stays in force for
+		// every mode not gated by an attest-lb verdict.
 		attestTLS := &tls.Config{
 			ServerName:         tlsCfg.ServerName,
 			InsecureSkipVerify: true, // replaced by the attest-lb hardware binding above
-			VerifyConnection:   attestedLeafVerifier(cache, remoteKey),
 		}
 		fallbackTLS = attestTLS.Clone()
 
@@ -326,6 +331,7 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 		cache:     cache,
 		remoteKey: remoteKey,
 		noH3:      make(map[string]bool),
+		pinned:    make(map[[32]byte]*http.Transport),
 	}, nil
 }
 
@@ -392,10 +398,12 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	if !fresh {
 		v, err := t.ea.Attest(req.Context())
 		var pinned [32]byte
+		var notAfter time.Time
 		if v != nil {
 			pinned = v.LeafSHA256
+			notAfter = v.LeafNotAfter
 		}
-		t.cache.RecordSession(t.remoteKey, err == nil, pinned, err)
+		t.cache.RecordSession(t.remoteKey, err == nil, pinned, notAfter, err)
 		if err != nil {
 			slog.Warn("attestation verification failed; refusing to forward",
 				"mode", t.remote.Mode, "url", req.URL.String(), "error", err)
@@ -405,10 +413,20 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 			"measurement", v.Measurement, "trust", v.TrustMode)
 		leaf = pinned
 	}
+	if leaf == ([32]byte{}) {
+		// Unreachable via either branch above, and deliberately fatal rather
+		// than defensive: forwarding without a decided pin is the one thing
+		// this path must never do.
+		return nil, fmt.Errorf("attestation binding for %s: no attested leaf to pin the forwarding handshake to", host)
+	}
 
-	// Forward over the fallback transport (HTTP/1.1 or H2) so resp.TLS reliably
-	// carries the peer leaf we pin against; attested sessions do not use HTTP/3.
-	resp, err := t.fallback.RoundTrip(req)
+	// Forward over a transport pinned to THIS request's decided leaf (HTTP/1.1
+	// or H2, so resp.TLS reliably carries the peer leaf; attested sessions do
+	// not use HTTP/3). The pin travels with the transport rather than being
+	// re-read from the cache during the handshake, so a concurrent Invalidate
+	// or TTL expiry cannot turn this request's handshake permissive between the
+	// FreshSession read above and the dial below.
+	resp, err := t.transportFor(leaf).RoundTrip(req)
 	if err != nil || resp == nil {
 		return resp, err
 	}
@@ -416,11 +434,12 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	// Pin: the serving connection must present the exact attested leaf. A
 	// swapped or rotated upstream leaf forces re-attestation rather than silent
 	// reuse. New connections are already refused at handshake time
-	// (attestedLeafVerifier); this response-time check covers connections
-	// pooled before the pin changed.
+	// (pinnedLeafVerifier); this response-time check is the belt to that
+	// braces.
 	if !sessionLeafMatches(resp, leaf) {
 		_ = resp.Body.Close()
 		t.cache.Invalidate(t.remoteKey)
+		t.dropPinned(leaf)
 		slog.Warn("upstream TLS leaf changed since attestation; dropping response",
 			"mode", t.remote.Mode, "url", req.URL.String())
 		return nil, fmt.Errorf("attestation binding broken for %s: upstream TLS leaf changed (re-attest required)", host)
@@ -428,27 +447,54 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	return resp, nil
 }
 
-// attestedLeafVerifier returns a handshake-time check for the forwarding
-// transport: while a fresh attestation verdict pins a serving leaf, every new
-// TLS handshake (VerifyConnection also runs on resumptions) must present that
-// exact certificate DER — not merely the same key, so a substituted certificate
-// reusing the attested key fails — aborting before any application data is
-// written. Without a fresh verdict it admits the handshake: roundTripEndpoint
-// handles first-connect and re-attestation and forwards nothing without a
-// verdict, and the response-time sessionLeafMatches check still covers pooled
-// connections that outlive a pin change.
-func attestedLeafVerifier(cache *verifier.SessionCache, key string) func(tls.ConnectionState) error {
+// transportFor returns the forwarding transport for one attested leaf,
+// building it on first use by cloning the base fallback transport (so the
+// remote's SNI, timeouts and any operator trust anchors carry over) and
+// replacing its handshake check with a pin on exactly that leaf. Transports are
+// kept per leaf so a pooled connection is only ever reused by a request that
+// decided on the same certificate.
+func (t *h3Transport) transportFor(leaf [32]byte) *http.Transport {
+	t.pinnedMu.Lock()
+	defer t.pinnedMu.Unlock()
+	if tr, ok := t.pinned[leaf]; ok {
+		return tr
+	}
+	tr := t.fallback.Clone()
+	if tr.TLSClientConfig == nil {
+		tr.TLSClientConfig = &tls.Config{}
+	}
+	tr.TLSClientConfig.VerifyConnection = pinnedLeafVerifier(leaf)
+	t.pinned[leaf] = tr
+	return tr
+}
+
+// dropPinned retires the transport for a leaf that is no longer attested,
+// closing its pooled connections so nothing survives the invalidation.
+func (t *h3Transport) dropPinned(leaf [32]byte) {
+	t.pinnedMu.Lock()
+	tr, ok := t.pinned[leaf]
+	delete(t.pinned, leaf)
+	t.pinnedMu.Unlock()
+	if ok {
+		tr.CloseIdleConnections()
+	}
+}
+
+// pinnedLeafVerifier is the handshake-time check for one decided leaf: every
+// new TLS handshake (VerifyConnection also runs on resumptions) must present
+// that exact certificate DER — not merely the same key, so a substituted
+// certificate reusing the attested key fails — aborting before any application
+// data is written. It compares against the pin its caller decided on and has no
+// permissive branch: there is no cache state that can make it admit a
+// certificate it was not built for.
+func pinnedLeafVerifier(leaf [32]byte) func(tls.ConnectionState) error {
 	return func(cs tls.ConnectionState) error {
-		leaf, fresh, ok := cache.FreshSession(key)
-		if !fresh || !ok {
-			return nil
-		}
 		if len(cs.PeerCertificates) == 0 {
-			return fmt.Errorf("attestation binding for %s: upstream presented no certificate", key)
+			return fmt.Errorf("attestation binding: upstream presented no certificate")
 		}
 		got := sha256.Sum256(cs.PeerCertificates[0].Raw)
 		if subtle.ConstantTimeCompare(got[:], leaf[:]) != 1 {
-			return fmt.Errorf("attestation binding for %s: upstream TLS leaf does not match the attested leaf certificate (re-attest required)", key)
+			return fmt.Errorf("attestation binding: upstream TLS leaf does not match the attested leaf certificate (re-attest required)")
 		}
 		return nil
 	}
@@ -464,8 +510,14 @@ func sessionLeafMatches(resp *http.Response, want [32]byte) bool {
 	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
-// Close releases resources held by both transports.
+// Close releases resources held by the H3, fallback and per-leaf transports.
 func (t *h3Transport) Close() error {
+	t.pinnedMu.Lock()
+	for leaf, tr := range t.pinned {
+		tr.CloseIdleConnections()
+		delete(t.pinned, leaf)
+	}
+	t.pinnedMu.Unlock()
 	if err := t.h3.Close(); err != nil {
 		return err
 	}

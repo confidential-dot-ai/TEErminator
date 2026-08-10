@@ -20,7 +20,7 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 	}
 
 	spki := [32]byte{4, 2}
-	c.RecordSession("host", true, spki, nil)
+	c.RecordSession("host", true, spki, now.Add(time.Hour), nil)
 	if got, fresh, ok := c.FreshSession("host"); !fresh || !ok || got != spki {
 		t.Fatal("expected fresh+ok pinned verdict right after RecordSession")
 	}
@@ -40,7 +40,7 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 
 func TestSessionCacheRemembersFailure(t *testing.T) {
 	c := NewSessionCache(time.Minute)
-	c.RecordSession("bad", false, [32]byte{}, errors.New("boom"))
+	c.RecordSession("bad", false, [32]byte{}, time.Time{}, errors.New("boom"))
 	_, fresh, ok := c.FreshSession("bad")
 	if !fresh || ok {
 		t.Fatalf("expected fresh failure verdict, got fresh=%v ok=%v", fresh, ok)
@@ -48,6 +48,39 @@ func TestSessionCacheRemembersFailure(t *testing.T) {
 	c.Invalidate("bad")
 	if _, fresh, _ := c.FreshSession("bad"); fresh {
 		t.Fatal("expected Invalidate to clear the verdict")
+	}
+}
+
+// TestExpiredServedLeafForcesReverify pins the second freshness bound: a
+// verdict is scoped to one serving leaf, so it stops being reusable when that
+// certificate expires even if the re-attest interval has not elapsed. The
+// interval is caller-settable with no ceiling (StartOptions.ReattestInterval),
+// while c8s caps a stamped leaf at 6h, so without this bound a generous
+// interval would keep both the verdict and the handshake pin derived from it
+// alive past the certificate's own lifetime.
+func TestExpiredServedLeafForcesReverify(t *testing.T) {
+	now := time.Unix(1000, 0)
+	c := NewSessionCache(time.Hour)
+	c.now = func() time.Time { return now }
+
+	leaf := [32]byte{7}
+	c.RecordSession("host", true, leaf, now.Add(10*time.Second), nil)
+	if _, fresh, ok := c.FreshSession("host"); !fresh || !ok {
+		t.Fatal("verdict should be fresh inside both the TTL and the leaf validity")
+	}
+
+	// Past the leaf's NotAfter but well inside the one-hour TTL.
+	now = now.Add(11 * time.Second)
+	if _, fresh, _ := c.FreshSession("host"); fresh {
+		t.Fatal("a verdict must not outlive the serving leaf it is scoped to")
+	}
+
+	// The TTL still binds independently: a long-lived leaf does not extend it.
+	now = time.Unix(2000, 0)
+	c.RecordSession("host", true, leaf, now.Add(24*time.Hour), nil)
+	now = now.Add(time.Hour + time.Second)
+	if _, fresh, _ := c.FreshSession("host"); fresh {
+		t.Fatal("a long-lived leaf must not extend the re-attest interval")
 	}
 }
 

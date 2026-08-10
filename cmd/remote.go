@@ -101,8 +101,46 @@ func validateImageManifestFlag(path string) (string, error) {
 	return abs, nil
 }
 
+// validatePinModes rejects a platform pin stored on a remote that can never
+// enforce it. Only attest-lb verifies hardware evidence, so on any other mode
+// these three are inert: the remote reads as configured, and the gap only
+// surfaces much later — if ever — as traffic that was never measured.
+func validatePinModes(mode config.AttestMode, imageManifest, expectedRTMR3, minTCB string) error {
+	if mode == config.AttestEndpoint {
+		return nil
+	}
+	for _, pin := range []struct{ flag, value string }{
+		{"--image-manifest", imageManifest},
+		{"--expected-rtmr3", expectedRTMR3},
+		{"--min-tcb", minTCB},
+	} {
+		if pin.value != "" {
+			return fmt.Errorf("%s requires --mode attest-lb: nothing verifies hardware measurements in mode %q, so the pin would be stored but never enforced", pin.flag, mode)
+		}
+	}
+	return nil
+}
+
+// validateRTMR3Flag validates the --expected-rtmr3 pin and returns the value to
+// store. Surrounding whitespace is trimmed here, at the flag boundary only: a
+// register pin is copy-pasted out of terminal output, so a trailing newline is
+// a typing artefact rather than a different value. The manifest parser stays
+// strict — there the exact file bytes are the reference.
+func validateRTMR3Flag(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", nil
+	}
+	if _, err := verifier.ParseRegisterHex(s); err != nil {
+		return "", fmt.Errorf("--expected-rtmr3 %w", err)
+	}
+	return s, nil
+}
+
 // parseMinTCBFlag parses --min-tcb's four comma-separated components
-// (bootloader,tee,snp,microcode), each 0-255. Empty means no floor.
+// (bootloader,tee,snp,microcode), each 0-255. Empty means no floor, and so does
+// an all-zero floor: every component is >= 0, so it gates nothing, while a
+// stored floor would reject all TDX evidence as a cross-platform pin.
 func parseMinTCBFlag(s string) (*config.TCBFloor, error) {
 	if s == "" {
 		return nil, nil
@@ -119,7 +157,11 @@ func parseMinTCBFlag(s string) (*config.TCBFloor, error) {
 		}
 		vals[i] = uint8(n)
 	}
-	return &config.TCBFloor{Bootloader: vals[0], TEE: vals[1], SNP: vals[2], Microcode: vals[3]}, nil
+	floor := config.TCBFloor{Bootloader: vals[0], TEE: vals[1], SNP: vals[2], Microcode: vals[3]}
+	if floor == (config.TCBFloor{}) {
+		return nil, nil
+	}
+	return &floor, nil
 }
 
 func newRemoteAddCmd(name string) *cobra.Command {
@@ -151,6 +193,16 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
 			}
 
+			if err := validatePinModes(attestMode, imageManifest, expectedRTMR3, minTCB); err != nil {
+				return err
+			}
+			// How the measurement pins relate to each other is one rule set,
+			// shared with the verifier so a config the CLI refuses to write is
+			// also a config the daemon refuses to run.
+			if err := verifier.ValidatePinCombination(measurements, imageManifest, expectedRTMR3); err != nil {
+				return err
+			}
+
 			allowlistStored, err := validateWorkloadFlags(workload, allowlistPath)
 			if err != nil {
 				return err
@@ -159,10 +211,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if expectedRTMR3 != "" {
-				if _, err := verifier.ParseRegisterHex(expectedRTMR3); err != nil {
-					return fmt.Errorf("--expected-rtmr3 %w", err)
-				}
+			rtmr3Stored, err := validateRTMR3Flag(expectedRTMR3)
+			if err != nil {
+				return err
 			}
 			tcbFloor, err := parseMinTCBFlag(minTCB)
 			if err != nil {
@@ -192,7 +243,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				WorkloadName:      workload,
 				AllowlistPath:     allowlistStored,
 				ImageManifestPath: manifestStored,
-				ExpectedRTMR3:     expectedRTMR3,
+				ExpectedRTMR3:     rtmr3Stored,
 				MinTCB:            tcbFloor,
 			}
 			if err := cfg.AddRemote(r); err != nil {
@@ -213,13 +264,13 @@ func newRemoteAddCmd(name string) *cobra.Command {
 
 	f := cmd.Flags()
 	f.StringVar(&mode, "mode", "", "attestation mode: attest-lb (per-handshake attestation binding the exact serving leaf, over ordinary TLS), cds-cert (CDS-cert pinning, not yet implemented), or empty to disable")
-	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated; required for attest-lb (an empty measurement policy is a configuration error)")
+	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated; required for attest-lb unless --image-manifest is given (an empty measurement policy is a configuration error, and the two flags are mutually exclusive)")
 	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest-lb always uses the remote's origin)")
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
 	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb)")
 	f.StringVar(&allowlistPath, "allowlist", "", "path to a pinned canonical-allowlist JSON file; hashed exactly as read against the stamp's digest, and the stamped name must resolve in it (attest-lb)")
-	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (JSON object with mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, published with the image build); its MRTD joins the --measurements allowlist and RTMR[1]/RTMR[2] are pinned exactly, so the guest kernel and rootfs are verified rather than only the firmware. TDX evidence only — with SNP evidence this is a policy error")
-	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 lowercase hex chars — pins the runtime measurement register, i.e. the ordered operator-key/workload-event chain extended after boot. This is a deployment property, NOT a cluster identity, and cannot replace an image pin. TDX evidence only — with SNP evidence this is a policy error")
+	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (JSON object with mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, published with the image build); all three registers are pinned exactly against this one manifest, so the guest kernel and rootfs are verified rather than only the firmware. Replaces --measurements rather than adding to it. TDX evidence only — with SNP evidence this is a policy error")
+	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 lowercase hex chars — pins the runtime measurement register, i.e. the ordered operator-key/workload-event chain extended after boot. This is a deployment property, NOT a cluster identity, and cannot replace an image pin, so it requires --image-manifest. TDX evidence only — with SNP evidence this is a policy error")
 	f.StringVar(&minTCB, "min-tcb", "", "minimum SNP TCB floor as four comma-separated components <bootloader,tee,snp,microcode> (each 0-255), enforced component-wise on the verified evidence. SNP evidence only — with TDX evidence this is a policy error")
 	return cmd
 }

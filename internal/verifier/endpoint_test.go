@@ -20,9 +20,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,8 +40,12 @@ var transcriptVectors []byte
 
 // TestAttestLBTranscriptGoldenVectors pins the report_data construction to the
 // golden vectors in testdata — a verbatim copy of c8s
-// pkg/overenc/testdata/attest_lb_transcript_vectors.json, shared across the
-// Go, JS, and TEErminator implementations so the three cannot drift.
+// pkg/overenc/testdata/attest_lb_transcript_vectors.json, so this client and
+// the c8s server cannot drift on the transcript. The browser client is NOT a
+// third party to these: c8s-verify-js implements no attest-lb flow (its
+// PROTOCOL.md scopes the endpoint to native clients and src/verify.ts rejects
+// the binding identifier), so only the matched-workload golden DER is shared
+// three ways.
 func TestAttestLBTranscriptGoldenVectors(t *testing.T) {
 	var vectors []struct {
 		Description       string `json:"description"`
@@ -89,8 +95,14 @@ func mintCert(t *testing.T, tmpl *x509.Certificate, parent *certAndKey, curve el
 	}
 	fixtureSerial++
 	tmpl.SerialNumber = big.NewInt(fixtureSerial)
-	tmpl.NotBefore = time.Now().Add(-time.Hour)
-	tmpl.NotAfter = time.Now().Add(time.Hour)
+	// A caller that presets the window keeps it (the validity tests do); every
+	// other fixture gets the default comfortably-valid one.
+	if tmpl.NotBefore.IsZero() {
+		tmpl.NotBefore = time.Now().Add(-time.Hour)
+	}
+	if tmpl.NotAfter.IsZero() {
+		tmpl.NotAfter = time.Now().Add(time.Hour)
+	}
 	signerCert, signerKey := tmpl, key
 	if parent != nil {
 		signerCert, signerKey = parent.cert, parent.key
@@ -212,6 +224,7 @@ type bundleSpec struct {
 	signKey    *ecdsa.PrivateKey
 	breakSig   bool
 	evidence   func(reportData []byte) json.RawMessage // default: stub shape {"report_data": ...}
+	observe    func(*http.Request)                     // called with the request as received
 }
 
 // newServer serves the attest-lb bundle over TLS with the fixture's serving
@@ -220,6 +233,9 @@ type bundleSpec struct {
 func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 	t.Helper()
 	handler := func(w http.ResponseWriter, r *http.Request) {
+		if spec.observe != nil {
+			spec.observe(r)
+		}
 		nonceB64 := r.URL.Query().Get("nonce")
 		nonce, err := base64.RawURLEncoding.DecodeString(nonceB64)
 		if err != nil {
@@ -306,7 +322,7 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 }
 
 // stubClaims parameterizes the evidence stub's verified result; the zero value
-// yields launch digest "m1" with no platform-specific claims. The result's
+// yields launch digest "a1" with no platform-specific claims. The result's
 // Platform always echoes the bundle's tag, as the real verifier does.
 type stubClaims struct {
 	launchDigest string
@@ -331,7 +347,7 @@ func stubEvidence(t *testing.T) {
 func stubEvidenceClaims(t *testing.T, sc stubClaims) *stubCalls {
 	t.Helper()
 	if sc.launchDigest == "" {
-		sc.launchDigest = "m1"
+		sc.launchDigest = "a1"
 	}
 	calls := &stubCalls{}
 	orig := verifyEvidence
@@ -379,10 +395,67 @@ func newLBAttester(t *testing.T, ts *httptest.Server, remote config.Remote, pinn
 	return ea
 }
 
-// measuredRemote is the minimal valid attest-lb policy; uppercase digests
-// exercise the case-insensitive membership check against the stub's "m1".
+// measuredRemote is the minimal valid attest-lb policy; the uppercase digest
+// exercises the case-insensitive membership check against the stub's "a1".
 func measuredRemote() config.Remote {
-	return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"M1"}}
+	return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"A1"}}
+}
+
+// TestAttestLBRequestShape pins what goes ON THE WIRE, which the rest of these
+// tests take for granted because the fixture server is lenient and the real one
+// is not. c8s answers the attest-lb endpoint from a handler that rejects, with
+// 400, any request carrying a `pq` or `binding` query key — on PRESENCE, not
+// value, so that a client which thinks it still selects a binding is told so
+// rather than served the wrong one — and any nonce that is not exactly 32
+// bytes, the length both transcripts frame. The retired /attestation endpoint
+// answers 410. A client that drifted on any of those three would fail against
+// every deployed LB, so they are asserted here rather than left to the fixture.
+//
+// The base URL deliberately carries a forwarding path and a query of its own:
+// the attestation fetch is anchored at the LB ORIGIN, independent of whatever
+// the remote forwards to, and neither may leak into the request.
+func TestAttestLBRequestShape(t *testing.T) {
+	stubEvidence(t)
+	f := newLBFixture(t, fixtureOpts{})
+	var got *url.URL
+	ts := f.newServer(t, bundleSpec{observe: func(r *http.Request) {
+		u := *r.URL
+		got = &u
+	}})
+
+	client := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
+	ea, err := NewEndpointAttester(ts.URL+"/api/v1?pq=false&binding=c8s-verify/v1", client, measuredRemote(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ea.Attest(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("the endpoint was never called")
+	}
+
+	if got.Path != wellKnownAttestLB {
+		t.Errorf("path = %q, want %q", got.Path, wellKnownAttestLB)
+	}
+	q := got.Query()
+	if len(q) != 1 {
+		t.Errorf("query = %v, want nonce alone: c8s refuses any extra parameter", q)
+	}
+	for _, retired := range []string{"pq", "binding"} {
+		if _, ok := q[retired]; ok {
+			t.Errorf("request carries the retired %q selector: %v", retired, q)
+		}
+	}
+	nonce, err := base64.RawURLEncoding.DecodeString(q.Get("nonce"))
+	if err != nil {
+		t.Fatalf("nonce is not unpadded base64url: %v", err)
+	}
+	if len(nonce) != 32 {
+		t.Errorf("nonce is %d bytes, want the 32 both transcripts frame", len(nonce))
+	}
 }
 
 func TestAttestLBHappyPath(t *testing.T) {
@@ -396,7 +469,7 @@ func TestAttestLBHappyPath(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if v.Measurement != "m1" {
+		if v.Measurement != "a1" {
 			t.Errorf("Measurement = %q", v.Measurement)
 		}
 		if v.TrustMode != TrustDeploymentClass {
@@ -585,6 +658,41 @@ func TestAttestLBRejectsMeasurementNotInAllowlist(t *testing.T) {
 	}
 }
 
+// TestCheckMeasurementValidatesHex covers the launch digest as a VALUE rather
+// than as a string: an empty allowlist is already a configuration error, but
+// `--measurements ""` yields one empty entry, which is not empty as a list and
+// would string-match a platform whose LaunchDigest claim came back empty.
+func TestCheckMeasurementValidatesHex(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		measurement string
+		allowed     []string
+		wantErr     string
+	}{
+		{"match", "aabb", []string{"AABB"}, ""},
+		{"no match", "aabb", []string{"ccdd"}, "not in the allowlist"},
+		{"empty allowlist", "aabb", nil, "empty measurement policy"},
+		{"empty allowlist entry", "aabb", []string{""}, "not a non-empty hex launch digest"},
+		{"non-hex allowlist entry", "aabb", []string{"zz"}, "not a non-empty hex launch digest"},
+		{"empty claim against an empty entry", "", []string{""}, "not a non-empty hex launch digest"},
+		{"empty claim", "", []string{"aabb"}, "launch_digest is missing or malformed"},
+		{"non-hex claim", "not-a-digest", []string{"aabb"}, "launch_digest is missing or malformed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkMeasurement(tc.measurement, tc.allowed)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("checkMeasurement = %v, want it accepted", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("checkMeasurement = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // writeAllowlist writes raw to a temp file and returns its path.
 func writeAllowlist(t *testing.T, raw []byte) string {
 	t.Helper()
@@ -601,7 +709,7 @@ func TestAttestLBWorkloadPolicy(t *testing.T) {
 	attest := func(t *testing.T, f *lbFixture, remote config.Remote) (*SessionVerdict, error) {
 		t.Helper()
 		remote.Mode = config.AttestEndpoint
-		remote.Measurements = []string{"m1"}
+		remote.Measurements = []string{"a1"}
 		ts := f.newServer(t, bundleSpec{})
 		ea := newLBAttester(t, ts, remote, nil)
 		return ea.Attest(context.Background())
@@ -700,8 +808,8 @@ func TestAttestLBTDXImagePins(t *testing.T) {
 		stubEvidenceClaims(t, tdxStubClaims())
 		f := newLBFixture(t, fixtureOpts{})
 		ts := f.newServer(t, bundleSpec{platform: "tdx"})
-		// No --measurements: the manifest's MRTD joins the allowlist, so the
-		// tuple alone is a complete policy.
+		// No --measurements: the manifest is the whole launch-digest policy —
+		// MRTD is compared against it exactly, like RTMR[1]/[2].
 		remote := config.Remote{
 			Mode:              config.AttestEndpoint,
 			ImageManifestPath: pinManifest(t),
@@ -778,13 +886,87 @@ func TestAttestLBTDXImagePins(t *testing.T) {
 		}
 	})
 
+	// The MRTD is pinned EXACTLY against the manifest, not unioned into a
+	// launch-digest allowlist. A guest whose firmware differs from the manifest
+	// must fail even though its RTMR[1]/[2] match the manifest — that is the
+	// combination a union admits, and it is a different image.
+	t.Run("MRTD not matching the manifest fails", func(t *testing.T) {
+		sc := tdxStubClaims()
+		sc.launchDigest = strings.Repeat("9f", RegisterSize)
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{Mode: config.AttestEndpoint, ImageManifestPath: pinManifest(t)}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "MRTD mismatch") {
+			t.Fatalf("want an MRTD mismatch, got %v", err)
+		}
+	})
+
+	t.Run("malformed launch digest fails closed", func(t *testing.T) {
+		sc := tdxStubClaims()
+		sc.launchDigest = "not-a-digest"
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{Mode: config.AttestEndpoint, ImageManifestPath: pinManifest(t)}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "launch_digest is missing or malformed") {
+			t.Fatalf("want a malformed-launch-digest failure, got %v", err)
+		}
+	})
+
+	// An allowlist alongside a manifest can only name digests the manifest does
+	// not: refusing the pair is what stopped the MRTD from being negotiable.
+	t.Run("measurements alongside an image manifest is a config error", func(t *testing.T) {
+		stubEvidenceClaims(t, tdxStubClaims())
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{
+			Mode:              config.AttestEndpoint,
+			Measurements:      []string{strings.Repeat("9f", RegisterSize)},
+			ImageManifestPath: pinManifest(t),
+		}
+		ea := newLBAttester(t, ts, remote, nil)
+		_, err := ea.Attest(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("want a mutually-exclusive configuration error, got %v", err)
+		}
+	})
+
+	// RTMR[3] is extended by software inside a guest the untrusted host chose.
+	// Pinning it alone would put a matched register in RTMRsPinned — the field
+	// that says what this verdict proved — for a guest whose image nothing
+	// pinned. The operator's CA pin is deliberately supplied here: that is the
+	// case the completeness rule only warns about, so this must be refused by
+	// the pin rules themselves rather than by that warning.
+	t.Run("expected-rtmr3 without an image manifest is a config error", func(t *testing.T) {
+		stubEvidenceClaims(t, tdxStubClaims())
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{
+			Mode:          config.AttestEndpoint,
+			Measurements:  []string{mrtdHex},
+			ExpectedRTMR3: rtmr3Hex,
+		}
+		ea := newLBAttester(t, ts, remote, []*x509.Certificate{f.ca.cert})
+		v, err := ea.Attest(context.Background())
+		if err == nil {
+			t.Fatalf("a lone RTMR[3] pin verified: %+v", v)
+		}
+		if !strings.Contains(err.Error(), "--expected-rtmr3 requires --image-manifest") {
+			t.Fatalf("want the RTMR[3] image requirement, got %v", err)
+		}
+	})
+
 	t.Run("TDX pins against SNP evidence fail closed", func(t *testing.T) {
 		stubEvidence(t)
 		f := newLBFixture(t, fixtureOpts{})
 		ts := f.newServer(t, bundleSpec{platform: "snp"})
 		remote := config.Remote{
 			Mode:              config.AttestEndpoint,
-			Measurements:      []string{"m1"},
 			ImageManifestPath: pinManifest(t),
 		}
 		ea := newLBAttester(t, ts, remote, nil)
@@ -810,6 +992,41 @@ func TestAttestLBTDXImagePins(t *testing.T) {
 	})
 }
 
+// TestValidatePinCombination covers the two evidence-independent pin rules as
+// a unit, since both `remote add` and the stored config are gated by them: a
+// config the CLI refuses to write must also be one the daemon refuses to run.
+// c8s applies the same two to `c8s verify` (internal/cmds/verify, buildPolicy).
+func TestValidatePinCombination(t *testing.T) {
+	const manifest = "/tmp/manifest.json"
+	for _, tc := range []struct {
+		name                        string
+		measurements                []string
+		imageManifest, expectedRTMR string
+		wantErr                     string
+	}{
+		{"nothing pinned", nil, "", "", ""},
+		{"allowlist alone", []string{mrtdHex}, "", "", ""},
+		{"manifest alone", nil, manifest, "", ""},
+		{"manifest carries the rtmr3 pin", nil, manifest, rtmr3Hex, ""},
+		{"allowlist beside a manifest", []string{mrtdHex}, manifest, "", "mutually exclusive"},
+		{"rtmr3 without a manifest", nil, "", rtmr3Hex, "--expected-rtmr3 requires --image-manifest"},
+		{"rtmr3 with only an allowlist", []string{mrtdHex}, "", rtmr3Hex, "--expected-rtmr3 requires --image-manifest"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidatePinCombination(tc.measurements, tc.imageManifest, tc.expectedRTMR)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidatePinCombination = %v, want it accepted", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidatePinCombination = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func p8(v uint8) *uint8 { return &v }
 
 func snpStubTCB() teetypes.TcbInfo {
@@ -819,7 +1036,7 @@ func snpStubTCB() teetypes.TcbInfo {
 func TestAttestLBMinTCB(t *testing.T) {
 	floor := &config.TCBFloor{Bootloader: 3, TEE: 0, SNP: 8, Microcode: 209}
 	remote := func() config.Remote {
-		return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"m1"}, MinTCB: floor}
+		return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"a1"}, MinTCB: floor}
 	}
 
 	t.Run("floor reaches the verifier engine and passes on the claims", func(t *testing.T) {
@@ -914,6 +1131,30 @@ func TestAttestLBTDXCompleteness(t *testing.T) {
 		}
 	})
 
+	// The completeness rule keys on the image pin, so the pin must mean "this
+	// exact image booted" and nothing weaker. With a manifest, a guest whose
+	// MRTD is not the manifest's cannot produce a verdict at all — least of all
+	// one reported as a complete TDX policy with no warning, which is what a
+	// launch-digest allowlist unioned with the manifest's MRTD allowed.
+	t.Run("a manifest verdict is complete only for the manifest's own image", func(t *testing.T) {
+		sc := tdxStubClaims()
+		sc.launchDigest = strings.Repeat("9f", RegisterSize)
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx"})
+		remote := config.Remote{Mode: config.AttestEndpoint, ImageManifestPath: pinManifest(t)}
+		// Even with the operator's CA pinned — the case that only warns when
+		// no image is pinned at all — a foreign MRTD is a hard failure.
+		ea := newLBAttester(t, ts, remote, []*x509.Certificate{f.ca.cert})
+		v, err := ea.Attest(context.Background())
+		if err == nil {
+			t.Fatalf("a guest outside the pinned image verified: %+v", v)
+		}
+		if !strings.Contains(err.Error(), "MRTD mismatch") {
+			t.Fatalf("want an MRTD mismatch, got %v", err)
+		}
+	})
+
 	t.Run("SNP needs no image manifest", func(t *testing.T) {
 		stubEvidence(t)
 		f := newLBFixture(t, fixtureOpts{})
@@ -927,6 +1168,38 @@ func TestAttestLBTDXCompleteness(t *testing.T) {
 			t.Errorf("SNP verdict must not warn, got %q", v.Warning)
 		}
 	})
+}
+
+// TestCheckVerificationResult asserts the verifier's own verdict fields are
+// read rather than inferred from a nil error. Every attestation-go platform
+// path happens to return an error on a report-data mismatch today; that is an
+// implementation property, not an interface guarantee.
+func TestCheckVerificationResult(t *testing.T) {
+	yes, no := true, false
+	for _, tc := range []struct {
+		name    string
+		res     *teetypes.VerificationResult
+		wantErr string
+	}{
+		{"valid", &teetypes.VerificationResult{SignatureValid: true, ReportDataMatch: &yes}, ""},
+		{"nil result", nil, "no result"},
+		{"signature not valid", &teetypes.VerificationResult{ReportDataMatch: &yes}, "hardware signature"},
+		{"report data mismatch", &teetypes.VerificationResult{SignatureValid: true, ReportDataMatch: &no}, "report_data mismatch"},
+		{"report data unevaluated", &teetypes.VerificationResult{SignatureValid: true}, "report_data mismatch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkVerificationResult(tc.res, "snp")
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("checkVerificationResult = %v, want it accepted", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("checkVerificationResult = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
 }
 
 // The following tests run the REAL evidence verifier (attestation-go teeverify)
@@ -982,6 +1255,36 @@ func TestAttestLBRejectsRecordedEvidence(t *testing.T) {
 	}
 }
 
+// TestAttestLBDoesNotFollowRedirects pins "the leaf the attester observes is
+// the leaf traffic rides". The fetch runs over a transport with no PKI
+// verification, so an on-path attacker can terminate it with any certificate;
+// following a redirect to the genuine LB would have the client attest — and
+// pin — a host it was never configured to reach.
+func TestAttestLBDoesNotFollowRedirects(t *testing.T) {
+	stubEvidence(t)
+	f := newLBFixture(t, fixtureOpts{})
+	honest := f.newServer(t, bundleSpec{})
+
+	var honestHits atomic.Int32
+	redirector := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		honestHits.Add(1)
+		http.Redirect(w, r, honest.URL+r.URL.Path+"?"+r.URL.RawQuery, http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	ea, err := NewEndpointAttester(redirector.URL, client, measuredRemote(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ea.Attest(context.Background()); err == nil || !strings.Contains(err.Error(), "302") {
+		t.Fatalf("want the redirect surfaced as a non-200 response, got %v", err)
+	}
+	if got := honestHits.Load(); got != 1 {
+		t.Fatalf("redirector saw %d requests, want exactly 1 (no follow)", got)
+	}
+}
+
 func TestAttestLBNon200(t *testing.T) {
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusBadGateway)
@@ -1003,7 +1306,7 @@ func TestSessionCachePinning(t *testing.T) {
 		t.Fatal("empty cache should not be fresh")
 	}
 	want := [32]byte{1, 2, 3}
-	c.RecordSession("r", true, want, nil)
+	c.RecordSession("r", true, want, time.Now().Add(time.Hour), nil)
 	leaf, fresh, ok := c.FreshSession("r")
 	if !fresh || !ok || leaf != want {
 		t.Fatalf("FreshSession = (%x, %v, %v), want (%x, true, true)", leaf, fresh, ok, want)

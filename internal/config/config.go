@@ -87,15 +87,17 @@ type Remote struct {
 	// key of its workloads map.
 	AllowlistPath string `json:"allowlist_path,omitempty"`
 	// ImageManifestPath points at a TDX image-pin manifest (JSON object with
-	// mrtd, rtmr1, rtmr2, each 96 lowercase hex chars). Its MRTD joins the
-	// Measurements allowlist and RTMR[1]/RTMR[2] are pinned exactly against the
-	// verified claims. TDX evidence only — with SNP evidence this pin is a
-	// policy error, never silently ignored.
+	// mrtd, rtmr1, rtmr2, each 96 lowercase hex chars). All three registers are
+	// compared byte-exactly against the verified claims — the launch digest
+	// against MRTD included — so the manifest replaces Measurements rather than
+	// adding to it; setting both is a configuration error. TDX evidence only —
+	// with SNP evidence this pin is a policy error, never silently ignored.
 	ImageManifestPath string `json:"image_manifest_path,omitempty"`
 	// ExpectedRTMR3 pins TDX RTMR[3] — the runtime operator-key/workload event
 	// chain extended after boot — as 96 lowercase hex chars. A deployment
-	// property, not a cluster identity; it cannot replace an image pin. TDX
-	// evidence only.
+	// property, not a cluster identity: the host chooses which guest extends
+	// the register, so this pin requires ImageManifestPath alongside it and is
+	// a configuration error without one. TDX evidence only.
 	ExpectedRTMR3 string `json:"expected_rtmr3,omitempty"`
 	// MinTCB is the SNP TCB floor enforced on verified evidence. SNP evidence
 	// only — with TDX evidence this pin is a policy error.
