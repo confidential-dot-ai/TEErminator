@@ -7,21 +7,21 @@ TEErminator is a little daemon meant to allow anyone to connect to remote TEE AP
 
 In particular it is meant to support the Confidential.ai stack and its confidential Kubernetes, C8s, which uses a certificate-backed attestation flow that abstracts away attestation verification from the end processes.
 
-`status` checks every remote live, over the same upstream TLS trust the proxy
-forwards over: `--mode attest` remotes run the full session attestation,
+`status` checks every remote live, with the same trust construction the proxy
+forwards over: `--mode attest-lb` remotes run the full attest-lb verification,
 unattested remotes are probed for reachability, and modes the proxy cannot
-enforce yet report `Failed`. Details (the verified measurement, or the failure
-reason) are printed below the table, and results are persisted so `remote ls`
-shows the last checked status.
+enforce yet report `Failed`. Details (the verified measurement, workload name,
+and trust mode, or the failure reason) are printed below the table, and results
+are persisted so `remote ls` shows the last checked status.
 
 ```
 $ ./teerminator status
-Local            Remote                                                 Auth   Mode    Status
-127.0.0.1:8080   https://api.openai.com/v1/                             Token  None    Untrusted
-127.0.0.1:14323  https://confidential-vllm-production-stack.lunal.dev/  None   attest  Verified
-[::1]:8080       https://api.ollama.provider.com/v1/                    Token  None    Failed
+Local            Remote                                                 Auth   Mode       Status
+127.0.0.1:8080   https://api.openai.com/v1/                             Token  None       Untrusted
+127.0.0.1:14323  https://confidential-vllm-production-stack.lunal.dev/  None   attest-lb  Verified
+[::1]:8080       https://api.ollama.provider.com/v1/                    Token  None       Failed
 
-127.0.0.1:14323: measurement 6d86eef8bfaea0f34a2a8dda5b8b0a97c9174a01d0a3546b930b16fceccb6d9e1e0d1cbc35e4a839e00e2b71c50ee2e2
+127.0.0.1:14323: measurement 6d86eef8bfaea0f34a2a8dda5b8b0a97c9174a01d0a3546b930b16fceccb6d9e1e0d1cbc35e4a839e00e2b71c50ee2e2, workload api, trust deployment-class (ca-vouched)
 ```
 
 Adding new remote TEE APIs:
@@ -36,14 +36,13 @@ Remotes are deleted with `remote rm`, by local address or by the index printed b
 $ ./teerminator remote rm <local-addr|index>
 ```
 
-For certificate-backed attestations, you might have to trust custom certificate authorities, especially when testing using localhost certs that might having been created using mkcert. Certificates added with `certs add` are appended to the system trust store and used as **upstream** TLS trust anchors for every remote, so a backend served by a private CA (e.g. a c8s mesh CA) verifies.
+For non-attested remotes served by a private CA (e.g. when testing with mkcert certificates), certificates added with `certs add` are appended to the system trust store and used as **upstream** TLS trust anchors. For `--mode attest-lb` remotes they play a different role: the mesh CA is derived from the hardware-committed attestation, so no CA file is needed to connect — a `certs add mesh-ca.pem` is an optional pin that upgrades the verdict from deployment-class to specific-cluster (see below).
 
 When the upstream's certificate does not match the host you dial — for example a LoadBalancer reached by **raw IP** whose cert only carries an internal DNS SAN like `c8s-tls-lb.c8s-system.svc` — pass `--server-name` on `remote add` to validate the certificate against that name (like `curl --resolve <name>:<port>:<ip>`); the connection still dials the URL host:
 
 ```
-$ ./teerminator certs add ./mesh-ca.pem
 $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
-    --mode attest --server-name c8s-tls-lb.c8s-system.svc --measurements <hex,...>
+    --mode attest-lb --server-name c8s-tls-lb.c8s-system.svc --measurements <hex,...>
 ```
 
 When the remote URL host is a raw IP and `--server-name` is omitted, it defaults to `c8s-tls-lb.c8s-system.svc` (the standard c8s LB SAN) and `remote add` prints a note saying so. Pass `--server-name` explicitly — e.g. the IP itself, for a certificate that does carry an IP SAN — to override the default.
@@ -52,28 +51,57 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
 
 `--mode` selects how each remote is verified:
 
-- **`attest`** — the same challenge/response attestation the `c8s-verify-js`
-  browser client performs, against the LB's `/.well-known/c8s/attestation` endpoint, but
-  riding the validated upstream TLS instead of the post-quantum tunnel. At session start
-  TEErminator fetches a fresh, nonce-bound bundle (requesting the LB's **tls-cert binding**,
-  `pq=false`), verifies the SEV-SNP evidence and that `report_data == SHA-384(serving_leaf_spki || nonce)`,
-  checks the measurement allowlist, then **pins the verdict to that attested TLS leaf** —
-  forwarded requests must ride a connection presenting the same leaf, otherwise the session
-  re-attests (fail closed). This is a *TLS-session-scoped* TEE binding: the hardware report
-  commits to the very certificate the traffic flows over. Requires a cluster whose `tls-lb`
-  serves the tls-cert binding (`cds-attest --serving-cert-file`). Evidence verification is
-  delegated entirely to the shared [`attestation-go`](https://github.com/confidential-dot-ai/attestation-go)
-  verifier (`teeverify`), so every platform it supports works here: bare-metal/GCP SNP
-  (binding in `report_data`), Azure az-snp (binding in the AK-signed vTPM quote), and the
-  TDX variants.
+- **`attest-lb`** — the ordinary-TLS native-client protocol against the LB's
+  `/.well-known/c8s/attest-lb` endpoint (the legacy `attest` spelling and the retired
+  `?pq=false` query selector are gone; old configs are normalized automatically).
+  After each new upstream TLS handshake, and before any application bytes flow,
+  TEErminator fetches a fresh nonce-bound bundle and verifies, in order: the
+  `c8s/attest-lb/v1` binding identifier and nonce echo; the hardware evidence over
+  `report_data = SHA-384(LP(version) || LP(nonce) || LP(SHA-256(serving_leaf_DER)) ||
+  LP(SHA-256(mesh_leaf_DER)) || LP(SHA-256(mesh_CA_DER)))`, recomputed from the **exact
+  serving certificate observed on that very connection**; the mesh-leaf key's proof of
+  possession over the same transcript; and that both the committed mesh leaf and the
+  serving leaf chain to the committed mesh CA. The verdict is then **pinned to the exact
+  serving-leaf DER** (not just its key): a substituted certificate — even one reusing the
+  attested key — refuses the handshake and forces re-attestation.
+
+  Key properties:
+  - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is
+    committed inside the hardware evidence and derived from the response, yielding a
+    *deployment-class* verdict ("an expected measured c8s front door under the policy I
+    pinned"). Because of that, upstream TLS trust for this mode is deferred entirely to
+    the attestation (the WebPKI check is replaced by a strictly stronger hardware
+    binding); `certs add` roots are not required to connect.
+  - **Pinned CA = specific-cluster.** Adding the cluster's mesh CA with `certs add`
+    upgrades the verdict to *specific-cluster* when the committed CA byte-equals the pin
+    ("that particular cluster, not a genuine clone").
+  - **Measurements are mandatory.** An empty `--measurements` allowlist is a
+    configuration error in this mode, never a permissive default.
+  - **Workload pin.** `--workload <name>` requires the committed mesh leaf to carry a
+    matched-workload stamp (OID `1.3.6.1.4.1.66378.1.5`) naming `<name>`;
+    `--allowlist <file>` additionally requires the stamp's digest to equal the SHA-256 of
+    the exact file bytes and the stamped name to resolve in the document. The stamp is
+    CA-vouched (`ca-vouched` profile in the verdict) — the mesh CA signature, not the
+    hardware evidence, vouches for it.
+  - **Requires `public_tls.mode=cds`.** The serving key must be TEE-held and mesh-chained;
+    a WebPKI front door refuses the endpoint with `400 unsupported_front_door` and can
+    only be used through the encrypted-tunnel `attest-pq` protocol (browser client).
+
+  Evidence verification is delegated entirely to the shared
+  [`attestation-go`](https://github.com/confidential-dot-ai/attestation-go) verifier
+  (`teeverify`), so every platform it supports works here: bare-metal/GCP SNP (binding in
+  `report_data`), Azure az-snp (binding in the AK-signed vTPM quote), and the TDX variants.
 - **`cds-cert`** — planned CDS-cert pinning; configuring it today fails
   closed (requests are blocked before reaching the backend).
 
 ```
-# Endpoint attestation against an Azure node-as-CVM LB:
-$ ./teerminator certs add ./mesh-ca.pem
+# attest-lb against a mesh-chained (public_tls.mode=cds) front door, deployment-class:
 $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
-    --mode attest --server-name c8s-tls-lb.c8s-system.svc --measurements <hex,...>
+    --mode attest-lb --server-name c8s-tls-lb.c8s-system.svc \
+    --measurements <hex,...> --workload api --allowlist ./allowlist.json
+
+# Optional hardening: pin the mesh CA to upgrade the verdict to specific-cluster.
+$ ./teerminator certs add ./mesh-ca.pem
 ```
 ```
 $ ./teerminator certs add <CA PEM File>

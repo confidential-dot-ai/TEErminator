@@ -31,9 +31,14 @@ type AttestMode string
 const (
 	// AttestNone disables attestation verification (current default behaviour).
 	AttestNone AttestMode = ""
-	// AttestEndpoint fetches a fresh attestation from a dedicated endpoint at
-	// session start and pins the session to the attested TLS leaf.
-	AttestEndpoint AttestMode = "attest"
+	// AttestEndpoint fetches a fresh attest-lb attestation per TLS handshake
+	// and pins the session to the exact attested serving leaf. The value was
+	// renamed from the legacy "attest" (the retired pq=false query selector);
+	// legacy configs are normalized at load time.
+	AttestEndpoint AttestMode = "attest-lb"
+	// legacyAttestEndpoint is the pre-attest-lb spelling, still accepted on
+	// input and normalized to AttestEndpoint.
+	legacyAttestEndpoint AttestMode = "attest"
 	// AttestCDSCert fetches and pins the CDS cert before trusting the
 	// connection.
 	AttestCDSCert AttestMode = "cds-cert"
@@ -64,16 +69,28 @@ type Remote struct {
 	// trust anchor so the chain also verifies.
 	ServerName   string   `json:"server_name,omitempty"`
 	Measurements []string `json:"measurements,omitempty"` // accepted hex launch digests
-	Pin          *CertPin `json:"pin,omitempty"`
+	// WorkloadName pins the matched-workload stamp (OID …66378.1.5) the
+	// committed mesh leaf must carry in attest-lb mode.
+	WorkloadName string `json:"workload_name,omitempty"`
+	// AllowlistPath points at a pinned canonical-allowlist JSON file. It is
+	// hashed exactly as read (SHA-256 over the raw file bytes, never
+	// reserialized) against the stamp's digest, and the stamped name must be a
+	// key of its workloads map.
+	AllowlistPath string   `json:"allowlist_path,omitempty"`
+	Pin           *CertPin `json:"pin,omitempty"`
 }
 
-// ValidAttestMode reports whether s is a recognised attestation mode.
-func ValidAttestMode(s string) bool {
+// ParseAttestMode parses an attestation-mode string, normalizing the legacy
+// "attest" spelling to AttestEndpoint ("attest-lb"). normalized reports that
+// the legacy spelling was used; ok reports whether s is recognised at all.
+func ParseAttestMode(s string) (mode AttestMode, normalized, ok bool) {
 	switch AttestMode(s) {
+	case legacyAttestEndpoint:
+		return AttestEndpoint, true, true
 	case AttestNone, AttestEndpoint, AttestCDSCert:
-		return true
+		return AttestMode(s), false, true
 	default:
-		return false
+		return "", false, false
 	}
 }
 
@@ -110,6 +127,13 @@ func Load() (*Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+	// Normalize the legacy "attest" mode spelling to "attest-lb" so configs
+	// written before the endpoint split keep working.
+	for i := range cfg.Remotes {
+		if cfg.Remotes[i].Mode == legacyAttestEndpoint {
+			cfg.Remotes[i].Mode = AttestEndpoint
+		}
 	}
 	return &cfg, nil
 }

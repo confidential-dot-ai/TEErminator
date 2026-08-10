@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -13,15 +14,14 @@ import (
 // CheckResult is the outcome of a live trust check for one remote.
 type CheckResult struct {
 	Status config.TrustStatus
-	// Detail explains the status: the verified measurement for StatusVerified,
-	// the failure reason for StatusFailed.
+	// Detail explains the status: measurement, workload, and trust mode for
+	// StatusVerified, the failure reason for StatusFailed.
 	Detail string
 }
 
 // CheckRemote actively determines the remote's trust status right now, using
-// the same upstream TLS trust (ServerName override + operator CAs) the proxy
-// forwards over:
-//   - AttestEndpoint: run the session-start attestation; Verified on
+// the same trust construction the proxy forwards over:
+//   - AttestEndpoint: run the full attest-lb verification; Verified on
 //     success, Failed otherwise.
 //   - AttestNone: probe the remote over its validated TLS; Untrusted when
 //     reachable (nothing attests the workload), Failed when not.
@@ -32,18 +32,27 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 	if err != nil {
 		return CheckResult{config.StatusFailed, fmt.Sprintf("invalid remote URL: %v", err)}
 	}
-	tlsCfg, err := upstreamTLSConfig(target, r, extraCAs)
-	if err != nil {
-		return CheckResult{config.StatusFailed, err.Error()}
-	}
-	tr := &http.Transport{TLSClientConfig: tlsCfg}
-	defer tr.CloseIdleConnections()
-	client := &http.Client{Transport: tr}
 	origin := target.Scheme + "://" + target.Host
 
 	switch r.Mode {
 	case config.AttestEndpoint:
-		ea, err := verifier.NewEndpointAttester(origin, client, r, tlsCfg.RootCAs)
+		pinnedCAs, err := parseExtraCAs(extraCAs)
+		if err != nil {
+			return CheckResult{config.StatusFailed, err.Error()}
+		}
+		// Same fail-closed trust replacement as the proxy (newH3Transport): the
+		// mesh-chained serving cert cannot pass WebPKI verification, so the
+		// TLS-layer PKI check is replaced by the attest-lb verification of this
+		// very connection, which binds the exact observed leaf into hardware
+		// evidence and chains it to the committed CA. No application bytes are
+		// sent on this probe.
+		tr := &http.Transport{TLSClientConfig: &tls.Config{
+			ServerName:         serverNameFor(target, r),
+			InsecureSkipVerify: true, // replaced by the attest-lb hardware binding
+		}}
+		defer tr.CloseIdleConnections()
+		client := &http.Client{Transport: tr}
+		ea, err := verifier.NewEndpointAttester(origin, client, r, pinnedCAs)
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
 		}
@@ -51,12 +60,21 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
 		}
-		detail := "measurement " + v.Measurement
-		if len(r.Measurements) == 0 {
-			detail += " (no --measurements allowlist: workload identity not pinned)"
+		workload := v.WorkloadName
+		if workload == "" {
+			workload = "unnamed"
 		}
+		detail := fmt.Sprintf("measurement %s, workload %s, trust %s (%s)",
+			v.Measurement, workload, v.TrustMode, v.Profile)
 		return CheckResult{config.StatusVerified, detail}
 	case config.AttestNone:
+		tlsCfg, err := upstreamTLSConfig(target, r, extraCAs)
+		if err != nil {
+			return CheckResult{config.StatusFailed, err.Error()}
+		}
+		tr := &http.Transport{TLSClientConfig: tlsCfg}
+		defer tr.CloseIdleConnections()
+		client := &http.Client{Transport: tr}
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, origin, nil)
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
@@ -72,4 +90,12 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		return CheckResult{config.StatusFailed,
 			fmt.Sprintf("attestation mode %q is not implemented: the proxy blocks all traffic for this remote", r.Mode)}
 	}
+}
+
+// serverNameFor mirrors upstreamTLSConfig's SNI choice without its trust pool.
+func serverNameFor(target *url.URL, r config.Remote) string {
+	if r.ServerName != "" {
+		return r.ServerName
+	}
+	return target.Hostname()
 }

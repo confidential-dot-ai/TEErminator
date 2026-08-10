@@ -21,12 +21,13 @@ func newStatusCmd() *cobra.Command {
 		Short: "Check the live trust status of all configured remotes",
 		Long: `Check the live trust status of all configured remotes.
 
-Each remote is verified right now, over the same upstream TLS trust the proxy
-uses: remotes with --mode attest run the full session attestation (Verified /
-Failed), remotes without an attestation mode are probed for reachability
-(Untrusted / Failed), and remotes whose mode the proxy cannot enforce yet are
-reported Failed. The results are persisted, so 'remote ls' shows the last
-checked status.`,
+Each remote is verified right now, with the same trust construction the proxy
+forwards over: remotes with --mode attest-lb run the full attest-lb
+verification (Verified / Failed, with the measurement, workload name, and
+trust mode printed below the table), remotes without an attestation mode are
+probed for reachability (Untrusted / Failed), and remotes whose mode the proxy
+cannot enforce yet are reported Failed. The results are persisted, so
+'remote ls' shows the last checked status.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load()
 			if err != nil {

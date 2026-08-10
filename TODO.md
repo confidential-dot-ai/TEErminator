@@ -16,15 +16,28 @@
       still dialing the URL host — so a backend reached by raw IP whose cert only
       carries an internal DNS SAN (e.g. a c8s LB serving `c8s-tls-lb.c8s-system.svc`)
       now connects instead of failing `x509: ... doesn't contain any IP SANs`.
-- [x] Support /attest remote endpoints: `remote add --mode attest`
-      performs the session-start challenge/response against the LB's
-      `/.well-known/c8s/attestation` endpoint (tls-cert binding, `pq=false`),
-      verifies `report_data == SHA-384(serving_leaf_spki || nonce)`, and pins
-      forwarded traffic to the attested TLS leaf (`internal/verifier/endpoint.go`,
-      `internal/proxy/proxy.go`). Evidence verification is fully delegated to
-      `attestation-go`'s `teeverify` dispatcher, so every platform it supports
-      (snp, az-snp, tdx, az-tdx, gcp-snp, gcp-tdx) is accepted; TEErminator only
-      computes the binding anchor and enforces the measurement allowlist.
+- [x] Migrate to the explicit `attest-lb` protocol: `remote add --mode attest-lb`
+      (legacy `attest` configs normalized) runs the per-handshake verification
+      against `/.well-known/c8s/attest-lb` — the old `/.well-known/c8s/attestation`
+      `pq=false` selector is gone server-side (`400 invalid_request`). The
+      evidence binds the fresh nonce and the exact serving-leaf DER observed on
+      the connection together with the committed mesh leaf and issuing mesh CA
+      (`report_data` LP transcript), the mesh-leaf key proves possession, both
+      leaves must chain to the hardware-committed (derived) CA, and forwarded
+      traffic is pinned to the exact attested leaf DER
+      (`internal/verifier/endpoint.go`, `internal/proxy/proxy.go`). Evidence
+      verification stays fully delegated to `attestation-go`'s `teeverify`.
+- [x] Workload identity pins: `remote add --workload <name> --allowlist <file>`
+      enforce the mesh leaf's matched-workload stamp (OID `…66378.1.5`, vendored
+      strict parser in `internal/verifier/workloadext.go` with cross-repo golden
+      vectors) and the pinned canonical-allowlist digest; verdicts report the
+      workload, trust mode (deployment-class vs specific-cluster via an optional
+      `certs add` mesh-CA pin), and the `ca-vouched` profile. An empty
+      `--measurements` policy is now a configuration error in attest-lb mode.
+- [ ] Superseded — do NOT merge: branches `feat/cds-rollup`,
+      `feat/cds-identity-cache`, and `fix/derive-allowlist-and-binding` were
+      built on the retired config-claims flow and are replaced by the attest-lb
+      protocol above (config-claims retired server-side).
 - [ ] Support `/cds-cert` pinning. Config model (`Mode`, `Measurements`,
       `DiscoveryURL`, `Pin`) is in place; configuring the mode blocks every
       request before it reaches the backend (fail closed) rather than forwarding
