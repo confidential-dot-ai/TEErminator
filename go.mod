@@ -3,7 +3,7 @@ module github.com/confidential-dot-ai/TEErminator
 go 1.25.0
 
 require (
-	github.com/confidential-dot-ai/attestation-go v0.4.0
+	github.com/confidential-dot-ai/attestation-go v0.4.1
 	github.com/quic-go/quic-go v0.60.0
 	github.com/spf13/cobra v1.10.2
 )
