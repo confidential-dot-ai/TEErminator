@@ -225,6 +225,10 @@ type bundleSpec struct {
 	breakSig   bool
 	evidence   func(reportData []byte) json.RawMessage // default: stub shape {"report_data": ...}
 	observe    func(*http.Request)                     // called with the request as received
+	// allowlist, when set, answers GET /allowlist on the same origin, as the
+	// front door does (the tls-lb proxies both routes). Unset leaves the route
+	// answering the attest-lb handler, i.e. not a served allowlist at all.
+	allowlist http.HandlerFunc
 }
 
 // newServer serves the attest-lb bundle over TLS with the fixture's serving
@@ -235,6 +239,10 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		if spec.observe != nil {
 			spec.observe(r)
+		}
+		if spec.allowlist != nil && r.URL.Path == allowlistRoute {
+			spec.allowlist(w, r)
+			return
 		}
 		nonceB64 := r.URL.Query().Get("nonce")
 		nonce, err := base64.RawURLEncoding.DecodeString(nonceB64)

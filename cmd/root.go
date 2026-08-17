@@ -24,8 +24,8 @@ verified through dedicated session-scoped attestation bound to the upstream TLS 
 // SetupCommands builds TEErminator's subcommands and registers them on root.
 //
 // It is the entry point for embedding TEErminator into another CLI: pass your
-// own (sub)command as root to mount `start`, `remote`, `certs` and `status`
-// under it. name is the invocation prefix used in help-text examples (e.g.
+// own (sub)command as root to mount `start`, `remote`, `certs`, `status` and
+// `allowlist` under it. name is the invocation prefix used in help-text examples (e.g.
 // "teerminator" for the standalone binary, or "mytool teerminator" when nested
 // under another CLI). opts configures the start command; the zero value is
 // valid.
@@ -34,6 +34,7 @@ func SetupCommands(root *cobra.Command, name string, opts StartOptions) {
 	root.AddCommand(newRemoteCmd(name))
 	root.AddCommand(newCertsCmd())
 	root.AddCommand(newStatusCmd())
+	root.AddCommand(newAllowlistCmd(name))
 }
 
 // Execute runs the standalone TEErminator binary.

@@ -85,7 +85,10 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
     `--allowlist <file>` additionally requires the stamp's digest to equal the SHA-256 of
     the exact file bytes and the stamped name to resolve in the document. The stamp is
     CA-vouched (`ca-vouched` profile in the verdict) — the mesh CA signature, not the
-    hardware evidence, vouches for it.
+    hardware evidence, vouches for it. `allowlist fetch` obtains that file from the
+    cluster itself (see below); the stamp's allowlist **version** counter, which `status`
+    prints for a workload-pinned remote, is a *claim* until you check the document behind
+    it that way.
   - **Platform-complete pinning.** The `--measurements` allowlist pins the launch
     digest, which means different things per platform. On **Intel TDX** the launch
     digest (MRTD) measures only the TDVF firmware — the guest kernel and rootfs live in
@@ -140,6 +143,52 @@ $ ./teerminator remote add 127.0.0.1:8082 https://<LB-IP>/ \
 # Optional hardening: pin the mesh CA to upgrade the verdict to specific-cluster.
 $ ./teerminator certs add ./mesh-ca.pem
 ```
+
+### Fetching the allowlist
+
+`--allowlist <file>` needs a file. `allowlist fetch` gets it from the cluster instead of
+having it couriered to you, and writes it only if the cluster's own attestation names it:
+
+```
+$ ./teerminator allowlist fetch 127.0.0.1:8080 -o ./allowlist.json --pin
+Wrote 412 bytes to /home/me/allowlist.json
+  workload api, allowlist version 7 (stamped), digest sha256:9f86d0…
+  attested measurement 6d86eef8…, trust deployment-class (ca-vouched)
+  This document is CA-vouched, not hardware-attested: the evidence binds the mesh leaf, the mesh CA vouches for the stamp in it, and the stamp names this digest.
+Pinned /home/me/allowlist.json as the allowlist for 127.0.0.1:8080: every attest-lb handshake now requires the stamp to name this file's exact bytes.
+```
+
+The remote is attested exactly as `status` attests it (`--mode attest-lb` only, since no
+other mode yields a stamp), the matched-workload stamp is read off the chain-verified mesh
+leaf, `GET /allowlist` is fetched over a connection pinned to the attested serving leaf,
+and the response is written only when SHA-256 over the bytes **as received** equals the
+digest the stamp names and the stamped workload resolves in the document. The bytes go to
+disk verbatim — the digest is over exactly them, so a JSON round trip that preserves the
+document's meaning still produces a file the stamp no longer matches. A document that
+fails the check is never written, not even partially, and the command exits non-zero.
+
+**What this proves.** The hardware evidence binds the mesh leaf into the attest-lb
+transcript; the mesh CA's signature over that leaf vouches for the matched-workload stamp
+inside it; the stamp names the allowlist digest. The fetched document is therefore
+**CA-vouched** — the snapshot the attested front door's workload match was decided under —
+not hardware-committed, and not proof of what the cluster enforces right now. It is weaker
+than an allowlist digest carried in hardware-committed config claims would be.
+
+**A digest mismatch is ordinary.** The stamp names the snapshot the match was decided
+under, so an allowlist edited between the leaf's issuance and your fetch legitimately
+hashes differently. The command re-attests once by itself, because a freshly issued leaf
+names the current snapshot; if it still mismatches, both digests are printed along with
+the two version counters — the one on the stamp and the one the response's weak ETag
+carries. Those counters only pick the wording: a *newer* served version reads as the
+cluster moving on, while the *same* version claimed for different bytes cannot be churn
+and is called out as such. The ETag is transport metadata outside the digest, so it never
+decides the outcome.
+
+An existing output file is never overwritten without `--force`, and when that file is the
+remote's current `--allowlist` pin the refusal says so — replacing it changes the document
+every later handshake is checked against. `--pin` stores the freshly written file as that
+pin, which is the bootstrap this command exists for.
+
 ```
 $ ./teerminator certs add <CA PEM File>
 $ ./teerminator certs

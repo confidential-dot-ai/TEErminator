@@ -93,7 +93,8 @@ type SessionVerdict struct {
 	// UNVERIFIED against any served allowlist: `--allowlist` checks the stamped
 	// digest against the pinned file's bytes, and a canonical-allowlist
 	// document carries no version field to compare this counter with. Report it
-	// as what the deployment claims, never as a checked fact.
+	// as what the deployment claims, never as a checked fact — the document
+	// behind the counter is what `allowlist fetch` checks.
 	AllowlistVersion string
 	// TrustMode is TrustDeploymentClass or TrustSpecificCluster.
 	TrustMode string
@@ -114,6 +115,15 @@ type SessionVerdict struct {
 	// TCBFloor names the SNP TCB floor this verdict enforced (empty when no
 	// --min-tcb pin is set).
 	TCBFloor string
+	// Stamp is the matched-workload stamp carried by the chain-verified mesh
+	// leaf, or nil when the leaf carries none. It is read on every attestation
+	// and ENFORCED only when the remote pins a workload name or an allowlist
+	// file, so a caller that needs the allowlist snapshot the match was decided
+	// under (`allowlist fetch`) reads it off this verdict rather than running a
+	// second handshake. It is CA-vouched, not hardware-attested: the hardware
+	// evidence binds the mesh leaf into the transcript, and the mesh CA's
+	// signature over that leaf is what vouches for the stamp inside it.
+	Stamp *MatchedWorkload
 	// Warning is a policy gap in an otherwise passing verdict — currently the
 	// MRTD-only note for specific-cluster TDX remotes without an image pin.
 	Warning string
@@ -328,10 +338,18 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 		return nil, fmt.Errorf("attest-lb: %w", err)
 	}
 
-	// (j) Workload policy, only when pinned, only after everything above.
+	// (j) Matched-workload stamp, only after everything above: the mesh leaf's
+	// chain to the committed CA is what vouches for it. It is READ on every
+	// attestation — a present-but-damaged stamp is an error even unpinned, a
+	// verifier must not read damage as absence — and ENFORCED only when the
+	// remote pins a workload name or an allowlist file.
+	stamp, err := matchedWorkloadFromCert(meshLeaf)
+	if err != nil {
+		return nil, fmt.Errorf("attest-lb: workload policy: %w", err)
+	}
+	v.Stamp = stamp
 	if e.remote.WorkloadName != "" || e.remote.AllowlistPath != "" {
-		stamp, err := e.checkWorkloadPolicy(meshLeaf)
-		if err != nil {
+		if err := e.checkWorkloadPolicy(stamp); err != nil {
 			return nil, fmt.Errorf("attest-lb: %w", err)
 		}
 		v.WorkloadName = stamp.Name
@@ -697,41 +715,36 @@ func checkValidity(cert *x509.Certificate, now time.Time) error {
 	return nil
 }
 
-// checkWorkloadPolicy reads the .1.5 stamp off the committed (chain-verified)
-// mesh leaf and enforces the remote's workload pins, fail closed: with a pin
-// set, an absent, malformed, duplicated, mismatched, or unresolvable stamp is
-// an error.
-func (e *EndpointAttester) checkWorkloadPolicy(meshLeaf *x509.Certificate) (*MatchedWorkload, error) {
-	stamp, err := matchedWorkloadFromCert(meshLeaf)
-	if err != nil {
-		return nil, fmt.Errorf("workload policy: %w", err)
-	}
+// checkWorkloadPolicy enforces the remote's workload pins against the stamp
+// carried by the committed (chain-verified) mesh leaf, fail closed: with a pin
+// set, an absent, mismatched, or unresolvable stamp is an error. stamp is nil
+// when the leaf carries none (a malformed or duplicated one never reaches
+// here — matchedWorkloadFromCert already failed).
+func (e *EndpointAttester) checkWorkloadPolicy(stamp *MatchedWorkload) error {
 	if stamp == nil {
-		return nil, fmt.Errorf("workload policy: pin set but the mesh leaf carries no matched-workload stamp")
+		return fmt.Errorf("workload policy: pin set but the mesh leaf carries no matched-workload stamp")
 	}
 	if e.remote.WorkloadName != "" && stamp.Name != e.remote.WorkloadName {
-		return nil, fmt.Errorf("workload policy: mesh leaf is stamped for workload %q, pinned %q", stamp.Name, e.remote.WorkloadName)
+		return fmt.Errorf("workload policy: mesh leaf is stamped for workload %q, pinned %q", stamp.Name, e.remote.WorkloadName)
 	}
 	if e.remote.AllowlistPath != "" {
 		// Hash EXACTLY the file bytes as read — canonical bytes only, never a
-		// reserialization.
+		// reserialization. This is the same check `allowlist fetch` runs over
+		// the bytes the cluster serves, so both go through checkAllowlistBytes.
 		raw, err := os.ReadFile(e.remote.AllowlistPath)
 		if err != nil {
-			return nil, fmt.Errorf("workload policy: read pinned allowlist: %w", err)
+			return fmt.Errorf("workload policy: read pinned allowlist: %w", err)
 		}
-		digest := sha256.Sum256(raw)
-		if !bytes.Equal(digest[:], stamp.AllowlistDigest) {
-			return nil, fmt.Errorf("workload policy: stamped allowlist digest does not match the pinned allowlist file %s", e.remote.AllowlistPath)
-		}
-		doc, err := ParsePinnedAllowlist(raw)
-		if err != nil {
-			return nil, fmt.Errorf("workload policy: %w", err)
-		}
-		if _, ok := doc.Workloads[stamp.Name]; !ok {
-			return nil, fmt.Errorf("workload policy: stamped workload %q does not resolve in the pinned allowlist", stamp.Name)
+		if err := checkAllowlistBytes(raw, stamp); err != nil {
+			var mismatch *AllowlistDigestMismatch
+			if errors.As(err, &mismatch) {
+				return fmt.Errorf("workload policy: stamped allowlist digest does not match the pinned allowlist file %s (stamped %s, file %s)",
+					e.remote.AllowlistPath, mismatch.stampedHex(), mismatch.servedHex())
+			}
+			return fmt.Errorf("workload policy: %w", err)
 		}
 	}
-	return stamp, nil
+	return nil
 }
 
 // verifyEvidence is the evidence-verification seam: production points at
