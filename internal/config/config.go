@@ -1,11 +1,17 @@
 package config
 
 import (
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 type AuthType string
@@ -119,9 +125,39 @@ func ParseAttestMode(s string) (mode AttestMode, normalized, ok bool) {
 	}
 }
 
+// Cert is a stored trust anchor, keyed by Fingerprint rather than CommonName:
+// every c8s cluster's mesh CA carries the same subject (CN=c8s Mesh CA), so
+// the store must hold any number of certificates sharing a common name.
 type Cert struct {
-	CommonName string `json:"common_name"`
-	PEM        string `json:"pem"`
+	// Fingerprint is the lowercase hex SHA-256 of the certificate DER.
+	// Configs written before fingerprint keying lack it; Load fills it in
+	// from the PEM.
+	Fingerprint string `json:"fingerprint,omitempty"`
+	CommonName  string `json:"common_name"`
+	PEM         string `json:"pem"`
+}
+
+// CertFingerprint returns the lowercase hex SHA-256 of the DER of the first
+// certificate in pemData.
+func CertFingerprint(pemData []byte) (string, error) {
+	block, _ := pem.Decode(pemData)
+	if block == nil {
+		return "", errors.New("no PEM block found")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("parsing certificate: %w", err)
+	}
+	sum := sha256.Sum256(cert.Raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// ShortFingerprint abbreviates a fingerprint for display.
+func ShortFingerprint(fp string) string {
+	if len(fp) > 16 {
+		return fp[:16]
+	}
+	return fp
 }
 
 type Config struct {
@@ -129,7 +165,8 @@ type Config struct {
 	Certs   []Cert   `json:"certs,omitempty"`
 }
 
-func configPath() (string, error) {
+// Path returns the location of the config file.
+func Path() (string, error) {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
@@ -138,7 +175,7 @@ func configPath() (string, error) {
 }
 
 func Load() (*Config, error) {
-	path, err := configPath()
+	path, err := Path()
 	if err != nil {
 		return nil, err
 	}
@@ -160,11 +197,23 @@ func Load() (*Config, error) {
 			cfg.Remotes[i].Mode = AttestEndpoint
 		}
 	}
+	// Configs written before fingerprint keying store certs without one;
+	// compute it from the PEM so lookup and dedup work. An unparseable PEM
+	// keeps an empty fingerprint (and is flagged by `certs`) rather than
+	// making the whole config unloadable.
+	for i := range cfg.Certs {
+		if cfg.Certs[i].Fingerprint != "" {
+			continue
+		}
+		if fp, err := CertFingerprint([]byte(cfg.Certs[i].PEM)); err == nil {
+			cfg.Certs[i].Fingerprint = fp
+		}
+	}
 	return &cfg, nil
 }
 
 func (c *Config) Save() error {
-	path, err := configPath()
+	path, err := Path()
 	if err != nil {
 		return err
 	}
@@ -226,26 +275,54 @@ func (c *Config) RemoveRemote(local string) bool {
 	return false
 }
 
-func (c *Config) FindCertByName(commonName string) *Cert {
-	for i := range c.Certs {
-		if c.Certs[i].CommonName == commonName {
-			return &c.Certs[i]
-		}
-	}
-	return nil
-}
-
+// AddCert stores a trust anchor. Certificates are keyed by fingerprint, so
+// any number of them may share a common name; only an exact duplicate of an
+// already-stored certificate is rejected. A missing fingerprint is computed
+// from the PEM.
 func (c *Config) AddCert(cert Cert) error {
-	if c.FindCertByName(cert.CommonName) != nil {
-		return errors.New("a certificate with that common name already exists")
+	if cert.Fingerprint == "" {
+		fp, err := CertFingerprint([]byte(cert.PEM))
+		if err != nil {
+			return err
+		}
+		cert.Fingerprint = fp
+	}
+	for _, existing := range c.Certs {
+		if existing.Fingerprint == cert.Fingerprint {
+			return fmt.Errorf("certificate %q is already stored (fingerprint %s)",
+				cert.CommonName, ShortFingerprint(cert.Fingerprint))
+		}
 	}
 	c.Certs = append(c.Certs, cert)
 	return nil
 }
 
-func (c *Config) RemoveCert(commonName string) bool {
+// FindCerts returns the stored certificates selected by sel. A sel that is a
+// case-insensitive prefix of at least one fingerprint selects those
+// certificates; otherwise sel selects the certificates whose common name
+// equals it exactly.
+func (c *Config) FindCerts(sel string) []Cert {
+	var byFingerprint, byName []Cert
+	lower := strings.ToLower(sel)
+	for _, cert := range c.Certs {
+		if cert.Fingerprint != "" && strings.HasPrefix(cert.Fingerprint, lower) {
+			byFingerprint = append(byFingerprint, cert)
+		}
+		if cert.CommonName == sel {
+			byName = append(byName, cert)
+		}
+	}
+	if len(byFingerprint) > 0 {
+		return byFingerprint
+	}
+	return byName
+}
+
+// RemoveCert removes the certificate with exactly that fingerprint and
+// reports whether one was stored.
+func (c *Config) RemoveCert(fingerprint string) bool {
 	for i, cert := range c.Certs {
-		if cert.CommonName == commonName {
+		if cert.Fingerprint == fingerprint {
 			c.Certs = append(c.Certs[:i], c.Certs[i+1:]...)
 			return true
 		}

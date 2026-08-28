@@ -38,6 +38,8 @@ $ ./teerminator remote rm <local-addr|index>
 
 For non-attested remotes served by a private CA (e.g. when testing with mkcert certificates), certificates added with `certs add` are appended to the system trust store and used as **upstream** TLS trust anchors. For `--mode attest-lb` remotes they play a different role: the mesh CA is derived from the hardware-committed attestation, so no CA file is needed to connect — a `certs add mesh-ca.pem` is an optional pin that upgrades the verdict from deployment-class to specific-cluster (see below).
 
+Stored certificates are keyed by their SHA-256 fingerprint, not their subject: any number of CAs sharing a common name can be trusted at once (every c8s cluster's mesh CA is `CN=c8s Mesh CA`), so several clusters verify as specific-cluster concurrently. Only adding the exact same certificate twice is rejected.
+
 When the upstream's certificate does not match the host you dial — for example a LoadBalancer reached by **raw IP** whose cert only carries an internal DNS SAN like `c8s-tls-lb.c8s-system.svc` — pass `--server-name` on `remote add` to validate the certificate against that name (like `curl --resolve <name>:<port>:<ip>`); the connection still dials the URL host:
 
 ```
@@ -191,8 +193,10 @@ pin, which is the bootstrap this command exists for.
 
 ```
 $ ./teerminator certs add <CA PEM File>
+Added certificate "c8s Mesh CA" (fingerprint 9f86d081884c7d65)
 $ ./teerminator certs
-common name:
+common name (9f86d081884c7d65):
+    Fingerprint (SHA-256): <64 hex chars>
     Issued To:
         ...
     Issued By:
@@ -205,9 +209,23 @@ common name:
         ....
         -----END CERTIFICATE-----
 
-other common name:
+other common name (…):
     ...
-$ ./teerminator certs rm <common name>
+$ ./teerminator certs rm <fingerprint|common name>
 ```
+
+`certs rm` takes a fingerprint (full, or any unambiguous prefix) or a common name, and
+removes exactly one certificate: a selector matching several — e.g. the shared
+`c8s Mesh CA` name with more than one mesh CA stored — removes nothing and lists the
+matching fingerprints to pick from.
+
+### Live config reload
+
+The running daemon watches the config file: a `remote add`/`remote rm` or `certs add`/
+`certs rm` from another terminal is picked up within a couple of seconds, starting or
+stopping only the affected tunnels — no restart needed. Send `SIGHUP` to reload
+immediately. A tunnel whose policy or trust store changed is restarted; an edit that
+fails to apply (e.g. a port already taken) is logged and the daemon keeps serving the
+rest.
 
 
