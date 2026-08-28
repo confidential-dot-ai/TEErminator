@@ -39,7 +39,8 @@ func newCertsCmd() *cobra.Command {
 					continue
 				}
 
-				fmt.Printf("%s:\n", c.CommonName)
+				fmt.Printf("%s (%s):\n", c.CommonName, config.ShortFingerprint(c.Fingerprint))
+				fmt.Printf("    Fingerprint (SHA-256): %s\n", c.Fingerprint)
 				fmt.Printf("    Issued To:\n")
 				fmt.Printf("        Common Name:   %s\n", cert.Subject.CommonName)
 				if len(cert.Subject.Organization) > 0 {
@@ -106,9 +107,14 @@ func newCertsAddCmd() *cobra.Command {
 				return fmt.Errorf("loading config: %w", err)
 			}
 
+			fingerprint, err := config.CertFingerprint(data)
+			if err != nil {
+				return err
+			}
 			c := config.Cert{
-				CommonName: commonName,
-				PEM:        string(data),
+				Fingerprint: fingerprint,
+				CommonName:  commonName,
+				PEM:         string(data),
 			}
 			if err := cfg.AddCert(c); err != nil {
 				return err
@@ -117,7 +123,7 @@ func newCertsAddCmd() *cobra.Command {
 				return fmt.Errorf("saving config: %w", err)
 			}
 
-			fmt.Printf("Added certificate %q\n", commonName)
+			fmt.Printf("Added certificate %q (fingerprint %s)\n", commonName, config.ShortFingerprint(fingerprint))
 			return nil
 		},
 	}
@@ -125,25 +131,36 @@ func newCertsAddCmd() *cobra.Command {
 
 func newCertsRmCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "rm <common-name>",
-		Short: "Remove a trusted CA certificate by common name",
+		Use:   "rm <fingerprint|common-name>",
+		Short: "Remove a trusted CA certificate by fingerprint (full or prefix) or common name",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			commonName := args[0]
+			sel := args[0]
 
 			cfg, err := config.Load()
 			if err != nil {
 				return fmt.Errorf("loading config: %w", err)
 			}
 
-			if !cfg.RemoveCert(commonName) {
-				return fmt.Errorf("no certificate found with common name %q", commonName)
+			matches := cfg.FindCerts(sel)
+			if len(matches) == 0 {
+				return fmt.Errorf("no certificate matches %q (see `certs` for fingerprints)", sel)
 			}
+			if len(matches) > 1 {
+				var lines strings.Builder
+				for _, m := range matches {
+					fmt.Fprintf(&lines, "\n  %s  %s", m.Fingerprint, m.CommonName)
+				}
+				return fmt.Errorf("%q matches %d certificates; pass a fingerprint:%s", sel, len(matches), lines.String())
+			}
+
+			cfg.RemoveCert(matches[0].Fingerprint)
 			if err := cfg.Save(); err != nil {
 				return fmt.Errorf("saving config: %w", err)
 			}
 
-			fmt.Printf("Removed certificate %q\n", commonName)
+			fmt.Printf("Removed certificate %q (fingerprint %s)\n",
+				matches[0].CommonName, config.ShortFingerprint(matches[0].Fingerprint))
 			return nil
 		},
 	}
