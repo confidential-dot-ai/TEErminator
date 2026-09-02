@@ -154,3 +154,38 @@ func TestValidateRTMR3Flag(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateStaticAllowlistFlags(t *testing.T) {
+	initData := strings.Repeat("5e", 32)
+	tests := []struct {
+		name     string
+		mode     config.AttestMode
+		static   bool
+		initData string
+		wantErr  string
+	}{
+		{"no pins on any mode", config.AttestNone, false, "", ""},
+		{"static on attest-lb", config.AttestEndpoint, true, "", ""},
+		{"static with init-data", config.AttestEndpoint, true, initData, ""},
+		{"static needs attest-lb", config.AttestNone, true, "", "--static-allowlist requires --mode attest-lb"},
+		{"static needs attest-lb (cds-cert)", config.AttestCDSCert, true, "", "--static-allowlist requires --mode attest-lb"},
+		{"init-data needs attest-lb", config.AttestNone, false, initData, "--init-data requires --mode attest-lb"},
+		{"init-data needs static", config.AttestEndpoint, false, initData, "--init-data requires --static-allowlist"},
+		{"init-data not hex", config.AttestEndpoint, true, "zz", "not hex"},
+		{"init-data wrong length", config.AttestEndpoint, true, "5e5e", "want 32"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateStaticAllowlistFlags(tc.mode, tc.static, tc.initData)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateStaticAllowlistFlags(%q, %v, %q) = %v, want nil", tc.mode, tc.static, tc.initData, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("validateStaticAllowlistFlags(%q, %v, %q) = %v, want error containing %q", tc.mode, tc.static, tc.initData, err, tc.wantErr)
+			}
+		})
+	}
+}

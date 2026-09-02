@@ -200,5 +200,10 @@ func printFetchSummary(out string, res *proxy.AllowlistFetch) {
 	if v.Warning != "" {
 		fmt.Printf("  WARNING: %s\n", v.Warning)
 	}
+	if v.StaticAllowlistDigest != "" {
+		fmt.Printf("  sealed: the mesh CA seals digest sha256:%s as its one lifetime policy (CA launch %s verified under the remote's measurement policy), and the stamp was decided under it.\n",
+			v.StaticAllowlistDigest, v.SealedCALaunch)
+		return
+	}
 	fmt.Println("  This document is CA-vouched, not hardware-attested: the evidence binds the mesh leaf, the mesh CA vouches for the stamp in it, and the stamp names this digest.")
 }

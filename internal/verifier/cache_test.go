@@ -136,6 +136,17 @@ func TestRemoteKey(t *testing.T) {
 			r.MinTCB = &config.TCBFloor{Bootloader: 3, SNP: 8, Microcode: 210}
 			return RemoteKey("lb.example:443", r, nil, nil, nil)
 		}(),
+		"static allowlist": func() string {
+			r := base
+			r.StaticAllowlist = true
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
+		}(),
+		"init data": func() string {
+			r := base
+			r.StaticAllowlist = true
+			r.InitData = strings.Repeat("5e", 32)
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
+		}(),
 		"allowlist digest":            RemoteKey("lb.example:443", base, []byte{1, 2, 3}, nil, nil),
 		"image manifest digest":       RemoteKey("lb.example:443", base, nil, []byte{1, 2, 3}, nil),
 		"other image manifest digest": RemoteKey("lb.example:443", base, nil, []byte{4, 5, 6}, nil),

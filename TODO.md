@@ -59,6 +59,16 @@
       `feat/cds-identity-cache`, and `fix/derive-allowlist-and-binding` were
       built on the retired config-claims flow and are replaced by the attest-lb
       protocol above (config-claims retired server-side).
+- [x] Enforce c8s's sealed-policy mode (`remote add --static-allowlist`,
+      c8s#522): the hardware-committed mesh CA must carry the static-allowlist
+      stamp (OID `…66378.1.3`) and RA-TLS evidence over its own key; the CA
+      evidence is verified through `attestation-go` (`internal/verifier/
+      staticallowlist.go`, KDS fetch for bare SNP, memoised per CA), its
+      launch must pass the remote's own measurement policy, the sealed digest
+      must equal SHA-256 of the pinned `--allowlist` bytes, and the leaf stamp
+      must have been decided under it. `--init-data` pins the CA evidence's
+      init-data claim for pod-as-CVM. Verdicts, `status`, `allowlist fetch`
+      and the verdict-cache key carry the seal.
 - [ ] Support `/cds-cert` pinning. Config model (`Mode`, `Measurements`,
       `DiscoveryURL`, `Pin`) is in place; configuring the mode blocks every
       request before it reaches the backend (fail closed) rather than forwarding
