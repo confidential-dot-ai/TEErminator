@@ -76,6 +76,9 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 			detail += fmt.Sprintf(", allowlist version %s (claimed by the stamp — `allowlist fetch %s` checks the document behind it)",
 				v.AllowlistVersion, r.Local)
 		}
+		if v.StaticAllowlistDigest != "" {
+			detail += fmt.Sprintf(", sealed allowlist %s (mesh CA launch %s)", v.StaticAllowlistDigest, v.SealedCALaunch)
+		}
 		if len(v.RTMRsPinned) > 0 {
 			detail += ", rtmrs pinned " + strings.Join(v.RTMRsPinned, " ")
 		}

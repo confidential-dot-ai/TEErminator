@@ -121,6 +121,22 @@ func validatePinModes(mode config.AttestMode, imageManifest, expectedRTMR3, minT
 	return nil
 }
 
+// validateStaticAllowlistFlags checks the sealed-policy flags at add time:
+// both need --mode attest-lb (nothing else commits a mesh CA to verify a seal
+// on), and --init-data needs --static-allowlist and is 32 bytes of hex.
+func validateStaticAllowlistFlags(mode config.AttestMode, staticAllowlist bool, initData string) error {
+	if mode != config.AttestEndpoint {
+		switch {
+		case staticAllowlist:
+			return fmt.Errorf("--static-allowlist requires --mode attest-lb: only the attest-lb handshake commits the mesh CA the seal is read off, so the pin would be stored but never enforced")
+		case initData != "":
+			return fmt.Errorf("--init-data requires --mode attest-lb and --static-allowlist: it pins the sealed mesh CA's evidence, which nothing verifies in mode %q", mode)
+		}
+	}
+	_, err := verifier.ValidateStaticAllowlistPins(staticAllowlist, strings.TrimSpace(initData))
+	return err
+}
+
 // validateRTMR3Flag validates the --expected-rtmr3 pin and returns the value to
 // store. Surrounding whitespace is trimmed here, at the flag boundary only: a
 // register pin is copy-pasted out of terminal output, so a trailing newline is
@@ -166,15 +182,17 @@ func parseMinTCBFlag(s string) (*config.TCBFloor, error) {
 
 func newRemoteAddCmd(name string) *cobra.Command {
 	var (
-		mode          string
-		measurements  []string
-		discoveryURL  string
-		serverName    string
-		workload      string
-		allowlistPath string
-		imageManifest string
-		expectedRTMR3 string
-		minTCB        string
+		mode            string
+		measurements    []string
+		discoveryURL    string
+		serverName      string
+		workload        string
+		allowlistPath   string
+		imageManifest   string
+		expectedRTMR3   string
+		minTCB          string
+		staticAllowlist bool
+		initData        string
 	)
 
 	cmd := &cobra.Command{
@@ -194,6 +212,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			}
 
 			if err := validatePinModes(attestMode, imageManifest, expectedRTMR3, minTCB); err != nil {
+				return err
+			}
+			if err := validateStaticAllowlistFlags(attestMode, staticAllowlist, initData); err != nil {
 				return err
 			}
 			// How the measurement pins relate to each other is one rule set,
@@ -245,6 +266,8 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				ImageManifestPath: manifestStored,
 				ExpectedRTMR3:     rtmr3Stored,
 				MinTCB:            tcbFloor,
+				StaticAllowlist:   staticAllowlist,
+				InitData:          strings.ToLower(strings.TrimSpace(initData)),
 			}
 			if err := cfg.AddRemote(r); err != nil {
 				return err
@@ -271,6 +294,8 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringVar(&allowlistPath, "allowlist", "", "path to a pinned canonical-allowlist JSON file; hashed exactly as read against the stamp's digest, and the stamped name must resolve in it (attest-lb)")
 	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (JSON object with mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, published with the image build); all three registers are pinned exactly against this one manifest, so the guest kernel and rootfs are verified rather than only the firmware. Replaces --measurements rather than adding to it. TDX evidence only — with SNP evidence this is a policy error")
 	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 lowercase hex chars — pins the runtime measurement register, i.e. the ordered operator-key/workload-event chain extended after boot. This is a deployment property, NOT a cluster identity, and cannot replace an image pin, so it requires --image-manifest. TDX evidence only — with SNP evidence this is a policy error")
+	f.BoolVar(&staticAllowlist, "static-allowlist", false, "require the hardware-committed mesh CA to be sealed (c8s CDS --static-allowlist): it must carry the static-allowlist stamp and RA-TLS evidence over its own key that verifies under this remote's measurement policy, the sealed digest must equal the SHA-256 of the --allowlist file when one is pinned, and the mesh leaf's stamp must have been decided under it. Without --allowlist the seal is verified but compared to no reviewed document, which the verdict warns about (attest-lb)")
+	f.StringVar(&initData, "init-data", "", "hex SHA-256 of the CDS pod's kata init-data document, pinned against the sealed mesh CA evidence's init-data claim (pod-as-CVM deployments; requires --static-allowlist)")
 	f.StringVar(&minTCB, "min-tcb", "", "minimum SNP TCB floor as four comma-separated components <bootloader,tee,snp,microcode> (each 0-255), enforced component-wise on the verified evidence. SNP evidence only — with TDX evidence this is a policy error")
 	return cmd
 }

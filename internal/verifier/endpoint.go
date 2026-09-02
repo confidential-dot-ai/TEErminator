@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
@@ -124,9 +125,28 @@ type SessionVerdict struct {
 	// evidence binds the mesh leaf into the transcript, and the mesh CA's
 	// signature over that leaf is what vouches for the stamp inside it.
 	Stamp *MatchedWorkload
-	// Warning is a policy gap in an otherwise passing verdict — currently the
-	// MRTD-only note for specific-cluster TDX remotes without an image pin.
+	// StaticAllowlistDigest is the hex SHA-256 the committed mesh CA seals as
+	// its one lifetime policy, set only when the remote pins --static-allowlist
+	// and every sealed-policy check passed (staticallowlist.go). Unlike the
+	// leaf stamp it is hardware-rooted: the CA DER is committed in fresh
+	// evidence, and the CA's own embedded evidence verified under the remote's
+	// measurement policy.
+	StaticAllowlistDigest string
+	// SealedCALaunch is the launch digest of the sealed CA's verified evidence,
+	// set alongside StaticAllowlistDigest.
+	SealedCALaunch string
+	// Warning is a policy gap in an otherwise passing verdict — the MRTD-only
+	// note for specific-cluster TDX remotes without an image pin, or a seal
+	// that is verified but pinned to no reviewed document.
 	Warning string
+}
+
+// addWarning appends w to the verdict's warning, keeping any earlier one.
+func (v *SessionVerdict) addWarning(w string) {
+	if v.Warning != "" {
+		v.Warning += "; "
+	}
+	v.Warning += w
 }
 
 // identityProof mirrors the attest-lb bundle's proof of possession by the mesh
@@ -160,6 +180,11 @@ type EndpointAttester struct {
 	attestURL *url.URL
 	remote    config.Remote
 	pinnedCAs []*x509.Certificate
+
+	// mu guards sealedCA, the memoised verification of the committed mesh
+	// CA's embedded evidence under --static-allowlist.
+	mu       sync.Mutex
+	sealedCA *sealedCAMemo
 }
 
 // NewEndpointAttester builds an endpoint attester.
@@ -192,7 +217,7 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 // leaf capture, bundle shape (version, nonce echo), served chain parsing and
 // committed-CA selection, identity-proof field equality, hardware evidence over
 // the recomputed transcript, proof of possession, mesh-leaf chain, serving-leaf
-// chain, measurement policy, workload policy.
+// chain, measurement policy, workload policy, sealed policy.
 func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) {
 	// Platform pins are resolved before any network round trip: a malformed
 	// image manifest, RTMR[3] pin, or TCB floor is a configuration error. The
@@ -356,6 +381,16 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 		v.AllowlistVersion = stamp.AllowlistVersion
 	}
 
+	// (k) Sealed policy, only when pinned: the committed CA — whose DER the
+	// evidence above commits — must carry the static-allowlist stamp and its
+	// own verifiable launch evidence, the pinned allowlist file must hash to
+	// the sealed digest, and the leaf stamp must have been decided under it.
+	if pins.sealed {
+		if err := e.checkStaticAllowlist(ctx, committedCA, stamp, pins, v); err != nil {
+			return nil, fmt.Errorf("attest-lb: static allowlist: %w", err)
+		}
+	}
+
 	// An operator CA pin upgrades the derived-CA verdict to specific-cluster
 	// when the committed CA byte-equals it.
 	for _, pinned := range e.pinnedCAs {
@@ -380,7 +415,7 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 		if v.TrustMode == TrustDeploymentClass {
 			return nil, fmt.Errorf("attest-lb: configuration error: deployment-class trust over TDX evidence needs an image pin — the measurement allowlist covers only MRTD, which measures the TDVF firmware, so the guest kernel and rootfs are unmeasured; pin the full MRTD+RTMR[1]+RTMR[2] tuple with `remote add --image-manifest`")
 		}
-		v.Warning = "TDX policy covers MRTD only — the guest kernel (RTMR[1]) and rootfs (RTMR[2]) are UNMEASURED by this policy; pin the full image tuple with `remote add --image-manifest`"
+		v.addWarning("TDX policy covers MRTD only — the guest kernel (RTMR[1]) and rootfs (RTMR[2]) are UNMEASURED by this policy; pin the full image tuple with `remote add --image-manifest`")
 	}
 	return v, nil
 }
@@ -413,12 +448,18 @@ func isSNPPlatform(p teetypes.PlatformType) bool {
 // remote: the TDX image tuple (all three of MRTD, RTMR[1] and RTMR[2] compare
 // exactly against the verified claims), the optional TDX runtime-register pin
 // (RTMR[3], which only ever rides on top of an image tuple — see
-// ValidatePinCombination), and the SNP TCB floor. Any pin set against evidence
-// from a platform it cannot apply to is a hard error.
+// ValidatePinCombination), the SNP TCB floor, and the sealed-policy pin with
+// its optional init-data digest. Any pin set against evidence from a platform
+// it cannot apply to is a hard error.
 type platformPins struct {
 	image  *ImagePins
 	rtmr3  *[RegisterSize]byte
 	minTCB *teetypes.SnpTcb
+	// sealed requires the committed mesh CA to carry a verified static
+	// allowlist seal; initData additionally pins the sealed CA evidence's
+	// init-data claim (pod-as-CVM).
+	sealed   bool
+	initData []byte
 }
 
 // ValidatePinCombination enforces the two rules that relate a remote's TDX
@@ -480,6 +521,12 @@ func loadPlatformPins(r config.Remote) (platformPins, error) {
 			Microcode:  r.MinTCB.Microcode,
 		}
 	}
+	initData, err := ValidateStaticAllowlistPins(r.StaticAllowlist, r.InitData)
+	if err != nil {
+		return platformPins{}, fmt.Errorf("configuration error: %w", err)
+	}
+	pins.sealed = r.StaticAllowlist
+	pins.initData = initData
 	return pins, nil
 }
 
@@ -496,35 +543,14 @@ func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.Veri
 	}
 
 	if p.image != nil {
-		// On TDX the launch digest IS the MRTD, and it comes out of the same
-		// build as RTMR[1]/[2]. Comparing it byte-exactly — rather than
-		// admitting it into an allowlist that may carry other digests — is what
-		// makes the manifest ONE image pin instead of three independent ones:
-		// otherwise a guest whose firmware differs from the manifest verifies
-		// while the kernel and rootfs registers stay pinned to the manifest.
-		mb, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(res.Claims.LaunchDigest)))
-		if err != nil || len(mb) == 0 {
-			return fmt.Errorf("cannot enforce the image pin: launch_digest is missing or malformed (%q)", res.Claims.LaunchDigest)
-		}
-		if !bytes.Equal(mb, p.image.MRTD[:]) {
-			return fmt.Errorf("MRTD mismatch: launch measurement %s does not match the image manifest MRTD %s (a different guest firmware/image booted)",
-				hex.EncodeToString(mb), hex.EncodeToString(p.image.MRTD[:]))
+		if err := checkImageMRTD(res, p.image); err != nil {
+			return err
 		}
 	}
 
 	check := func(idx int, meaning string, want []byte) error {
-		key := fmt.Sprintf("rtmr_%d", idx)
-		got, _ := res.Claims.PlatformData[key].(string)
-		got = strings.ToLower(strings.TrimSpace(got))
-		if got == "" {
-			return fmt.Errorf("cannot enforce the RTMR[%d] pin: the verified claims carry no %s", idx, key)
-		}
-		gb, err := hex.DecodeString(got)
-		if err != nil || len(gb) != RegisterSize {
-			return fmt.Errorf("cannot enforce the RTMR[%d] pin: %s claim is malformed (%q)", idx, key, got)
-		}
-		if !bytes.Equal(gb, want) {
-			return fmt.Errorf("RTMR[%d] (%s) is %s, expected %s", idx, meaning, got, hex.EncodeToString(want))
+		if err := checkRTMR(res, idx, meaning, want); err != nil {
+			return err
 		}
 		v.RTMRsPinned = append(v.RTMRsPinned, fmt.Sprintf("%d:%s", idx, hex.EncodeToString(want)))
 		return nil
@@ -553,6 +579,44 @@ func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.Veri
 		}
 		v.TCBFloor = fmt.Sprintf("bootloader=%d,tee=%d,snp=%d,microcode=%d",
 			p.minTCB.Bootloader, p.minTCB.Tee, p.minTCB.Snp, p.minTCB.Microcode)
+	}
+	return nil
+}
+
+// checkImageMRTD compares the launch digest byte-exactly against the image
+// manifest's MRTD. On TDX the launch digest IS the MRTD, and it comes out of
+// the same build as RTMR[1]/[2]: comparing it exactly — rather than admitting
+// it into an allowlist that may carry other digests — is what makes the
+// manifest ONE image pin instead of three independent ones; otherwise a guest
+// whose firmware differs from the manifest verifies while the kernel and
+// rootfs registers stay pinned to the manifest.
+func checkImageMRTD(res *teetypes.VerificationResult, image *ImagePins) error {
+	mb, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(res.Claims.LaunchDigest)))
+	if err != nil || len(mb) == 0 {
+		return fmt.Errorf("cannot enforce the image pin: launch_digest is missing or malformed (%q)", res.Claims.LaunchDigest)
+	}
+	if !bytes.Equal(mb, image.MRTD[:]) {
+		return fmt.Errorf("MRTD mismatch: launch measurement %s does not match the image manifest MRTD %s (a different guest firmware/image booted)",
+			hex.EncodeToString(mb), hex.EncodeToString(image.MRTD[:]))
+	}
+	return nil
+}
+
+// checkRTMR compares one pinned TDX runtime register against the verified
+// claims, failing closed on an absent or malformed claim.
+func checkRTMR(res *teetypes.VerificationResult, idx int, meaning string, want []byte) error {
+	key := fmt.Sprintf("rtmr_%d", idx)
+	got, _ := res.Claims.PlatformData[key].(string)
+	got = strings.ToLower(strings.TrimSpace(got))
+	if got == "" {
+		return fmt.Errorf("cannot enforce the RTMR[%d] pin: the verified claims carry no %s", idx, key)
+	}
+	gb, err := hex.DecodeString(got)
+	if err != nil || len(gb) != RegisterSize {
+		return fmt.Errorf("cannot enforce the RTMR[%d] pin: %s claim is malformed (%q)", idx, key, got)
+	}
+	if !bytes.Equal(gb, want) {
+		return fmt.Errorf("RTMR[%d] (%s) is %s, expected %s", idx, meaning, got, hex.EncodeToString(want))
 	}
 	return nil
 }
@@ -731,9 +795,9 @@ func (e *EndpointAttester) checkWorkloadPolicy(stamp *MatchedWorkload) error {
 		// Hash EXACTLY the file bytes as read — canonical bytes only, never a
 		// reserialization. This is the same check `allowlist fetch` runs over
 		// the bytes the cluster serves, so both go through checkAllowlistBytes.
-		raw, err := os.ReadFile(e.remote.AllowlistPath)
+		raw, err := readPinnedAllowlist(e.remote.AllowlistPath)
 		if err != nil {
-			return fmt.Errorf("workload policy: read pinned allowlist: %w", err)
+			return fmt.Errorf("workload policy: %w", err)
 		}
 		if err := checkAllowlistBytes(raw, stamp); err != nil {
 			var mismatch *AllowlistDigestMismatch
@@ -745,6 +809,17 @@ func (e *EndpointAttester) checkWorkloadPolicy(stamp *MatchedWorkload) error {
 		}
 	}
 	return nil
+}
+
+// readPinnedAllowlist reads the pinned allowlist file EXACTLY as stored —
+// canonical bytes only, never a reserialization — since every digest in this
+// client is taken over those bytes.
+func readPinnedAllowlist(path string) ([]byte, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read pinned allowlist: %w", err)
+	}
+	return raw, nil
 }
 
 // verifyEvidence is the evidence-verification seam: production points at

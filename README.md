@@ -91,6 +91,27 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
     cluster itself (see below); the stamp's allowlist **version** counter, which `status`
     prints for a workload-pinned remote, is a *claim* until you check the document behind
     it that way.
+  - **Sealed policy.** `--static-allowlist` requires the committed mesh CA to be the one
+    a c8s CDS running with `--static-allowlist` mints ([c8s#522](https://github.com/confidential-dot-ai/c8s/pull/522)):
+    it must carry the static-allowlist stamp (OID `1.3.6.1.4.1.66378.1.3`, the SHA-256 of
+    the one document that CDS enforces for its lifetime) and RA-TLS evidence (OID
+    `…66378.1.1`) over its own public key. Because attest-lb already commits
+    `SHA-256(mesh_CA_DER)` into the nonce-fresh `report_data`, both extensions are covered
+    by per-handshake hardware evidence. TEErminator verifies the CA's embedded evidence
+    through `attestation-go`, requires its launch to pass the same measurement policy as
+    the front door (the `--measurements` allowlist or the `--image-manifest` tuple, plus
+    `--min-tcb` when set), requires the sealed digest to equal the SHA-256 of the
+    `--allowlist` file's exact bytes, and refuses a mesh leaf whose matched-workload stamp
+    was decided under any other snapshot. This is what closes the gap the workload pin
+    leaves open: with a dynamic allowlist the operator can widen the policy between two
+    requests and have CDS stamp a new pod; with a seal, changing the policy means launching
+    a new CDS and minting a new CA, which the next handshake refuses. Without `--allowlist`
+    the seal is verified but compared to no reviewed document, and the verdict says so.
+    `--init-data <hex>` additionally pins the sealed CA evidence's init-data claim (the
+    SHA-256 of the CDS pod's kata init-data document) for pod-as-CVM deployments. Both
+    require `--mode attest-lb`. On bare-metal SNP the CA certificate carries no VCEK, so
+    the first verification fetches it from AMD KDS; the CA is immutable, so its verified
+    claims are reused for later handshakes and only the policy is re-applied.
   - **Platform-complete pinning.** The `--measurements` allowlist pins the launch
     digest, which means different things per platform. On **Intel TDX** the launch
     digest (MRTD) measures only the TDVF firmware — the guest kernel and rootfs live in
@@ -142,9 +163,21 @@ $ ./teerminator remote add 127.0.0.1:8081 https://<LB-IP>/ \
 $ ./teerminator remote add 127.0.0.1:8082 https://<LB-IP>/ \
     --mode attest-lb --measurements <hex,...> --min-tcb 3,0,8,209
 
+# Sealed policy: the mesh CA must seal exactly the reviewed allowlist, and the CDS that
+# minted it must run on the pinned image.
+$ ./teerminator remote add 127.0.0.1:8083 https://<LB-IP>/ \
+    --mode attest-lb --image-manifest ./image-manifest.json \
+    --static-allowlist --allowlist ./static-allowlist.json --workload api
+
 # Optional hardening: pin the mesh CA to upgrade the verdict to specific-cluster.
 $ ./teerminator certs add ./mesh-ca.pem
 ```
+
+`status` reports a sealed remote as `sealed allowlist <digest> (mesh CA launch <digest>)`.
+The digest is the same value `c8s allowlist digest <file>` prints, so a reviewer can pin
+the document they read without contacting the cluster; `allowlist fetch --pin` is the
+other way to obtain it, and under a seal the fetched bytes are also checked against the
+sealed digest.
 
 ### Fetching the allowlist
 

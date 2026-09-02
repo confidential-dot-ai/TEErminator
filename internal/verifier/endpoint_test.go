@@ -184,6 +184,7 @@ type fixtureOpts struct {
 	noStamp      bool
 	servingCA    *certAndKey // default: the fixture CA
 	meshCA       *certAndKey // default: the fixture CA
+	ca           *certAndKey // the committed CA itself; default: a plain mintCA
 }
 
 func newLBFixture(t *testing.T, opts fixtureOpts) *lbFixture {
@@ -192,7 +193,10 @@ func newLBFixture(t *testing.T, opts fixtureOpts) *lbFixture {
 	if f.allowlistRaw == nil {
 		f.allowlistRaw = defaultAllowlistRaw
 	}
-	f.ca = mintCA(t, "mesh-ca")
+	f.ca = opts.ca
+	if f.ca == nil {
+		f.ca = mintCA(t, "mesh-ca")
+	}
 	exts := opts.stampExts
 	if exts == nil && !opts.noStamp {
 		digest := sha256.Sum256(f.allowlistRaw)
