@@ -43,7 +43,7 @@ var ErrNotImplemented = errors.New("attestation flow not implemented")
 // same transcript. The mesh CA is thereby DERIVED from the hardware-committed
 // response — no out-of-band CA file is required — and both the mesh leaf and
 // the serving leaf must chain to it, so the serving key is TEE-held
-// (public_tls.mode=cds; a WebPKI-secret front door refuses the endpoint).
+// (public_tls.mode=cds or acme; a WebPKI-secret front door refuses the endpoint).
 
 // wellKnownAttestLB is the LB's ordinary-TLS attestation endpoint. It lives at
 // the LB origin, independent of the remote's forwarding path.
@@ -54,6 +54,14 @@ const wellKnownAttestLB = "/.well-known/c8s/attest-lb"
 // encrypted-session "c8s/attest-pq/v1") is rejected even if its evidence is
 // otherwise valid — there is no endpoint negotiation or fallback.
 const attestLBVersion = "c8s/attest-lb/v1"
+
+// These are the only front-door modes that keep the serving key in the TEE.
+// A webpki key is host-visible and is valid for attest-pq only.
+const (
+	frontDoorModeCDS    = "cds"
+	frontDoorModeWebPKI = "webpki"
+	frontDoorModeACME   = "acme"
+)
 
 // proofAlgorithmECDSASHA384 is the only identity-proof algorithm accepted.
 const proofAlgorithmECDSASHA384 = "ecdsa-sha384"
@@ -165,6 +173,7 @@ type attestationBundle struct {
 	Nonce         string          `json:"nonce"`
 	Evidence      json.RawMessage `json:"evidence"`
 	CDSCertPEM    string          `json:"cds_cert_pem"`
+	FrontDoorMode string          `json:"front_door_mode"`
 	IdentityProof identityProof   `json:"identity_proof"`
 }
 
@@ -276,6 +285,9 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	if bundle.Nonce != nonceB64 {
 		return nil, fmt.Errorf("attest-lb: nonce mismatch (LB echoed %q)", bundle.Nonce)
 	}
+	if !isTEEFrontDoorMode(bundle.FrontDoorMode) {
+		return nil, fmt.Errorf("attest-lb: unsupported front_door_mode %q (want %q or %q; %q is attest-pq-only)", bundle.FrontDoorMode, frontDoorModeCDS, frontDoorModeACME, frontDoorModeWebPKI)
+	}
 
 	// (c) Served chain: first block is the mesh leaf; the committed CA is
 	// selected among the remaining blocks by the proof's mesh_ca_sha256.
@@ -305,7 +317,7 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	// mesh identity, and our nonce, and require the hardware evidence to bind
 	// exactly it. A bundle relayed through any other serving leaf fails here
 	// even when both leaves share an issuer.
-	reportData := attestLBReportData(nonce, servingLeaf.Raw, meshLeaf.Raw, committedCA.Raw)
+	reportData := attestLBReportData(bundle.FrontDoorMode, nonce, servingLeaf.Raw, meshLeaf.Raw, committedCA.Raw)
 	res, err := verifyEvidence(bundle, reportData[:], pins.minTCB)
 	if err != nil {
 		return nil, err
@@ -644,16 +656,22 @@ func checkTCBFloor(tcb teetypes.TcbInfo, floor *teetypes.SnpTcb) error {
 	return nil
 }
 
+// isTEEFrontDoorMode reports whether mode keeps the public serving key inside
+// the TEE. Only these modes can support the attest-lb transport binding.
+func isTEEFrontDoorMode(mode string) bool {
+	return mode == frontDoorModeCDS || mode == frontDoorModeACME
+}
+
 // attestLBReportData is the normative attest-lb transcript hash:
 //
-//	report_data = SHA-384( LP("c8s/attest-lb/v1") || LP(nonce) ||
+//	report_data = SHA-384( LP("c8s/attest-lb/v1") || LP(front_door_mode) || LP(nonce) ||
 //	    LP(SHA-256(serving_leaf_DER)) || LP(SHA-256(mesh_leaf_DER)) ||
 //	    LP(SHA-256(mesh_CA_DER)) )
 //
 // where LP(x) = uint32-big-endian(len(x)) || x. The serving-leaf hash covers
 // the FULL certificate DER, not the SPKI, so a substituted certificate with the
 // same key still fails.
-func attestLBReportData(nonce, servingLeafDER, meshLeafDER, meshCADER []byte) [48]byte {
+func attestLBReportData(frontDoorMode string, nonce, servingLeafDER, meshLeafDER, meshCADER []byte) [48]byte {
 	h := sha512.New384()
 	lp := func(b []byte) {
 		var n [4]byte
@@ -662,6 +680,7 @@ func attestLBReportData(nonce, servingLeafDER, meshLeafDER, meshCADER []byte) [4
 		h.Write(b)
 	}
 	lp([]byte(attestLBVersion))
+	lp([]byte(frontDoorMode))
 	lp(nonce)
 	servingSum := sha256.Sum256(servingLeafDER)
 	lp(servingSum[:])

@@ -49,6 +49,7 @@ var transcriptVectors []byte
 func TestAttestLBTranscriptGoldenVectors(t *testing.T) {
 	var vectors []struct {
 		Description       string `json:"description"`
+		FrontDoorMode     string `json:"front_door_mode"`
 		NonceB64          string `json:"nonce_b64"`
 		ServingLeafDERB64 string `json:"serving_leaf_der_b64"`
 		MeshLeafDERB64    string `json:"mesh_leaf_der_b64"`
@@ -70,7 +71,7 @@ func TestAttestLBTranscriptGoldenVectors(t *testing.T) {
 	}
 	for _, v := range vectors {
 		t.Run(v.Description, func(t *testing.T) {
-			got := attestLBReportData(unb64(v.NonceB64), unb64(v.ServingLeafDERB64), unb64(v.MeshLeafDERB64), unb64(v.MeshCADERB64))
+			got := attestLBReportData(v.FrontDoorMode, unb64(v.NonceB64), unb64(v.ServingLeafDERB64), unb64(v.MeshLeafDERB64), unb64(v.MeshCADERB64))
 			if want := unb64(v.ReportDataB64); !bytes.Equal(got[:], want) {
 				t.Fatalf("report_data = %x, want %x", got, want)
 			}
@@ -218,17 +219,19 @@ func newLBFixture(t *testing.T, opts fixtureOpts) *lbFixture {
 // bundleSpec controls what the fixture LB serves; the zero value is the honest
 // bundle for the fixture.
 type bundleSpec struct {
-	version    string // default attestLBVersion
-	platform   string // default "test"
-	echoNonce  string // default: echo the request nonce
-	servingDER []byte // DER committed into the transcript; default: the actual serving leaf
-	cdsPEM     string // default: mesh leaf PEM + CA PEM
-	algorithm  string // default "ecdsa-sha384"
-	meshCAHash []byte // default SHA-256(CA DER)
-	signKey    *ecdsa.PrivateKey
-	breakSig   bool
-	evidence   func(reportData []byte) json.RawMessage // default: stub shape {"report_data": ...}
-	observe    func(*http.Request)                     // called with the request as received
+	version        string // default attestLBVersion
+	frontDoorMode  string // default cds; mode advertised in the response
+	transcriptMode string // default frontDoorMode; mode committed by evidence
+	platform       string // default "test"
+	echoNonce      string // default: echo the request nonce
+	servingDER     []byte // DER committed into the transcript; default: the actual serving leaf
+	cdsPEM         string // default: mesh leaf PEM + CA PEM
+	algorithm      string // default "ecdsa-sha384"
+	meshCAHash     []byte // default SHA-256(CA DER)
+	signKey        *ecdsa.PrivateKey
+	breakSig       bool
+	evidence       func(reportData []byte) json.RawMessage // default: stub shape {"report_data": ...}
+	observe        func(*http.Request)                     // called with the request as received
 	// allowlist, when set, answers GET /allowlist on the same origin, as the
 	// front door does (the tls-lb proxies both routes). Unset leaves the route
 	// answering the attest-lb handler, i.e. not a served allowlist at all.
@@ -258,7 +261,15 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		if servingDER == nil {
 			servingDER = f.serving.cert.Raw
 		}
-		reportData := attestLBReportData(nonce, servingDER, f.mesh.cert.Raw, f.ca.cert.Raw)
+		frontDoorMode := spec.frontDoorMode
+		if frontDoorMode == "" {
+			frontDoorMode = frontDoorModeCDS
+		}
+		transcriptMode := spec.transcriptMode
+		if transcriptMode == "" {
+			transcriptMode = frontDoorMode
+		}
+		reportData := attestLBReportData(transcriptMode, nonce, servingDER, f.mesh.cert.Raw, f.ca.cert.Raw)
 		digest := sha512.Sum384(reportData[:])
 		signKey := spec.signKey
 		if signKey == nil {
@@ -308,12 +319,13 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		servingSum := sha256.Sum256(servingDER)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"version":      version,
-			"platform":     platform,
-			"generation":   1,
-			"nonce":        echo,
-			"evidence":     evidence(reportData[:]),
-			"cds_cert_pem": cdsPEM,
+			"version":         version,
+			"platform":        platform,
+			"generation":      1,
+			"nonce":           echo,
+			"evidence":        evidence(reportData[:]),
+			"cds_cert_pem":    cdsPEM,
+			"front_door_mode": frontDoorMode,
 			"identity_proof": map[string]string{
 				"algorithm":      algorithm,
 				"leaf_sha256":    base64.RawURLEncoding.EncodeToString(meshSum[:]),
@@ -520,6 +532,48 @@ func TestAttestLBHappyPath(t *testing.T) {
 			t.Errorf("TrustMode = %q, want %q", v.TrustMode, TrustDeploymentClass)
 		}
 	})
+}
+
+func TestAttestLBAcmeFrontDoor(t *testing.T) {
+	stubEvidence(t)
+	f := newLBFixture(t, fixtureOpts{})
+	ts := f.newServer(t, bundleSpec{frontDoorMode: frontDoorModeACME})
+	ea := newLBAttester(t, ts, measuredRemote(), nil)
+	if _, err := ea.Attest(context.Background()); err != nil {
+		t.Fatalf("acme front door: %v", err)
+	}
+}
+
+func TestAttestLBRejectsNonTEEFrontDoorModes(t *testing.T) {
+	for _, mode := range []string{frontDoorModeWebPKI, "unknown"} {
+		t.Run(mode, func(t *testing.T) {
+			stubEvidence(t)
+			f := newLBFixture(t, fixtureOpts{})
+			ts := f.newServer(t, bundleSpec{frontDoorMode: mode})
+			ea := newLBAttester(t, ts, measuredRemote(), nil)
+			_, err := ea.Attest(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "front_door_mode") || !strings.Contains(err.Error(), mode) {
+				t.Fatalf("want non-TEE front-door rejection, got %v", err)
+			}
+		})
+	}
+}
+
+func TestAttestLBRejectsFrontDoorModeTranscriptMismatch(t *testing.T) {
+	stubEvidence(t)
+	f := newLBFixture(t, fixtureOpts{})
+	// The response advertises acme, but the evidence and leaf proof were made
+	// with cds. A client must use the advertised mode in its transcript, so it
+	// must reject this downgrade or relay mismatch.
+	ts := f.newServer(t, bundleSpec{
+		frontDoorMode:  frontDoorModeACME,
+		transcriptMode: frontDoorModeCDS,
+	})
+	ea := newLBAttester(t, ts, measuredRemote(), nil)
+	_, err := ea.Attest(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "report_data does not match") {
+		t.Fatalf("want front-door transcript mismatch, got %v", err)
+	}
 }
 
 func TestAttestLBRejectsWrongVersion(t *testing.T) {
