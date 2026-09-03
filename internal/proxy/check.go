@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -43,19 +42,19 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
 		}
-		// Same fail-closed trust replacement as the proxy (newH3Transport): the
-		// mesh-chained serving cert cannot pass WebPKI verification, so the
-		// TLS-layer PKI check is replaced by the attest-lb verification of this
-		// very connection, which binds the exact observed leaf into hardware
-		// evidence and chains it to the committed CA. No application bytes are
-		// sent on this probe.
-		tr := &http.Transport{TLSClientConfig: &tls.Config{
-			ServerName:         serverNameFor(target, r),
-			InsecureSkipVerify: true, // replaced by the attest-lb hardware binding
-		}}
+		// Capture the serving leaf first. The attested front-door mode then
+		// selects mesh-CA trust (cds) or WebPKI trust (acme). No application
+		// bytes are sent on this probe.
+		webPKITLS, err := upstreamTLSConfig(target, r, extraCAs)
+		if err != nil {
+			return CheckResult{config.StatusFailed, err.Error()}
+		}
+		attestTLS := webPKITLS.Clone()
+		attestTLS.InsecureSkipVerify = true // trust is checked after the mode is attested
+		tr := &http.Transport{TLSClientConfig: attestTLS}
 		defer tr.CloseIdleConnections()
 		client := &http.Client{Transport: tr}
-		ea, err := verifier.NewEndpointAttester(origin, client, r, pinnedCAs)
+		ea, err := verifier.NewEndpointAttester(origin, client, r, pinnedCAs, webPKITLS.RootCAs)
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
 		}

@@ -59,11 +59,13 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
   After each new upstream TLS handshake, and before any application bytes flow,
   TEErminator fetches a fresh nonce-bound bundle and verifies, in order: the
   `c8s/attest-lb/v1` binding identifier and nonce echo; the hardware evidence over
-  `report_data = SHA-384(LP(version) || LP(nonce) || LP(SHA-256(serving_leaf_DER)) ||
+  `report_data = SHA-384(LP(version) || LP(front_door_mode) || LP(nonce) || LP(SHA-256(serving_leaf_DER)) ||
   LP(SHA-256(mesh_leaf_DER)) || LP(SHA-256(mesh_CA_DER)))`, recomputed from the **exact
   serving certificate observed on that very connection**; the mesh-leaf key's proof of
-  possession over the same transcript; and that both the committed mesh leaf and the
-  serving leaf chain to the committed mesh CA. The verdict is then **pinned to the exact
+  possession over the same transcript; that the mesh leaf chains to the committed mesh
+  CA; and that the serving leaf follows the attested mode's trust rule. In `cds` mode it
+  chains to the mesh CA. In `acme` mode it passes WebPKI chain and hostname validation.
+  The verdict is then **pinned to the exact
   serving-leaf DER** (not just its key): a substituted certificate — even one reusing the
   attested key — refuses the handshake and forces re-attestation.
 
@@ -71,9 +73,9 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
   - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is
     committed inside the hardware evidence and derived from the response, yielding a
     *deployment-class* verdict ("an expected measured c8s front door under the policy I
-    pinned"). Because of that, upstream TLS trust for this mode is deferred entirely to
-    the attestation (the WebPKI check is replaced by a strictly stronger hardware
-    binding); `certs add` roots are not required to connect.
+    pinned"). In `cds` mode, attestation replaces WebPKI trust. In `acme` mode, WebPKI
+    trust and the hardware binding are both required. `certs add` is not required for a
+    certificate issued by a public CA.
   - **Pinned CA = specific-cluster.** Adding the cluster's mesh CA with `certs add`
     upgrades the verdict to *specific-cluster* when the committed CA byte-equals the pin
     ("that particular cluster, not a genuine clone").
@@ -139,9 +141,10 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
     TDX evidence — never a silently ignored option. All three require
     `--mode attest-lb`: on any other mode nothing would read them.
   - **Requires `public_tls.mode=cds` or `public_tls.mode=acme`.** The serving key must
-    stay inside the TEE and must chain to the mesh CA. A Kubernetes-supplied WebPKI key
-    is host-visible, so attest-lb rejects that mode. It remains usable only through the
-    encrypted `attest-pq` tunnel.
+    stay inside the TEE. A `cds` certificate chains to the mesh CA. An `acme`
+    certificate chains to WebPKI and is also bound into fresh hardware evidence. A
+    Kubernetes-supplied WebPKI key is host-visible, so attest-lb rejects that mode. It
+    remains usable only through the encrypted `attest-pq` tunnel.
 
   Evidence verification is delegated entirely to the shared
   [`attestation-go`](https://github.com/confidential-dot-ai/attestation-go) verifier
@@ -261,4 +264,3 @@ stopping only the affected tunnels — no restart needed. Send `SIGHUP` to reloa
 immediately. A tunnel whose policy or trust store changed is restarted; an edit that
 fails to apply (e.g. a port already taken) is logged and the daemon keeps serving the
 rest.
-
