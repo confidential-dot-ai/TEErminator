@@ -4,7 +4,7 @@
 # Required environment:
 #   TEERMINATOR_ACME_URL          ACME front-door URL (usually an LB IP)
 #   TEERMINATOR_ACME_SERVER_NAME  hostname in the ACME certificate
-#   TEERMINATOR_ACME_MEASUREMENTS accepted launch digest(s), comma-separated
+#   TEERMINATOR_ACME_IMAGE_MANIFEST full TDX MRTD, RTMR1, and RTMR2 manifest
 #   TEERMINATOR_ACME_ALLOWLIST    reviewed canonical allowlist JSON
 #   TEERMINATOR_ACME_WORKLOAD     workload name stamped into the mesh leaf
 #   TEERMINATOR_PROMPT_BODY       JSON body accepted by the production API
@@ -36,7 +36,7 @@ Usage: verify-acme-production.sh
 Set the required TEERMINATOR_ACME_* and TEERMINATOR_PROMPT_BODY environment
 variables first. This command performs five isolated checks against the
 current ACME front door: one expected-success case and four fail-closed cases
-(wrong allowlist bytes, certificate name, measurement, and workload).
+(wrong allowlist bytes, certificate name, full TDX image, and workload).
 EOF
 }
 
@@ -49,7 +49,7 @@ fi
 required_vars=(
   TEERMINATOR_ACME_URL
   TEERMINATOR_ACME_SERVER_NAME
-  TEERMINATOR_ACME_MEASUREMENTS
+  TEERMINATOR_ACME_IMAGE_MANIFEST
   TEERMINATOR_ACME_ALLOWLIST
   TEERMINATOR_ACME_WORKLOAD
   TEERMINATOR_PROMPT_BODY
@@ -59,6 +59,7 @@ for var in "${required_vars[@]}"; do
 done
 
 [[ -f "$TEERMINATOR_ACME_ALLOWLIST" ]] || die "allowlist is not a file: $TEERMINATOR_ACME_ALLOWLIST"
+[[ -f "$TEERMINATOR_ACME_IMAGE_MANIFEST" ]] || die "image manifest is not a file: $TEERMINATOR_ACME_IMAGE_MANIFEST"
 if [[ -n ${TEERMINATOR_TOKEN_FILE:-} ]]; then
   [[ -f "$TEERMINATOR_TOKEN_FILE" ]] || die "token file is not a file: $TEERMINATOR_TOKEN_FILE"
 fi
@@ -123,7 +124,7 @@ run_case() {
   local name=$1
   local expected=$2
   local server_name=$3
-  local measurements=$4
+  local image_manifest=$4
   local workload=$5
   local allowlist=$6
 
@@ -137,7 +138,7 @@ run_case() {
     remote add "$local_addr" "$TEERMINATOR_ACME_URL"
     --mode attest-lb
     --server-name "$server_name"
-    --measurements "$measurements"
+    --image-manifest "$image_manifest"
   )
   if [[ -n $workload ]]; then
     remote_args+=(--workload "$workload")
@@ -184,31 +185,39 @@ run_case() {
   fi
 }
 
-wrong_measurement=0000000000000000000000000000000000000000000000000000000000000000
 wrong_server_name=${TEERMINATOR_WRONG_SERVER_NAME:-wrong.invalid}
 wrong_workload=${TEERMINATOR_WRONG_WORKLOAD:-wrong-workload}
 
 case_number=0
-run_case correct pass "$TEERMINATOR_ACME_SERVER_NAME" "$TEERMINATOR_ACME_MEASUREMENTS" \
+run_case correct pass "$TEERMINATOR_ACME_SERVER_NAME" "$TEERMINATOR_ACME_IMAGE_MANIFEST" \
   "$TEERMINATOR_ACME_WORKLOAD" "$TEERMINATOR_ACME_ALLOWLIST"
 
 case_number=1
 wrong_allowlist="$tmp_dir/wrong-allowlist.json"
 cp -- "$TEERMINATOR_ACME_ALLOWLIST" "$wrong_allowlist"
 printf '\n' >>"$wrong_allowlist"
-run_case wrong-policy block "$TEERMINATOR_ACME_SERVER_NAME" "$TEERMINATOR_ACME_MEASUREMENTS" \
+run_case wrong-policy block "$TEERMINATOR_ACME_SERVER_NAME" "$TEERMINATOR_ACME_IMAGE_MANIFEST" \
   "$TEERMINATOR_ACME_WORKLOAD" "$wrong_allowlist"
 
 case_number=2
-run_case wrong-certificate block "$wrong_server_name" "$TEERMINATOR_ACME_MEASUREMENTS" \
+run_case wrong-certificate block "$wrong_server_name" "$TEERMINATOR_ACME_IMAGE_MANIFEST" \
   "$TEERMINATOR_ACME_WORKLOAD" ""
 
 case_number=3
-run_case wrong-measurement block "$TEERMINATOR_ACME_SERVER_NAME" "$wrong_measurement" \
+wrong_image_manifest="$tmp_dir/wrong-image-manifest.json"
+python3 - "$TEERMINATOR_ACME_IMAGE_MANIFEST" "$wrong_image_manifest" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+target = value.get("tdx", value)
+target["rtmr2"] = ("0" if target["rtmr2"][0] != "0" else "1") + target["rtmr2"][1:]
+with open(sys.argv[2], "w", encoding="utf-8") as output:
+    json.dump(value, output, separators=(",", ":"))
+PY
+run_case wrong-image block "$TEERMINATOR_ACME_SERVER_NAME" "$wrong_image_manifest" \
   "$TEERMINATOR_ACME_WORKLOAD" ""
 
 case_number=4
-run_case wrong-workload block "$TEERMINATOR_ACME_SERVER_NAME" "$TEERMINATOR_ACME_MEASUREMENTS" \
+run_case wrong-workload block "$TEERMINATOR_ACME_SERVER_NAME" "$TEERMINATOR_ACME_IMAGE_MANIFEST" \
   "$wrong_workload" ""
 
 echo "All ACME front-door verification checks passed."
