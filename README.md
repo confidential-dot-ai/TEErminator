@@ -138,9 +138,10 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
     against SNP evidence is a hard error naming the platform, as is `--min-tcb` against
     TDX evidence — never a silently ignored option. All three require
     `--mode attest-lb`: on any other mode nothing would read them.
-  - **Requires `public_tls.mode=cds`.** The serving key must be TEE-held and mesh-chained;
-    a WebPKI front door refuses the endpoint with `400 unsupported_front_door` and can
-    only be used through the encrypted-tunnel `attest-pq` protocol (browser client).
+  - **Requires `public_tls.mode=cds` or `public_tls.mode=acme`.** The serving key must
+    stay inside the TEE and must chain to the mesh CA. A Kubernetes-supplied WebPKI key
+    is host-visible, so attest-lb rejects that mode. It remains usable only through the
+    encrypted `attest-pq` tunnel.
 
   Evidence verification is delegated entirely to the shared
   [`attestation-go`](https://github.com/confidential-dot-ai/attestation-go) verifier
@@ -260,5 +261,4 @@ stopping only the affected tunnels — no restart needed. Send `SIGHUP` to reloa
 immediately. A tunnel whose policy or trust store changed is restarted; an edit that
 fails to apply (e.g. a port already taken) is logged and the daemon keeps serving the
 rest.
-
 
