@@ -112,11 +112,3 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 			fmt.Sprintf("attestation mode %q is not implemented: the proxy blocks all traffic for this remote", r.Mode)}
 	}
 }
-
-// serverNameFor mirrors upstreamTLSConfig's SNI choice without its trust pool.
-func serverNameFor(target *url.URL, r config.Remote) string {
-	if r.ServerName != "" {
-		return r.ServerName
-	}
-	return target.Hostname()
-}
