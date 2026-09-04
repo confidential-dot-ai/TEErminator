@@ -153,7 +153,7 @@ run_case() {
     run_cli "$config_home" remote auth "$local_addr" "$TEERMINATOR_TOKEN_FILE"
   fi
 
-  run_cli "$config_home" status --timeout 30 | tee "$status_file"
+  run_cli "$config_home" status --timeout 30s | tee "$status_file"
   if [[ $expected == pass ]]; then
     grep -F "$local_addr" "$status_file" | grep -Fq "Verified" || die "$name: expected Verified status"
   else
