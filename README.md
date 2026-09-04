@@ -49,6 +49,18 @@ $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
 
 When the remote URL host is a raw IP and `--server-name` is omitted, it defaults to `c8s-tls-lb.c8s-system.svc` (the standard c8s LB SAN) and `remote add` prints a note saying so. Pass `--server-name` explicitly — e.g. the IP itself, for a certificate that does carry an IP SAN — to override the default.
 
+**In `acme` mode, set `--server-name` to the public hostname on the certificate** (e.g. `api.example.com`). A public ACME certificate carries the public domain in its SAN, never the raw-IP default or the internal c8s LB name, so leaving the default in place will always fail the name check.
+
+#### ACME staging
+
+A front door configured against the ACME **staging** directory (sensible while testing issuance) presents certificates that chain to staging roots no operating system trusts. Those roots still have to verify, so add the published staging root once — `certs add` roots are appended to the WebPKI pool used by the acme check, alongside the system roots:
+
+```
+$ ./teerminator certs add letsencrypt-staging-root.pem
+```
+
+The staging root provides chain trust for the acme check only. It is not a mesh-CA pin: the specific-cluster upgrade still requires the cluster's actual mesh CA.
+
 ### Attestation modes
 
 `--mode` selects how each remote is verified:

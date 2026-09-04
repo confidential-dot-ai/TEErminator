@@ -88,9 +88,14 @@ func attemptAllowlistFetch(ctx context.Context, r config.Remote, extraCAs []conf
 	if err != nil {
 		return nil, err
 	}
-	// Capture the serving leaf first. The attested front-door mode then selects
-	// mesh-CA trust (cds) or WebPKI trust (acme) before any application data is
-	// sent.
+	// Capture the serving leaf first. In cds mode the serving leaf must chain
+	// to the committed mesh CA. In acme mode WebPKI verification proves only
+	// the certificate's name and issuance — it does not by itself prove the
+	// serving key is TEE-held. That proof comes from the hardware evidence:
+	// the exact serving-leaf DER is bound into report_data, the front-door
+	// mode is part of the attested transcript, and host-visible `webpki`
+	// secrets are rejected there. No application data is sent before the
+	// verdict.
 	webPKITLS, err := upstreamTLSConfig(target, r, extraCAs)
 	if err != nil {
 		return nil, err

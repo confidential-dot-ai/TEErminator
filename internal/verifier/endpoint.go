@@ -819,7 +819,9 @@ func verifyWebPKIChain(leaf *x509.Certificate, peers []*x509.Certificate, server
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	})
 	if err != nil {
-		return fmt.Errorf("WebPKI verification for %q failed: %w", serverName, err)
+		return fmt.Errorf(
+			"WebPKI verification for %q failed: %w (hint: in acme mode, set --server-name to the public hostname on the certificate; for a staging or private ACME directory, add its root certificate with `certs add`)",
+			serverName, err)
 	}
 	return nil
 }

@@ -42,9 +42,13 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
 		}
-		// Capture the serving leaf first. The attested front-door mode then
-		// selects mesh-CA trust (cds) or WebPKI trust (acme). No application
-		// bytes are sent on this probe.
+		// Capture the serving leaf first. In cds mode the serving leaf must chain
+		// to the committed mesh CA. In acme mode WebPKI verification proves only
+		// the certificate's name and issuance — the TEE proof comes from the
+		// hardware evidence, which binds the exact serving leaf and the
+		// front-door mode into the attested transcript (host-visible `webpki`
+		// secrets are rejected there). No application bytes are sent on this
+		// probe.
 		webPKITLS, err := upstreamTLSConfig(target, r, extraCAs)
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
