@@ -412,7 +412,7 @@ func newLBAttester(t *testing.T, ts *httptest.Server, remote config.Remote, pinn
 	client := &http.Client{
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 	}
-	ea, err := NewEndpointAttester(ts.URL, client, remote, pinnedCAs)
+	ea, err := NewEndpointAttester(ts.URL, client, remote, pinnedCAs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +450,7 @@ func TestAttestLBRequestShape(t *testing.T) {
 	client := &http.Client{
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 	}
-	ea, err := NewEndpointAttester(ts.URL+"/api/v1?pq=false&binding=c8s-verify/v1", client, measuredRemote(), nil)
+	ea, err := NewEndpointAttester(ts.URL+"/api/v1?pq=false&binding=c8s-verify/v1", client, measuredRemote(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,11 +536,58 @@ func TestAttestLBHappyPath(t *testing.T) {
 
 func TestAttestLBAcmeFrontDoor(t *testing.T) {
 	stubEvidence(t)
-	f := newLBFixture(t, fixtureOpts{})
+	webPKICA := mintCA(t, "webpki-root")
+	f := newLBFixture(t, fixtureOpts{servingCA: webPKICA})
 	ts := f.newServer(t, bundleSpec{frontDoorMode: frontDoorModeACME})
-	ea := newLBAttester(t, ts, measuredRemote(), nil)
+	remote := measuredRemote()
+	remote.ServerName = "serving-leaf"
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	roots := x509.NewCertPool()
+	roots.AddCert(webPKICA.cert)
+	ea, err := NewEndpointAttester(ts.URL, client, remote, nil, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := ea.Attest(context.Background()); err != nil {
 		t.Fatalf("acme front door: %v", err)
+	}
+}
+
+func TestAttestLBAcmeRejectsUntrustedServingCertificate(t *testing.T) {
+	stubEvidence(t)
+	webPKICA := mintCA(t, "webpki-root")
+	f := newLBFixture(t, fixtureOpts{servingCA: webPKICA})
+	ts := f.newServer(t, bundleSpec{frontDoorMode: frontDoorModeACME})
+	remote := measuredRemote()
+	remote.ServerName = "serving-leaf"
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	wrongRoots := x509.NewCertPool()
+	wrongRoots.AddCert(mintCA(t, "wrong-root").cert)
+	ea, err := NewEndpointAttester(ts.URL, client, remote, nil, wrongRoots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ea.Attest(context.Background()); err == nil || !strings.Contains(err.Error(), "WebPKI verification") {
+		t.Fatalf("want WebPKI rejection, got %v", err)
+	}
+}
+
+func TestAttestLBAcmeRejectsWrongServerName(t *testing.T) {
+	stubEvidence(t)
+	webPKICA := mintCA(t, "webpki-root")
+	f := newLBFixture(t, fixtureOpts{servingCA: webPKICA})
+	ts := f.newServer(t, bundleSpec{frontDoorMode: frontDoorModeACME})
+	remote := measuredRemote()
+	remote.ServerName = "wrong.example"
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	roots := x509.NewCertPool()
+	roots.AddCert(webPKICA.cert)
+	ea, err := NewEndpointAttester(ts.URL, client, remote, nil, roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ea.Attest(context.Background()); err == nil || !strings.Contains(err.Error(), "wrong.example") {
+		t.Fatalf("want hostname rejection, got %v", err)
 	}
 }
 
@@ -1339,7 +1386,7 @@ func TestAttestLBDoesNotFollowRedirects(t *testing.T) {
 	t.Cleanup(redirector.Close)
 
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	ea, err := NewEndpointAttester(redirector.URL, client, measuredRemote(), nil)
+	ea, err := NewEndpointAttester(redirector.URL, client, measuredRemote(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1357,7 +1404,7 @@ func TestAttestLBNon200(t *testing.T) {
 	}))
 	t.Cleanup(ts.Close)
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	ea, err := NewEndpointAttester(ts.URL, client, measuredRemote(), nil)
+	ea, err := NewEndpointAttester(ts.URL, client, measuredRemote(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -41,9 +41,10 @@ var ErrNotImplemented = errors.New("attestation flow not implemented")
 // leaf DER observed on this very connection, and the LB's mesh leaf and issuing
 // mesh CA into report_data, and the mesh leaf key proves possession over the
 // same transcript. The mesh CA is thereby DERIVED from the hardware-committed
-// response — no out-of-band CA file is required — and both the mesh leaf and
-// the serving leaf must chain to it, so the serving key is TEE-held
-// (public_tls.mode=cds or acme; a WebPKI-secret front door refuses the endpoint).
+// response — no out-of-band CA file is required. In cds mode, the serving leaf
+// chains to that mesh CA. In acme mode, the serving leaf must pass WebPKI name
+// and chain validation. In both modes, fresh hardware evidence binds the exact
+// serving certificate observed on the connection.
 
 // wellKnownAttestLB is the LB's ordinary-TLS attestation endpoint. It lives at
 // the LB origin, independent of the remote's forwarding path.
@@ -185,10 +186,11 @@ type attestationBundle struct {
 // hardware-committed response either way — and only upgrade the verdict to
 // specific-cluster when one of them byte-equals the committed CA.
 type EndpointAttester struct {
-	client    *http.Client
-	attestURL *url.URL
-	remote    config.Remote
-	pinnedCAs []*x509.Certificate
+	client      *http.Client
+	attestURL   *url.URL
+	remote      config.Remote
+	pinnedCAs   []*x509.Certificate
+	webPKIRoots *x509.CertPool
 
 	// mu guards sealedCA, the memoised verification of the committed mesh
 	// CA's embedded evidence under --static-allowlist.
@@ -197,7 +199,7 @@ type EndpointAttester struct {
 }
 
 // NewEndpointAttester builds an endpoint attester.
-func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remote, pinnedCAs []*x509.Certificate) (*EndpointAttester, error) {
+func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remote, pinnedCAs []*x509.Certificate, webPKIRoots *x509.CertPool) (*EndpointAttester, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb: parse base URL: %w", err)
@@ -214,10 +216,11 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 	c := *client
 	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &EndpointAttester{
-		client:    &c,
-		attestURL: u,
-		remote:    remote,
-		pinnedCAs: pinnedCAs,
+		client:      &c,
+		attestURL:   u,
+		remote:      remote,
+		pinnedCAs:   pinnedCAs,
+		webPKIRoots: webPKIRoots,
 	}, nil
 }
 
@@ -226,7 +229,7 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 // leaf capture, bundle shape (version, nonce echo), served chain parsing and
 // committed-CA selection, identity-proof field equality, hardware evidence over
 // the recomputed transcript, proof of possession, mesh-leaf chain, serving-leaf
-// chain, measurement policy, workload policy, sealed policy.
+// trust, measurement policy, workload policy, sealed policy.
 func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) {
 	// Platform pins are resolved before any network round trip: a malformed
 	// image manifest, RTMR[3] pin, or TCB floor is a configuration error. The
@@ -336,14 +339,28 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 		return nil, fmt.Errorf("attest-lb: %w", err)
 	}
 
-	// (g)+(h) Both the committed mesh identity and the serving leaf must chain
-	// to the committed CA — the latter is what makes the serving key TEE-held.
+	// (g) The committed mesh identity must chain to the committed mesh CA.
 	now := time.Now()
 	if err := verifyDirectChain(meshLeaf, committedCA, now); err != nil {
 		return nil, fmt.Errorf("attest-lb: mesh leaf: %w", err)
 	}
-	if err := verifyDirectChain(servingLeaf, committedCA, now); err != nil {
-		return nil, fmt.Errorf("attest-lb: serving leaf: %w", err)
+
+	// (h) The serving-certificate trust rule depends on the front-door mode.
+	// A cds leaf is issued by the mesh CA. An ACME leaf is issued by WebPKI,
+	// while the fresh hardware evidence above binds its exact DER to this session.
+	switch bundle.FrontDoorMode {
+	case frontDoorModeCDS:
+		if err := verifyDirectChain(servingLeaf, committedCA, now); err != nil {
+			return nil, fmt.Errorf("attest-lb: serving leaf: %w", err)
+		}
+	case frontDoorModeACME:
+		serverName := e.remote.ServerName
+		if serverName == "" {
+			serverName = e.attestURL.Hostname()
+		}
+		if err := verifyWebPKIChain(servingLeaf, resp.TLS.PeerCertificates[1:], serverName, e.webPKIRoots, now); err != nil {
+			return nil, fmt.Errorf("attest-lb: ACME serving leaf: %w", err)
+		}
 	}
 
 	// (i) Measurement policy. Without an image manifest the launch-digest
@@ -782,6 +799,29 @@ func verifyDirectChain(cert, ca *x509.Certificate, now time.Time) error {
 	}
 	if err := checkValidity(ca, now); err != nil {
 		return fmt.Errorf("committed mesh CA: %w", err)
+	}
+	return nil
+}
+
+// verifyWebPKIChain verifies an ACME serving certificate after hardware
+// evidence identifies the front-door mode. No application data is sent before
+// this check. A nil roots pool selects the operating system trust store.
+func verifyWebPKIChain(leaf *x509.Certificate, peers []*x509.Certificate, serverName string, roots *x509.CertPool, now time.Time) error {
+	intermediates := x509.NewCertPool()
+	for _, cert := range peers {
+		intermediates.AddCert(cert)
+	}
+	_, err := leaf.Verify(x509.VerifyOptions{
+		DNSName:       serverName,
+		Roots:         roots,
+		Intermediates: intermediates,
+		CurrentTime:   now,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	if err != nil {
+		return fmt.Errorf(
+			"WebPKI verification for %q failed: %w (hint: in acme mode, set --server-name to the public hostname on the certificate; for a staging or private ACME directory, add its root certificate with `certs add`)",
+			serverName, err)
 	}
 	return nil
 }

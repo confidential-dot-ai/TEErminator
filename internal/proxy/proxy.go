@@ -272,20 +272,17 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 		remoteKey = verifier.RemoteKey(target.Host, opts.Remote, allowlistDigest, imageManifestDigest, pinnedCAs)
 		cache = verifier.NewSessionCache(opts.ReattestInterval)
 
-		// attest-lb TLS trust: the front door's serving leaf chains to the
-		// cluster's mesh CA, which the client DERIVES from the attest-lb
-		// response rather than pinning out of band — so Go's PKI chain
-		// verification cannot succeed here without a `certs add` pin. Instead
-		// of the WebPKI check, trust is deferred entirely to attest-lb
-		// verification, which is strictly stronger: the exact
-		// serving-leaf DER observed on the connection is bound into fresh
-		// hardware evidence and must chain to the hardware-committed CA, and no
-		// application bytes flow before that verdict (roundTripEndpoint).
+		// The first handshake captures the serving leaf before its attested mode
+		// is known. No application bytes flow before verification. The verifier
+		// then requires a mesh-CA chain in cds mode, or WebPKI name and chain
+		// validation in acme mode, and binds the exact serving-leaf DER into
+		// fresh hardware evidence (roundTripEndpoint).
 		// Forwarding handshakes additionally carry the decided leaf pin
 		// (transportFor). WebPKI/system-pool verification stays in force for
 		// every mode not gated by an attest-lb verdict.
 		attestTLS := &tls.Config{
 			ServerName:         tlsCfg.ServerName,
+			RootCAs:            tlsCfg.RootCAs,
 			InsecureSkipVerify: true, // replaced by the attest-lb hardware binding above
 		}
 		fallbackTLS = attestTLS.Clone()
@@ -298,7 +295,7 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 			Timeout:   30 * time.Second,
 		}
 		baseURL := target.Scheme + "://" + target.Host
-		ea, err = verifier.NewEndpointAttester(baseURL, attestClient, opts.Remote, pinnedCAs)
+		ea, err = verifier.NewEndpointAttester(baseURL, attestClient, opts.Remote, pinnedCAs, tlsCfg.RootCAs)
 		if err != nil {
 			return nil, err
 		}

@@ -49,6 +49,18 @@ $ ./teerminator remote add 127.0.0.1:8080 https://<LB-IP>/ \
 
 When the remote URL host is a raw IP and `--server-name` is omitted, it defaults to `c8s-tls-lb.c8s-system.svc` (the standard c8s LB SAN) and `remote add` prints a note saying so. Pass `--server-name` explicitly — e.g. the IP itself, for a certificate that does carry an IP SAN — to override the default.
 
+**In `acme` mode, set `--server-name` to the public hostname on the certificate** (e.g. `api.example.com`). A public ACME certificate carries the public domain in its SAN, never the raw-IP default or the internal c8s LB name, so leaving the default in place will always fail the name check.
+
+#### ACME staging
+
+A front door configured against the ACME **staging** directory (sensible while testing issuance) presents certificates that chain to staging roots no operating system trusts. Those roots still have to verify, so add the published staging root once — `certs add` roots are appended to the WebPKI pool used by the acme check, alongside the system roots:
+
+```
+$ ./teerminator certs add letsencrypt-staging-root.pem
+```
+
+The staging root provides chain trust for the acme check only. It is not a mesh-CA pin: the specific-cluster upgrade still requires the cluster's actual mesh CA.
+
 ### Attestation modes
 
 `--mode` selects how each remote is verified:
@@ -59,11 +71,13 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
   After each new upstream TLS handshake, and before any application bytes flow,
   TEErminator fetches a fresh nonce-bound bundle and verifies, in order: the
   `c8s/attest-lb/v1` binding identifier and nonce echo; the hardware evidence over
-  `report_data = SHA-384(LP(version) || LP(nonce) || LP(SHA-256(serving_leaf_DER)) ||
+  `report_data = SHA-384(LP(version) || LP(front_door_mode) || LP(nonce) || LP(SHA-256(serving_leaf_DER)) ||
   LP(SHA-256(mesh_leaf_DER)) || LP(SHA-256(mesh_CA_DER)))`, recomputed from the **exact
   serving certificate observed on that very connection**; the mesh-leaf key's proof of
-  possession over the same transcript; and that both the committed mesh leaf and the
-  serving leaf chain to the committed mesh CA. The verdict is then **pinned to the exact
+  possession over the same transcript; that the mesh leaf chains to the committed mesh
+  CA; and that the serving leaf follows the attested mode's trust rule. In `cds` mode it
+  chains to the mesh CA. In `acme` mode it passes WebPKI chain and hostname validation.
+  The verdict is then **pinned to the exact
   serving-leaf DER** (not just its key): a substituted certificate — even one reusing the
   attested key — refuses the handshake and forces re-attestation.
 
@@ -71,9 +85,9 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
   - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is
     committed inside the hardware evidence and derived from the response, yielding a
     *deployment-class* verdict ("an expected measured c8s front door under the policy I
-    pinned"). Because of that, upstream TLS trust for this mode is deferred entirely to
-    the attestation (the WebPKI check is replaced by a strictly stronger hardware
-    binding); `certs add` roots are not required to connect.
+    pinned"). In `cds` mode, attestation replaces WebPKI trust. In `acme` mode, WebPKI
+    trust and the hardware binding are both required. `certs add` is not required for a
+    certificate issued by a public CA.
   - **Pinned CA = specific-cluster.** Adding the cluster's mesh CA with `certs add`
     upgrades the verdict to *specific-cluster* when the committed CA byte-equals the pin
     ("that particular cluster, not a genuine clone").
@@ -139,9 +153,10 @@ When the remote URL host is a raw IP and `--server-name` is omitted, it defaults
     TDX evidence — never a silently ignored option. All three require
     `--mode attest-lb`: on any other mode nothing would read them.
   - **Requires `public_tls.mode=cds` or `public_tls.mode=acme`.** The serving key must
-    stay inside the TEE and must chain to the mesh CA. A Kubernetes-supplied WebPKI key
-    is host-visible, so attest-lb rejects that mode. It remains usable only through the
-    encrypted `attest-pq` tunnel.
+    stay inside the TEE. A `cds` certificate chains to the mesh CA. An `acme`
+    certificate chains to WebPKI and is also bound into fresh hardware evidence. A
+    Kubernetes-supplied WebPKI key is host-visible, so attest-lb rejects that mode. It
+    remains usable only through the encrypted `attest-pq` tunnel.
 
   Evidence verification is delegated entirely to the shared
   [`attestation-go`](https://github.com/confidential-dot-ai/attestation-go) verifier
@@ -261,4 +276,3 @@ stopping only the affected tunnels — no restart needed. Send `SIGHUP` to reloa
 immediately. A tunnel whose policy or trust store changed is restarted; an edit that
 fails to apply (e.g. a port already taken) is logged and the daemon keeps serving the
 rest.
-

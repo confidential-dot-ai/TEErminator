@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -43,19 +42,23 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
 		}
-		// Same fail-closed trust replacement as the proxy (newH3Transport): the
-		// mesh-chained serving cert cannot pass WebPKI verification, so the
-		// TLS-layer PKI check is replaced by the attest-lb verification of this
-		// very connection, which binds the exact observed leaf into hardware
-		// evidence and chains it to the committed CA. No application bytes are
-		// sent on this probe.
-		tr := &http.Transport{TLSClientConfig: &tls.Config{
-			ServerName:         serverNameFor(target, r),
-			InsecureSkipVerify: true, // replaced by the attest-lb hardware binding
-		}}
+		// Capture the serving leaf first. In cds mode the serving leaf must chain
+		// to the committed mesh CA. In acme mode WebPKI verification proves only
+		// the certificate's name and issuance — the TEE proof comes from the
+		// hardware evidence, which binds the exact serving leaf and the
+		// front-door mode into the attested transcript (host-visible `webpki`
+		// secrets are rejected there). No application bytes are sent on this
+		// probe.
+		webPKITLS, err := upstreamTLSConfig(target, r, extraCAs)
+		if err != nil {
+			return CheckResult{config.StatusFailed, err.Error()}
+		}
+		attestTLS := webPKITLS.Clone()
+		attestTLS.InsecureSkipVerify = true // trust is checked after the mode is attested
+		tr := &http.Transport{TLSClientConfig: attestTLS}
 		defer tr.CloseIdleConnections()
 		client := &http.Client{Transport: tr}
-		ea, err := verifier.NewEndpointAttester(origin, client, r, pinnedCAs)
+		ea, err := verifier.NewEndpointAttester(origin, client, r, pinnedCAs, webPKITLS.RootCAs)
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
 		}
@@ -112,12 +115,4 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		return CheckResult{config.StatusFailed,
 			fmt.Sprintf("attestation mode %q is not implemented: the proxy blocks all traffic for this remote", r.Mode)}
 	}
-}
-
-// serverNameFor mirrors upstreamTLSConfig's SNI choice without its trust pool.
-func serverNameFor(target *url.URL, r config.Remote) string {
-	if r.ServerName != "" {
-		return r.ServerName
-	}
-	return target.Hostname()
 }

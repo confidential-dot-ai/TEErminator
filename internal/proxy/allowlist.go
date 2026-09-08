@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -89,18 +88,24 @@ func attemptAllowlistFetch(ctx context.Context, r config.Remote, extraCAs []conf
 	if err != nil {
 		return nil, err
 	}
-	// Same fail-closed trust replacement as the proxy and `status`: the
-	// mesh-chained serving cert cannot pass WebPKI verification, so the
-	// TLS-layer PKI check is replaced by the attest-lb verification of this
-	// very connection.
-	attestTLS := &tls.Config{
-		ServerName:         serverNameFor(target, r),
-		InsecureSkipVerify: true, // replaced by the attest-lb hardware binding
+	// Capture the serving leaf first. In cds mode the serving leaf must chain
+	// to the committed mesh CA. In acme mode WebPKI verification proves only
+	// the certificate's name and issuance — it does not by itself prove the
+	// serving key is TEE-held. That proof comes from the hardware evidence:
+	// the exact serving-leaf DER is bound into report_data, the front-door
+	// mode is part of the attested transcript, and host-visible `webpki`
+	// secrets are rejected there. No application data is sent before the
+	// verdict.
+	webPKITLS, err := upstreamTLSConfig(target, r, extraCAs)
+	if err != nil {
+		return nil, err
 	}
+	attestTLS := webPKITLS.Clone()
+	attestTLS.InsecureSkipVerify = true // trust is checked after the mode is attested
 	attestTr := &http.Transport{TLSClientConfig: attestTLS}
 	defer attestTr.CloseIdleConnections()
 
-	ea, err := verifier.NewEndpointAttester(origin, &http.Client{Transport: attestTr}, r, pinnedCAs)
+	ea, err := verifier.NewEndpointAttester(origin, &http.Client{Transport: attestTr}, r, pinnedCAs, webPKITLS.RootCAs)
 	if err != nil {
 		return nil, err
 	}
