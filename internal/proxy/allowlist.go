@@ -163,6 +163,8 @@ func FetchBoundPolicies(ctx context.Context, r config.Remote, extraCAs []config.
 	if err != nil {
 		return nil, nil, err
 	}
+	// As in attemptAllowlistFetch: the attest-lb verification binds the
+	// observed serving leaf, and the fetch below is pinned to that leaf.
 	attestTLS := webPKITLS.Clone()
 	attestTLS.InsecureSkipVerify = true // trust is checked after the mode is attested
 	attestTr := &http.Transport{TLSClientConfig: attestTLS}
@@ -188,6 +190,9 @@ func FetchBoundPolicies(ctx context.Context, r config.Remote, extraCAs []config.
 
 	policies := make(map[string][]byte, len(v.AllowlistBound))
 	for _, digest := range v.AllowlistBound {
+		if _, seen := policies[digest]; seen {
+			continue
+		}
 		raw, err := verifier.FetchPolicyObject(ctx, client, origin, digest)
 		if err != nil {
 			return nil, nil, err

@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -931,8 +932,17 @@ func verifyRolloutState(s *cdsState, ca *x509.Certificate, nonce []byte) (*rollo
 	if st.Nonce != hex.EncodeToString(nonce) {
 		return nil, fmt.Errorf("rollout state answers another nonce")
 	}
+	for _, d := range st.Bound {
+		if !policyDigestRE.MatchString(d) {
+			return nil, fmt.Errorf("rollout state: bound digest %q is not sha256:<64 lowercase hex>", d)
+		}
+	}
 	return &st, nil
 }
+
+// policyDigestRE is the only digest shape a bound may carry; it is used in
+// URLs and file names.
+var policyDigestRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 // checkPinnedPolicies requires every policy that may run to be pinned, and a
 // lease that fences open connections before a new policy is enforced. No

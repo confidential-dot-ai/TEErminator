@@ -149,7 +149,12 @@ func fetchBound(ctx context.Context, cfg *config.Config, r *config.Remote, dir s
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", dir, err)
 	}
+	written := map[string]bool{}
 	for _, digest := range v.AllowlistBound {
+		if written[digest] {
+			continue
+		}
+		written[digest] = true
 		path := filepath.Join(dir, strings.TrimPrefix(digest, "sha256:")+".json")
 		if err := writeAllowlistFile(path, policies[digest]); err != nil {
 			return err

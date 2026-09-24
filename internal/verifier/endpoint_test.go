@@ -1493,6 +1493,7 @@ func TestAttestLBRolloutState(t *testing.T) {
 		{"no lease", signedState(t, f.ca.key, 0, p), withPins(p), "without an activation lease"},
 		{"not signed by the mesh CA", signedState(t, mintCA(t, "other").key, 30, p), measuredRemote(), "signature does not verify"},
 		{"pins without state", nil, withPins(p), "need the CDS rollout state"},
+		{"malformed bound digest", signedState(t, f.ca.key, 30, "sha256:../../etc"), measuredRemote(), "not sha256:<64 lowercase hex>"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ts := f.newServer(t, bundleSpec{state: tc.state})
