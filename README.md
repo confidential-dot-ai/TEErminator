@@ -268,6 +268,30 @@ removes exactly one certificate: a selector matching several — e.g. the shared
 `c8s Mesh CA` name with more than one mesh CA stored — removes nothing and lists the
 matching fingerprints to pick from.
 
+### Pinning the rollout bound
+
+A c8s router with `router.attest.pinnedAllowlist` adds a `cds_state` to every attest-lb
+bundle: CDS's rollout state, bound to your nonce, signed by the mesh CA, and committed into
+the transcript. Its `bound` lists every allowlist policy (`sha256:<hex>`) that may be
+running. TEErminator verifies it on every attestation and reports the bound in `status`.
+
+You choose how to trust it:
+
+- **Follow the deployment.** Without pins the bound is verified and reported, not limited.
+- **Pin reviewed policies.** With `remote add --pin-policy sha256:<hex>` (repeatable),
+  attestation fails once the bound holds a policy you have not pinned, or when CDS runs
+  without an activation lease. The error names the digest to review.
+
+To review and pin the current bound, fetch every policy in it over the attested
+connection. Each is written only when it hashes to its attested digest:
+
+```
+$ ./teerminator allowlist fetch 127.0.0.1:8080 --bound-dir ./policies --pin
+```
+
+When a router fences a connection opened before the bound widened, it answers 503. The
+proxy then drops that connection and re-attests on the next request.
+
 ### Live config reload
 
 The running daemon watches the config file: a `remote add`/`remote rm` or `certs add`/

@@ -92,6 +92,10 @@ type Remote struct {
 	// reserialized) against the stamp's digest, and the stamped name must be a
 	// key of its workloads map.
 	AllowlistPath string `json:"allowlist_path,omitempty"`
+	// PinnedPolicies are the reviewed policy digests (sha256:<hex>) a c8s
+	// router's attested rollout bound must stay within (attest-lb). Empty
+	// follows the deployment: the bound is verified and reported, not limited.
+	PinnedPolicies []string `json:"pinned_policies,omitempty"`
 	// ImageManifestPath points at a TDX image-pin manifest (JSON object with
 	// mrtd, rtmr1, rtmr2, each 96 lowercase hex chars). All three registers are
 	// compared byte-exactly against the verified claims — the launch digest

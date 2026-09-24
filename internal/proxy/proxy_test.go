@@ -880,3 +880,24 @@ func TestHandshakePinBlocksBeforeSend(t *testing.T) {
 		t.Fatalf("matching pin: backend hits = %d, want 1", got)
 	}
 }
+
+func TestIsFenceRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"fence", http.StatusServiceUnavailable, "the allowlist bound changed: open a new connection and attest again\n", true},
+		{"other 503", http.StatusServiceUnavailable, "backend overloaded", false},
+		{"fence text on 200", http.StatusOK, "the allowlist bound changed", false},
+	} {
+		resp := &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}
+		if got := isFenceRefusal(resp); got != tc.want {
+			t.Errorf("%s: isFenceRefusal = %v, want %v", tc.name, got, tc.want)
+		}
+		if body, _ := io.ReadAll(resp.Body); string(body) != tc.body {
+			t.Errorf("%s: body after peek = %q, want %q", tc.name, body, tc.body)
+		}
+	}
+}

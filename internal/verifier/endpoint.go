@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -144,6 +145,10 @@ type SessionVerdict struct {
 	// SealedCALaunch is the launch digest of the sealed CA's verified evidence,
 	// set alongside StaticAllowlistDigest.
 	SealedCALaunch string
+	// AllowlistBound lists the policy digests (sha256:<hex>) the attested CDS
+	// rollout state says may be running. The transcript commits the state, and
+	// the committed mesh CA signs it. Empty when the router serves no state.
+	AllowlistBound []string
 	// Warning is a policy gap in an otherwise passing verdict — the MRTD-only
 	// note for specific-cluster TDX remotes without an image pin, or a seal
 	// that is verified but pinned to no reviewed document.
@@ -176,6 +181,21 @@ type attestationBundle struct {
 	CDSCertPEM    string          `json:"cds_cert_pem"`
 	FrontDoorMode string          `json:"front_door_mode"`
 	IdentityProof identityProof   `json:"identity_proof"`
+	CDSState      *cdsState       `json:"cds_state,omitempty"`
+}
+
+// cdsState is a pinned-allowlist router's CDS rollout state: the exact state
+// JSON bytes and an ASN.1 ECDSA signature over their SHA-384 by the mesh CA.
+type cdsState struct {
+	State     []byte `json:"state"`
+	Signature []byte `json:"signature"`
+}
+
+// rolloutState holds the rollout-state fields this client checks.
+type rolloutState struct {
+	Bound []string `json:"bound"`
+	Lease int64    `json:"lease_seconds"`
+	Nonce string   `json:"nonce"`
 }
 
 // EndpointAttester implements the attest-lb mode. baseURL is the LB origin
@@ -320,7 +340,12 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	// mesh identity, and our nonce, and require the hardware evidence to bind
 	// exactly it. A bundle relayed through any other serving leaf fails here
 	// even when both leaves share an issuer.
-	reportData := attestLBReportData(bundle.FrontDoorMode, nonce, servingLeaf.Raw, meshLeaf.Raw, committedCA.Raw)
+	var stateDigest []byte
+	if bundle.CDSState != nil {
+		sum := sha512.Sum384(bundle.CDSState.State)
+		stateDigest = sum[:]
+	}
+	reportData := attestLBReportData(bundle.FrontDoorMode, nonce, servingLeaf.Raw, meshLeaf.Raw, committedCA.Raw, stateDigest)
 	res, err := verifyEvidence(bundle, reportData[:], pins.minTCB)
 	if err != nil {
 		return nil, err
@@ -408,6 +433,22 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 		}
 		v.WorkloadName = stamp.Name
 		v.AllowlistVersion = stamp.AllowlistVersion
+	}
+
+	// (j') Rollout state: committed by the transcript, signed by the committed
+	// mesh CA, and answering this nonce. With pinned policies, every policy
+	// that may run must be pinned.
+	if bundle.CDSState != nil {
+		st, err := verifyRolloutState(bundle.CDSState, committedCA, nonce)
+		if err != nil {
+			return nil, fmt.Errorf("attest-lb: %w", err)
+		}
+		v.AllowlistBound = st.Bound
+		if err := checkPinnedPolicies(st, e.remote.PinnedPolicies); err != nil {
+			return nil, fmt.Errorf("attest-lb: %w", err)
+		}
+	} else if len(e.remote.PinnedPolicies) > 0 {
+		return nil, fmt.Errorf("attest-lb: pinned policies need the CDS rollout state, which this router does not serve (c8s router.attest.pinnedAllowlist)")
 	}
 
 	// (k) Sealed policy, only when pinned: the committed CA — whose DER the
@@ -683,12 +724,13 @@ func isTEEFrontDoorMode(mode string) bool {
 //
 //	report_data = SHA-384( LP("c8s/attest-lb/v1") || LP(front_door_mode) || LP(nonce) ||
 //	    LP(SHA-256(serving_leaf_DER)) || LP(SHA-256(mesh_leaf_DER)) ||
-//	    LP(SHA-256(mesh_CA_DER)) )
+//	    LP(SHA-256(mesh_CA_DER)) || LP(state_digest) )
 //
-// where LP(x) = uint32-big-endian(len(x)) || x. The serving-leaf hash covers
+// where LP(x) = uint32-big-endian(len(x)) || x and state_digest is SHA-384 of
+// the bundle's exact cds_state bytes, empty without one. The serving-leaf hash covers
 // the FULL certificate DER, not the SPKI, so a substituted certificate with the
 // same key still fails.
-func attestLBReportData(frontDoorMode string, nonce, servingLeafDER, meshLeafDER, meshCADER []byte) [48]byte {
+func attestLBReportData(frontDoorMode string, nonce, servingLeafDER, meshLeafDER, meshCADER, stateDigest []byte) [48]byte {
 	h := sha512.New384()
 	lp := func(b []byte) {
 		var n [4]byte
@@ -705,6 +747,7 @@ func attestLBReportData(frontDoorMode string, nonce, servingLeafDER, meshLeafDER
 	lp(meshSum[:])
 	caSum := sha256.Sum256(meshCADER)
 	lp(caSum[:])
+	lp(stateDigest)
 	var out [48]byte
 	h.Sum(out[:0])
 	return out
@@ -865,6 +908,45 @@ func (e *EndpointAttester) checkWorkloadPolicy(stamp *MatchedWorkload) error {
 					e.remote.AllowlistPath, mismatch.stampedHex(), mismatch.servedHex())
 			}
 			return fmt.Errorf("workload policy: %w", err)
+		}
+	}
+	return nil
+}
+
+// verifyRolloutState checks that ca's key signed the state and that it
+// answers nonce.
+func verifyRolloutState(s *cdsState, ca *x509.Certificate, nonce []byte) (*rolloutState, error) {
+	key, ok := ca.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("rollout state: mesh CA key is %T, not ECDSA", ca.PublicKey)
+	}
+	sum := sha512.Sum384(s.State)
+	if !ecdsa.VerifyASN1(key, sum[:], s.Signature) {
+		return nil, fmt.Errorf("rollout state: signature does not verify against the committed mesh CA")
+	}
+	var st rolloutState
+	if err := json.Unmarshal(s.State, &st); err != nil {
+		return nil, fmt.Errorf("rollout state: %w", err)
+	}
+	if st.Nonce != hex.EncodeToString(nonce) {
+		return nil, fmt.Errorf("rollout state answers another nonce")
+	}
+	return &st, nil
+}
+
+// checkPinnedPolicies requires every policy that may run to be pinned, and a
+// lease that fences open connections before a new policy is enforced. No
+// pins means the caller follows the deployment and only reports the bound.
+func checkPinnedPolicies(st *rolloutState, pins []string) error {
+	if len(pins) == 0 {
+		return nil
+	}
+	if st.Lease <= 0 {
+		return fmt.Errorf("pinned policies: CDS enforces allowlist writes without an activation lease, so open connections are not fenced")
+	}
+	for _, d := range st.Bound {
+		if !slices.Contains(pins, d) {
+			return fmt.Errorf("pinned policies: policy %s may be running and is not pinned; review it at /.well-known/c8s/objects/sha256/%s", d, strings.TrimPrefix(d, "sha256:"))
 		}
 	}
 	return nil

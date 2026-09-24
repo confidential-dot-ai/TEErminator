@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -49,6 +50,18 @@ func newRemoteCmd(name string) *cobra.Command {
 	remoteCmd.AddCommand(newRemoteRmCmd())
 	remoteCmd.AddCommand(newRemoteLsCmd())
 	return remoteCmd
+}
+
+var policyDigestRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// validatePolicyDigests checks --pin-policy values are sha256:<64 lowercase hex>.
+func validatePolicyDigests(digests []string) error {
+	for _, d := range digests {
+		if !policyDigestRE.MatchString(d) {
+			return fmt.Errorf("--pin-policy %q: want sha256:<64 lowercase hex>", d)
+		}
+	}
+	return nil
 }
 
 // validateWorkloadFlags checks the --workload/--allowlist pins at add time:
@@ -193,6 +206,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 		minTCB          string
 		staticAllowlist bool
 		initData        string
+		pinPolicies     []string
 	)
 
 	cmd := &cobra.Command{
@@ -226,6 +240,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 
 			allowlistStored, err := validateWorkloadFlags(workload, allowlistPath)
 			if err != nil {
+				return err
+			}
+			if err := validatePolicyDigests(pinPolicies); err != nil {
 				return err
 			}
 			manifestStored, err := validateImageManifestFlag(imageManifest)
@@ -268,6 +285,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				MinTCB:            tcbFloor,
 				StaticAllowlist:   staticAllowlist,
 				InitData:          strings.ToLower(strings.TrimSpace(initData)),
+				PinnedPolicies:    pinPolicies,
 			}
 			if err := cfg.AddRemote(r); err != nil {
 				return err
@@ -295,6 +313,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (JSON object with mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, published with the image build); all three registers are pinned exactly against this one manifest, so the guest kernel and rootfs are verified rather than only the firmware. Replaces --measurements rather than adding to it. TDX evidence only — with SNP evidence this is a policy error")
 	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 lowercase hex chars — pins the runtime measurement register, i.e. the ordered operator-key/workload-event chain extended after boot. This is a deployment property, NOT a cluster identity, and cannot replace an image pin, so it requires --image-manifest. TDX evidence only — with SNP evidence this is a policy error")
 	f.BoolVar(&staticAllowlist, "static-allowlist", false, "require the hardware-committed mesh CA to be sealed (c8s CDS --static-allowlist): it must carry the static-allowlist stamp and RA-TLS evidence over its own key that verifies under this remote's measurement policy, the sealed digest must equal the SHA-256 of the --allowlist file when one is pinned, and the mesh leaf's stamp must have been decided under it. Without --allowlist the seal is verified but compared to no reviewed document, which the verdict warns about (attest-lb)")
+	f.StringSliceVar(&pinPolicies, "pin-policy", nil, "reviewed c8s allowlist policy digest(s) sha256:<hex>, comma-separated; every policy the router's attested rollout state says may run must be one of them, and CDS must fence open connections with an activation lease. Without it the bound is verified and reported only (attest-lb)")
 	f.StringVar(&initData, "init-data", "", "hex SHA-256 of the CDS pod's kata init-data document, pinned against the sealed mesh CA evidence's init-data claim (pod-as-CVM deployments; requires --static-allowlist)")
 	f.StringVar(&minTCB, "min-tcb", "", "minimum SNP TCB floor as four comma-separated components <bootloader,tee,snp,microcode> (each 0-255), enforced component-wise on the verified evidence. SNP evidence only — with TDX evidence this is a policy error")
 	return cmd

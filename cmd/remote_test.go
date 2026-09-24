@@ -189,3 +189,14 @@ func TestValidateStaticAllowlistFlags(t *testing.T) {
 		})
 	}
 }
+
+func TestValidatePolicyDigests(t *testing.T) {
+	if err := validatePolicyDigests([]string{"sha256:" + strings.Repeat("ab", 32)}); err != nil {
+		t.Errorf("valid digest refused: %v", err)
+	}
+	for _, bad := range []string{"sha256:AB", "sha384:" + strings.Repeat("ab", 32), strings.Repeat("ab", 32)} {
+		if err := validatePolicyDigests([]string{bad}); err == nil {
+			t.Errorf("validatePolicyDigests(%q) accepted a malformed digest", bad)
+		}
+	}
+}
