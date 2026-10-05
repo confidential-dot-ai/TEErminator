@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -8,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -441,7 +443,33 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 			"mode", t.remote.Mode, "url", req.URL.String())
 		return nil, fmt.Errorf("attestation binding broken for %s: upstream TLS leaf changed (re-attest required)", host)
 	}
+	// A pinned-allowlist c8s router refuses a connection opened before its
+	// rollout bound widened. Retire the pooled connection and the verdict so
+	// the next request re-attests on a new connection.
+	if isFenceRefusal(resp) {
+		t.cache.Invalidate(t.remoteKey)
+		t.dropPinned(leaf)
+		slog.Warn("router fenced this connection after an allowlist change; re-attesting on the next request",
+			"mode", t.remote.Mode, "url", req.URL.String())
+	}
 	return resp, nil
+}
+
+// fenceRefusal is the body prefix of a c8s router's fence 503.
+const fenceRefusal = "the allowlist bound changed"
+
+// isFenceRefusal reports whether resp is a c8s router's fence 503. It peeks
+// at the body and puts the bytes back for the caller.
+func isFenceRefusal(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Body == nil {
+		return false
+	}
+	head, _ := io.ReadAll(io.LimitReader(resp.Body, int64(len(fenceRefusal))))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
+	return string(head) == fenceRefusal
 }
 
 // transportFor returns the forwarding transport for one attested leaf,

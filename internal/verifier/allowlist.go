@@ -243,3 +243,51 @@ func isJSONContentType(ct string) bool {
 	mediaType, _, err := mime.ParseMediaType(ct)
 	return err == nil && strings.EqualFold(mediaType, "application/json")
 }
+
+// FetchPolicyObject downloads the policy c8s serves at
+// /.well-known/c8s/objects/sha256/<hex> and returns it only when SHA-256 over
+// the bytes as received equals digest ("sha256:<hex>"), which the caller took
+// from an attested rollout bound. Redirects are refused, as in FetchAllowlist.
+func FetchPolicyObject(ctx context.Context, client *http.Client, baseURL, digest string) ([]byte, error) {
+	hexDigest, ok := strings.CutPrefix(digest, "sha256:")
+	if !ok {
+		return nil, fmt.Errorf("policy fetch: digest %q is not sha256:<hex>", digest)
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("policy fetch: parse base URL: %w", err)
+	}
+	u.Path = "/.well-known/c8s/objects/sha256/" + hexDigest
+	u.RawQuery = ""
+	c := *client
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("policy fetch: build request: %w", err)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("policy fetch: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Error("error closing response Body", "error", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("policy fetch: %s returned %d: %s", u.Path, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxAllowlistBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("policy fetch: read response: %w", err)
+	}
+	if len(raw) > maxAllowlistBytes {
+		return nil, fmt.Errorf("policy fetch: response exceeds %d bytes", maxAllowlistBytes)
+	}
+	if sum := sha256.Sum256(raw); hex.EncodeToString(sum[:]) != hexDigest {
+		return nil, fmt.Errorf("policy fetch: the router served bytes for %s that hash to sha256:%x", digest, sum)
+	}
+	return raw, nil
+}

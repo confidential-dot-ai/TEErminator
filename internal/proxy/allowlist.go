@@ -141,3 +141,63 @@ func modeLabel(m config.AttestMode) string {
 	}
 	return string(m)
 }
+
+// FetchBoundPolicies attests r and downloads every policy in its attested
+// rollout bound, over a connection pinned to the attested serving leaf, as
+// attemptAllowlistFetch does. Each is kept only when its SHA-256 equals the
+// digest the bound names.
+func FetchBoundPolicies(ctx context.Context, r config.Remote, extraCAs []config.Cert) (*verifier.SessionVerdict, map[string][]byte, error) {
+	if r.Mode != config.AttestEndpoint {
+		return nil, nil, fmt.Errorf("fetching the rollout bound requires a remote with --mode attest-lb (this one is %q)", modeLabel(r.Mode))
+	}
+	target, err := url.Parse(r.Remote)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid remote URL: %w", err)
+	}
+	origin := target.Scheme + "://" + target.Host
+	pinnedCAs, err := parseExtraCAs(extraCAs)
+	if err != nil {
+		return nil, nil, err
+	}
+	webPKITLS, err := upstreamTLSConfig(target, r, extraCAs)
+	if err != nil {
+		return nil, nil, err
+	}
+	// As in attemptAllowlistFetch: the attest-lb verification binds the
+	// observed serving leaf, and the fetch below is pinned to that leaf.
+	attestTLS := webPKITLS.Clone()
+	attestTLS.InsecureSkipVerify = true // trust is checked after the mode is attested
+	attestTr := &http.Transport{TLSClientConfig: attestTLS}
+	defer attestTr.CloseIdleConnections()
+
+	ea, err := verifier.NewEndpointAttester(origin, &http.Client{Transport: attestTr}, r, pinnedCAs, webPKITLS.RootCAs)
+	if err != nil {
+		return nil, nil, err
+	}
+	v, err := ea.Attest(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(v.AllowlistBound) == 0 {
+		return nil, nil, fmt.Errorf("the router attested no CDS rollout state (c8s router.attest.pinnedAllowlist), so there is no bound to fetch")
+	}
+
+	fetchTLS := attestTLS.Clone()
+	fetchTLS.VerifyConnection = pinnedLeafVerifier(v.LeafSHA256)
+	fetchTr := &http.Transport{TLSClientConfig: fetchTLS}
+	defer fetchTr.CloseIdleConnections()
+	client := &http.Client{Transport: fetchTr}
+
+	policies := make(map[string][]byte, len(v.AllowlistBound))
+	for _, digest := range v.AllowlistBound {
+		if _, seen := policies[digest]; seen {
+			continue
+		}
+		raw, err := verifier.FetchPolicyObject(ctx, client, origin, digest)
+		if err != nil {
+			return nil, nil, err
+		}
+		policies[digest] = raw
+	}
+	return v, policies, nil
+}

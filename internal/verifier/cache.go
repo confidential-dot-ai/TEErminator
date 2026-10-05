@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -115,6 +116,11 @@ func RemoteKey(host string, r config.Remote, allowlistDigest, imageManifestDiges
 		field('m', []byte(m))
 	}
 	field('w', []byte(r.WorkloadName))
+	policies := slices.Clone(r.PinnedPolicies)
+	slices.Sort(policies)
+	for _, p := range policies {
+		field('p', []byte(p))
+	}
 	if allowlistDigest != nil {
 		field('a', allowlistDigest)
 	}

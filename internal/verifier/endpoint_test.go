@@ -14,6 +14,7 @@ import (
 	_ "embed"
 	"encoding/asn1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -23,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -54,6 +56,7 @@ func TestAttestLBTranscriptGoldenVectors(t *testing.T) {
 		ServingLeafDERB64 string `json:"serving_leaf_der_b64"`
 		MeshLeafDERB64    string `json:"mesh_leaf_der_b64"`
 		MeshCADERB64      string `json:"mesh_ca_der_b64"`
+		StateB64          string `json:"state_b64"`
 		ReportDataB64     string `json:"report_data_b64"`
 	}
 	if err := json.Unmarshal(transcriptVectors, &vectors); err != nil {
@@ -71,7 +74,12 @@ func TestAttestLBTranscriptGoldenVectors(t *testing.T) {
 	}
 	for _, v := range vectors {
 		t.Run(v.Description, func(t *testing.T) {
-			got := attestLBReportData(v.FrontDoorMode, unb64(v.NonceB64), unb64(v.ServingLeafDERB64), unb64(v.MeshLeafDERB64), unb64(v.MeshCADERB64))
+			var stateDigest []byte
+			if state := unb64(v.StateB64); len(state) > 0 {
+				sum := sha512.Sum384(state)
+				stateDigest = sum[:]
+			}
+			got := attestLBReportData(v.FrontDoorMode, unb64(v.NonceB64), unb64(v.ServingLeafDERB64), unb64(v.MeshLeafDERB64), unb64(v.MeshCADERB64), stateDigest)
 			if want := unb64(v.ReportDataB64); !bytes.Equal(got[:], want) {
 				t.Fatalf("report_data = %x, want %x", got, want)
 			}
@@ -236,6 +244,12 @@ type bundleSpec struct {
 	// front door does (the tls-lb proxies both routes). Unset leaves the route
 	// answering the attest-lb handler, i.e. not a served allowlist at all.
 	allowlist http.HandlerFunc
+	// state, when set, returns the cds_state to serve for the request nonce;
+	// its digest is committed into the transcript.
+	state func(nonce []byte) *cdsState
+	// servedState, when set, replaces the served cds_state after state's
+	// digest went into the transcript.
+	servedState func(nonce []byte) *cdsState
 }
 
 // newServer serves the attest-lb bundle over TLS with the fixture's serving
@@ -269,7 +283,18 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		if transcriptMode == "" {
 			transcriptMode = frontDoorMode
 		}
-		reportData := attestLBReportData(transcriptMode, nonce, servingDER, f.mesh.cert.Raw, f.ca.cert.Raw)
+		var state *cdsState
+		var stateDigest []byte
+		if spec.state != nil {
+			state = spec.state(nonce)
+			sum := sha512.Sum384(state.State)
+			stateDigest = sum[:]
+		}
+		served := state
+		if spec.servedState != nil {
+			served = spec.servedState(nonce)
+		}
+		reportData := attestLBReportData(transcriptMode, nonce, servingDER, f.mesh.cert.Raw, f.ca.cert.Raw, stateDigest)
 		digest := sha512.Sum384(reportData[:])
 		signKey := spec.signKey
 		if signKey == nil {
@@ -319,6 +344,7 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		servingSum := sha256.Sum256(servingDER)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
+			"cds_state":       served,
 			"version":         version,
 			"platform":        platform,
 			"generation":      1,
@@ -1428,4 +1454,76 @@ func TestSessionCachePinning(t *testing.T) {
 	if _, fresh, _ := c.FreshSession("r"); fresh {
 		t.Fatal("invalidated entry should not be fresh")
 	}
+}
+
+// signedState returns a state function signing {bound, lease, nonce} with key
+// under the challenge context, valid for a minute from now.
+func signedState(t *testing.T, key *ecdsa.PrivateKey, lease int64, bound ...string) func([]byte) *cdsState {
+	return func(nonce []byte) *cdsState {
+		now := time.Now().Unix()
+		raw, err := json.Marshal(rolloutState{Bound: bound, Lease: lease, Nonce: hex.EncodeToString(nonce), IssuedAt: now, ExpiresAt: now + 60})
+		if err != nil {
+			t.Error(err)
+		}
+		h := sha512.New384()
+		h.Write([]byte(rolloutStateChallengeContext + "\x00"))
+		h.Write(raw)
+		sig, err := ecdsa.SignASN1(rand.Reader, key, h.Sum(nil))
+		if err != nil {
+			t.Error(err)
+		}
+		return &cdsState{State: raw, Signature: sig}
+	}
+}
+
+func TestAttestLBRolloutState(t *testing.T) {
+	stubEvidence(t)
+	f := newLBFixture(t, fixtureOpts{})
+	p, q := "sha256:"+strings.Repeat("aa", 32), "sha256:"+strings.Repeat("bb", 32)
+	withPins := func(pins ...string) config.Remote {
+		r := measuredRemote()
+		r.PinnedPolicies = pins
+		return r
+	}
+	for _, tc := range []struct {
+		name   string
+		state  func([]byte) *cdsState
+		remote config.Remote
+		want   string
+	}{
+		{"followed bound", signedState(t, f.ca.key, 30, p, q), measuredRemote(), ""},
+		{"bound inside pins", signedState(t, f.ca.key, 30, p, q), withPins(p, q), ""},
+		{"unpinned policy", signedState(t, f.ca.key, 30, p, q), withPins(p), "policy " + q + " may be running"},
+		{"no lease", signedState(t, f.ca.key, 0, p), withPins(p), "without an activation lease"},
+		{"not signed by the mesh CA", signedState(t, mintCA(t, "other").key, 30, p), measuredRemote(), "signature does not verify"},
+		{"pins without state", nil, withPins(p), "need the CDS rollout state"},
+		{"malformed bound digest", signedState(t, f.ca.key, 30, "sha256:../../etc"), measuredRemote(), "not sha256:<64 lowercase hex>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := f.newServer(t, bundleSpec{state: tc.state})
+			v, err := newLBAttester(t, ts, tc.remote, nil).Attest(context.Background())
+			if tc.want != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("Attest = %v, want error containing %q", err, tc.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(v.AllowlistBound, []string{p, q}) {
+				t.Errorf("AllowlistBound = %v, want [%s %s]", v.AllowlistBound, p, q)
+			}
+		})
+	}
+
+	t.Run("state not committed by the transcript", func(t *testing.T) {
+		ts := f.newServer(t, bundleSpec{
+			state:       signedState(t, f.ca.key, 30, p),
+			servedState: signedState(t, f.ca.key, 30, p, q),
+		})
+		if _, err := newLBAttester(t, ts, measuredRemote(), nil).Attest(context.Background()); err == nil {
+			t.Fatal("accepted a state the transcript does not commit")
+		}
+	})
 }

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -312,4 +313,27 @@ func sign(n int) int {
 		return -1
 	}
 	return 0
+}
+
+func TestFetchPolicyObject(t *testing.T) {
+	policy := []byte(`{"schema":"x","workloads":{}}`)
+	sum := sha256.Sum256(policy)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/c8s/objects/sha256/"+hex.EncodeToString(sum[:]) {
+			_, _ = w.Write(policy)
+			return
+		}
+		_, _ = w.Write([]byte("tampered"))
+	}))
+	defer ts.Close()
+
+	got, err := FetchPolicyObject(context.Background(), ts.Client(), ts.URL, digest)
+	if err != nil || !bytes.Equal(got, policy) {
+		t.Fatalf("FetchPolicyObject(attested digest) = %q, %v; want the policy bytes", got, err)
+	}
+	other := "sha256:" + strings.Repeat("00", 32)
+	if _, err := FetchPolicyObject(context.Background(), ts.Client(), ts.URL, other); err == nil || !strings.Contains(err.Error(), "hash to") {
+		t.Fatalf("FetchPolicyObject(mismatching bytes) = %v, want a digest error", err)
+	}
 }

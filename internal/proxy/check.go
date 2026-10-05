@@ -82,6 +82,13 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		if v.StaticAllowlistDigest != "" {
 			detail += fmt.Sprintf(", sealed allowlist %s (mesh CA launch %s)", v.StaticAllowlistDigest, v.SealedCALaunch)
 		}
+		if len(v.AllowlistBound) > 0 {
+			basis := "following the deployment"
+			if len(r.PinnedPolicies) > 0 {
+				basis = "all pinned"
+			}
+			detail += fmt.Sprintf(", allowlist bound %s (%s)", strings.Join(v.AllowlistBound, " "), basis)
+		}
 		if len(v.RTMRsPinned) > 0 {
 			detail += ", rtmrs pinned " + strings.Join(v.RTMRsPinned, " ")
 		}

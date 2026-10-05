@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
@@ -26,10 +28,11 @@ func newAllowlistCmd(name string) *cobra.Command {
 
 func newAllowlistFetchCmd(name string) *cobra.Command {
 	var (
-		output  string
-		force   bool
-		pin     bool
-		timeout time.Duration
+		output   string
+		boundDir string
+		force    bool
+		pin      bool
+		timeout  time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -65,7 +68,13 @@ Pass --pin to store the written file as the remote's --allowlist pin, which is
 the bootstrap this command exists for: fetch the document the cluster attested,
 then have every later handshake check the stamp against it.
 
-  $ %s allowlist fetch 127.0.0.1:8080 -o ./allowlist.json --pin`, name),
+With --bound-dir instead of --output, fetch every policy in the router's
+attested rollout bound (c8s router.attest.pinnedAllowlist) into
+<dir>/<hex>.json, each kept only when it hashes to its attested digest. With
+--pin, their digests are added to the remote's --pin-policy set once reviewed.
+
+  $ %s allowlist fetch 127.0.0.1:8080 -o ./allowlist.json --pin
+  $ %s allowlist fetch 127.0.0.1:8080 --bound-dir ./policies`, name, name),
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load()
@@ -75,6 +84,10 @@ then have every later handshake check the stamp against it.
 			r := cfg.FindByKey(args[0])
 			if r == nil {
 				return fmt.Errorf("no remote found for %q; add it first with `remote add` or check `remote ls`", args[0])
+			}
+
+			if boundDir != "" {
+				return fetchBound(cmd.Context(), cfg, r, boundDir, pin, timeout)
 			}
 
 			// Decided before any network round trip: an operator who cannot
@@ -116,11 +129,52 @@ then have every later handshake check the stamp against it.
 	f := cmd.Flags()
 	f.StringVarP(&output, "output", "o", "", "file to write the checked allowlist document to (required); written verbatim, and only if the check passes")
 	f.BoolVar(&force, "force", false, "overwrite an existing output file (refused by default, and named explicitly when that file is the remote's current --allowlist pin)")
-	f.BoolVar(&pin, "pin", false, "after a successful fetch, store the written file as the remote's --allowlist pin")
+	f.StringVar(&boundDir, "bound-dir", "", "directory to write every policy in the attested rollout bound to, instead of --output")
+	f.BoolVar(&pin, "pin", false, "after a successful fetch, store the written file as the remote's --allowlist pin (with --bound-dir: add the fetched digests to its --pin-policy set)")
 	f.DurationVar(&timeout, "timeout", 30*time.Second, "overall timeout for the attestation and the fetch")
-	// Cannot fail: the flag is registered right above.
-	_ = cmd.MarkFlagRequired("output")
+	cmd.MarkFlagsOneRequired("output", "bound-dir")
+	cmd.MarkFlagsMutuallyExclusive("output", "bound-dir")
 	return cmd
+}
+
+// fetchBound writes every attested bound policy to dir and, with pin, adds the
+// digests to the remote's pinned policies.
+func fetchBound(ctx context.Context, cfg *config.Config, r *config.Remote, dir string, pin bool, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	v, policies, err := proxy.FetchBoundPolicies(ctx, *r, cfg.Certs)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating %s: %w", dir, err)
+	}
+	written := map[string]bool{}
+	for _, digest := range v.AllowlistBound {
+		if written[digest] {
+			continue
+		}
+		written[digest] = true
+		path := filepath.Join(dir, strings.TrimPrefix(digest, "sha256:")+".json")
+		if err := writeAllowlistFile(path, policies[digest]); err != nil {
+			return err
+		}
+		fmt.Printf("Wrote %s (%s)\n", path, digest)
+	}
+	fmt.Printf("  attested measurement %s, trust %s (%s); the router's attestation commits this bound\n", v.Measurement, v.TrustMode, v.Profile)
+	if !pin {
+		return nil
+	}
+	for _, digest := range v.AllowlistBound {
+		if !slices.Contains(r.PinnedPolicies, digest) {
+			r.PinnedPolicies = append(r.PinnedPolicies, digest)
+		}
+	}
+	if err := cfg.Save(); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+	fmt.Printf("Pinned %d policies for %s: every attest-lb handshake now requires the attested bound to stay within them.\n", len(r.PinnedPolicies), r.Local)
+	return nil
 }
 
 // resolveOutputPath decides whether the fetched document may be written to
