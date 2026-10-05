@@ -96,6 +96,15 @@ type Remote struct {
 	// router's attested rollout bound must stay within (attest-lb). Empty
 	// follows the deployment: the bound is verified and reported, not limited.
 	PinnedPolicies []string `json:"pinned_policies,omitempty"`
+	// Immutable requires the attested rollout state to report an immutable
+	// allowlist (operator_keys: none).
+	Immutable bool `json:"immutable,omitempty"`
+	// TrustOperator accepts every policy the bound or the node's measured
+	// history names when the operator signed its publication, under the key
+	// set the attested state names: OperatorKeysPath when set, else the set
+	// the router serves.
+	TrustOperator    bool   `json:"trust_operator,omitempty"`
+	OperatorKeysPath string `json:"operator_keys_path,omitempty"`
 	// ImageManifestPath points at a TDX image-pin manifest (JSON object with
 	// mrtd, rtmr1, rtmr2, each 96 lowercase hex chars). All three registers are
 	// compared byte-exactly against the verified claims — the launch digest

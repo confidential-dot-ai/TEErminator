@@ -1456,15 +1456,19 @@ func TestSessionCachePinning(t *testing.T) {
 	}
 }
 
-// signedState returns a state function signing {bound, lease, nonce} with key.
+// signedState returns a state function signing {bound, lease, nonce} with key
+// under the challenge context, valid for a minute from now.
 func signedState(t *testing.T, key *ecdsa.PrivateKey, lease int64, bound ...string) func([]byte) *cdsState {
 	return func(nonce []byte) *cdsState {
-		raw, err := json.Marshal(rolloutState{Bound: bound, Lease: lease, Nonce: hex.EncodeToString(nonce)})
+		now := time.Now().Unix()
+		raw, err := json.Marshal(rolloutState{Bound: bound, Lease: lease, Nonce: hex.EncodeToString(nonce), IssuedAt: now, ExpiresAt: now + 60})
 		if err != nil {
 			t.Error(err)
 		}
-		sum := sha512.Sum384(raw)
-		sig, err := ecdsa.SignASN1(rand.Reader, key, sum[:])
+		h := sha512.New384()
+		h.Write([]byte(rolloutStateChallengeContext + "\x00"))
+		h.Write(raw)
+		sig, err := ecdsa.SignASN1(rand.Reader, key, h.Sum(nil))
 		if err != nil {
 			t.Error(err)
 		}

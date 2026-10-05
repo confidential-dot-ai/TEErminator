@@ -280,7 +280,19 @@ You choose how to trust it:
 - **Follow the deployment.** Without pins the bound is verified and reported, not limited.
 - **Pin reviewed policies.** With `remote add --pin-policy sha256:<hex>` (repeatable),
   attestation fails once the bound holds a policy you have not pinned, or when CDS runs
-  without an activation lease. The error names the digest to review.
+  without an activation lease. The error names the digest to review. Add `--immutable`
+  to also require that CDS accepts no allowlist writes at all.
+- **Trust the operator's signature.** With `remote add --trust-operator`, every policy in
+  the bound must carry the operator's signature under the key set the attested state
+  names. Pass `--operator-keys <pem>` to pin that set, or let TEErminator fetch it from
+  the router and check it against the state.
+
+On a TDX node, the bundle also lists every policy the node enforced since boot, as
+measured into RTMR[3]. With `--expected-rtmr3` set to the register's value before any
+policy was measured (the operator-key seed), TEErminator replays that list against the
+quote and reports it as the node's history. Pinned policies and operator signatures
+then apply to the history too, so a policy nobody reviewed fails attestation for the
+rest of the node's boot, even after the bound drains back.
 
 To review and pin the current bound, fetch every policy in it over the attested
 connection. Each is written only when it hashes to its attested digest:

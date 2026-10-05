@@ -150,6 +150,9 @@ type SessionVerdict struct {
 	// rollout state says may be running. The transcript commits the state, and
 	// the committed mesh CA signs it. Empty when the router serves no state.
 	AllowlistBound []string
+	// MeasuredPolicies lists every allowlist policy the router's TDX node
+	// enforced since boot, replayed from RTMR[3] onto the expected_rtmr3 seed.
+	MeasuredPolicies []string
 	// Warning is a policy gap in an otherwise passing verdict — the MRTD-only
 	// note for specific-cluster TDX remotes without an image pin, or a seal
 	// that is verified but pinned to no reviewed document.
@@ -183,10 +186,14 @@ type attestationBundle struct {
 	FrontDoorMode string          `json:"front_door_mode"`
 	IdentityProof identityProof   `json:"identity_proof"`
 	CDSState      *cdsState       `json:"cds_state,omitempty"`
+	// MeasuredPolicies lists the allowlist policies the router's TDX node
+	// extended into RTMR[3] after its seed, read after the evidence.
+	MeasuredPolicies []string `json:"measured_policies,omitempty"`
 }
 
 // cdsState is a pinned-allowlist router's CDS rollout state: the exact state
-// JSON bytes and an ASN.1 ECDSA signature over their SHA-384 by the mesh CA.
+// JSON bytes and the mesh CA's ASN.1 ECDSA signature over SHA-384 of the
+// challenge context, a zero byte and those bytes.
 type cdsState struct {
 	State     []byte `json:"state"`
 	Signature []byte `json:"signature"`
@@ -194,10 +201,24 @@ type cdsState struct {
 
 // rolloutState holds the rollout-state fields this client checks.
 type rolloutState struct {
-	Bound []string `json:"bound"`
-	Lease int64    `json:"lease_seconds"`
-	Nonce string   `json:"nonce"`
+	Bound        []string `json:"bound"`
+	Lease        int64    `json:"lease_seconds"`
+	Nonce        string   `json:"nonce"`
+	IssuedAt     int64    `json:"issued_at"`
+	ExpiresAt    int64    `json:"expires_at"`
+	OperatorKeys string   `json:"operator_keys"`
 }
+
+// rolloutStateChallengeContext prefixes the state CDS signs for a nonce
+// (c8s pkg/rolloutstate.ContextChallenge).
+const rolloutStateChallengeContext = "c8s/rollout-state-challenge/v1"
+
+// rolloutStateMaxSkew is the clock skew allowed around a state's validity
+// window (c8s pkg/rolloutstate.MaxClockSkew).
+const rolloutStateMaxSkew = 2 * time.Minute
+
+// operatorKeysNone is rolloutState.OperatorKeys for an immutable allowlist.
+const operatorKeysNone = "none"
 
 // EndpointAttester implements the attest-lb mode. baseURL is the LB origin
 // (scheme://host); client must be the transport whose observed TLS state the
@@ -414,7 +435,7 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	// (i') Platform-complete pins: TDX runtime registers and the SNP TCB floor
 	// are enforced on the verified claims, fail closed — including any pin set
 	// against evidence from a platform it cannot apply to.
-	if err := pins.enforce(platform, res, v); err != nil {
+	if err := pins.enforce(platform, res, v, bundle.MeasuredPolicies); err != nil {
 		return nil, fmt.Errorf("attest-lb: %w", err)
 	}
 
@@ -445,11 +466,19 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 			return nil, fmt.Errorf("attest-lb: %w", err)
 		}
 		v.AllowlistBound = st.Bound
-		if err := checkPinnedPolicies(st, e.remote.PinnedPolicies); err != nil {
+		if err := checkPinnedPolicies(st, e.remote.PinnedPolicies, v.MeasuredPolicies); err != nil {
 			return nil, fmt.Errorf("attest-lb: %w", err)
 		}
-	} else if len(e.remote.PinnedPolicies) > 0 {
-		return nil, fmt.Errorf("attest-lb: pinned policies need the CDS rollout state, which this router does not serve (c8s router.attest.pinnedAllowlist)")
+		if e.remote.Immutable && st.OperatorKeys != operatorKeysNone {
+			return nil, fmt.Errorf("attest-lb: the remote requires an immutable allowlist, but CDS accepts writes from operator key set %q", st.OperatorKeys)
+		}
+		if e.remote.TrustOperator {
+			if err := e.checkOperatorSignatures(ctx, st, v.MeasuredPolicies); err != nil {
+				return nil, fmt.Errorf("attest-lb: %w", err)
+			}
+		}
+	} else if len(e.remote.PinnedPolicies) > 0 || e.remote.TrustOperator || e.remote.Immutable {
+		return nil, fmt.Errorf("attest-lb: pinned or operator-signed policies need the CDS rollout state, which this router does not serve (c8s router.attest.pinnedAllowlist)")
 	}
 
 	// (k) Sealed policy, only when pinned: the committed CA — whose DER the
@@ -605,7 +634,11 @@ func loadPlatformPins(r config.Remote) (platformPins, error) {
 // enforced in the verdict. It fails closed on any pin whose platform does not
 // match the evidence, on absent or malformed claims, and on any mismatch —
 // never an ignored option.
-func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.VerificationResult, v *SessionVerdict) error {
+//
+// expected_rtmr3 is the value before the node measured any allowlist policy;
+// RTMR[3] may also be it followed by a prefix of measured, which then becomes
+// the verdict's MeasuredPolicies.
+func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.VerificationResult, v *SessionVerdict, measured []string) error {
 	if (p.image != nil || p.rtmr3 != nil) && !isTDXPlatform(platform) {
 		return fmt.Errorf("a TDX pin (image manifest / expected RTMR[3]) is set but the evidence platform is %q: runtime measurement registers exist only on TDX, so this policy cannot be enforced against %q evidence", platform, platform)
 	}
@@ -635,7 +668,18 @@ func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.Veri
 		}
 	}
 	if p.rtmr3 != nil {
-		if err := check(3, "runtime operator-key/workload chain", p.rtmr3[:]); err != nil {
+		want := p.rtmr3[:]
+		if checkRTMR(res, 3, "", want) != nil {
+			reg := *p.rtmr3
+			for i, d := range measured {
+				reg = extendRegister(reg, d)
+				if checkRTMR(res, 3, "", reg[:]) == nil {
+					want, v.MeasuredPolicies = reg[:], slices.Clone(measured[:i+1])
+					break
+				}
+			}
+		}
+		if err := check(3, "runtime operator-key/policy chain", want); err != nil {
 			return err
 		}
 	}
@@ -748,7 +792,11 @@ func attestLBReportData(frontDoorMode string, nonce, servingLeafDER, meshLeafDER
 	lp(meshSum[:])
 	caSum := sha256.Sum256(meshCADER)
 	lp(caSum[:])
-	lp(stateDigest)
+	// Present only with a rollout state, so a bundle without one hashes as
+	// before the field existed.
+	if len(stateDigest) > 0 {
+		lp(stateDigest)
+	}
 	var out [48]byte
 	h.Sum(out[:0])
 	return out
@@ -921,8 +969,11 @@ func verifyRolloutState(s *cdsState, ca *x509.Certificate, nonce []byte) (*rollo
 	if !ok {
 		return nil, fmt.Errorf("rollout state: mesh CA key is %T, not ECDSA", ca.PublicKey)
 	}
-	sum := sha512.Sum384(s.State)
-	if !ecdsa.VerifyASN1(key, sum[:], s.Signature) {
+	h := sha512.New384()
+	h.Write([]byte(rolloutStateChallengeContext))
+	h.Write([]byte{0})
+	h.Write(s.State)
+	if !ecdsa.VerifyASN1(key, h.Sum(nil), s.Signature) {
 		return nil, fmt.Errorf("rollout state: signature does not verify against the committed mesh CA")
 	}
 	var st rolloutState
@@ -931,6 +982,10 @@ func verifyRolloutState(s *cdsState, ca *x509.Certificate, nonce []byte) (*rollo
 	}
 	if st.Nonce != hex.EncodeToString(nonce) {
 		return nil, fmt.Errorf("rollout state answers another nonce")
+	}
+	skew := int64(rolloutStateMaxSkew / time.Second)
+	if now := time.Now().Unix(); st.IssuedAt <= 0 || st.ExpiresAt < st.IssuedAt || st.IssuedAt > now+skew || now > st.ExpiresAt+skew {
+		return nil, fmt.Errorf("rollout state is outside its validity window (issued_at %d, expires_at %d)", st.IssuedAt, st.ExpiresAt)
 	}
 	for _, d := range st.Bound {
 		if !policyDigestRE.MatchString(d) {
@@ -947,9 +1002,16 @@ var policyDigestRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // checkPinnedPolicies requires every policy that may run to be pinned, and a
 // lease that fences open connections before a new policy is enforced. No
 // pins means the caller follows the deployment and only reports the bound.
-func checkPinnedPolicies(st *rolloutState, pins []string) error {
+//
+// history, the policies the node enforced since boot, must be pinned too.
+func checkPinnedPolicies(st *rolloutState, pins, history []string) error {
 	if len(pins) == 0 {
 		return nil
+	}
+	for _, d := range history {
+		if !slices.Contains(pins, d) {
+			return fmt.Errorf("pinned policies: the node enforced policy %s since boot (RTMR[3]) and it is not pinned; review it at /.well-known/c8s/objects/sha256/%s", d, strings.TrimPrefix(d, "sha256:"))
+		}
 	}
 	if st.Lease <= 0 {
 		return fmt.Errorf("pinned policies: CDS enforces allowlist writes without an activation lease, so open connections are not fenced")
