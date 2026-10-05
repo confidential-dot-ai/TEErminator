@@ -108,18 +108,18 @@ type Remote struct {
 	// MinTCB is the SNP TCB floor enforced on verified evidence. SNP evidence
 	// only — with TDX evidence this pin is a policy error.
 	MinTCB *TCBFloor `json:"min_tcb,omitempty"`
-	// StaticAllowlist requires the hardware-committed mesh CA to be sealed: it
-	// must carry the static-allowlist stamp (OID …66378.1.3) and RA-TLS
-	// evidence over its own key that verifies under this remote's measurement
-	// policy, the sealed digest must equal SHA-256 of the AllowlistPath file
-	// when one is pinned, and the mesh leaf's stamp must have been decided
-	// under the sealed digest. attest-lb only.
-	StaticAllowlist bool `json:"static_allowlist,omitempty"`
-	// InitData pins the sealed CA evidence's init-data claim (SNP HOST_DATA /
-	// TDX MRCONFIGID) as the hex SHA-256 of the CDS pod's kata init-data
-	// document — the pod-as-CVM binding of the seal. Requires StaticAllowlist.
-	InitData string   `json:"init_data,omitempty"`
-	Pin      *CertPin `json:"pin,omitempty"`
+	// TDXTCBStatus lists the Intel TCB statuses accepted for TDX evidence
+	// (e.g. UpToDate, SWHardeningNeeded). When set, each verification fetches
+	// Intel PCS collateral and checks the PCK CRLs; when empty, TDX evidence is
+	// verified offline. TDX evidence only — with SNP evidence this pin is a
+	// policy error.
+	TDXTCBStatus []string `json:"tdx_tcb_status,omitempty"`
+	// StaticAllowlist and InitData belong to the removed sealed-mesh-CA
+	// policy. They are still read so a config that sets them fails closed
+	// instead of silently dropping the pin.
+	StaticAllowlist bool     `json:"static_allowlist,omitempty"`
+	InitData        string   `json:"init_data,omitempty"`
+	Pin             *CertPin `json:"pin,omitempty"`
 }
 
 // ParseAttestMode parses an attestation-mode string, normalizing the legacy

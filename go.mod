@@ -3,14 +3,14 @@ module github.com/confidential-dot-ai/TEErminator
 go 1.25.0
 
 require (
-	github.com/confidential-dot-ai/attestation-go v0.4.1
-	github.com/google/go-sev-guest v0.15.0
+	github.com/confidential-dot-ai/attestation-go v0.7.3-0.20261005151435-fd542235ba14
+	github.com/google/go-tdx-guest v0.3.2-0.20261003001058-b0a2dd8100a0
 	github.com/quic-go/quic-go v0.60.0
 	github.com/spf13/cobra v1.10.2
 )
 
 require (
-	github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d // indirect
+	github.com/google/go-sev-guest v0.15.0 // indirect
 	github.com/google/logger v1.1.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect

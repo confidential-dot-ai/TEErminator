@@ -136,15 +136,14 @@ func TestRemoteKey(t *testing.T) {
 			r.MinTCB = &config.TCBFloor{Bootloader: 3, SNP: 8, Microcode: 210}
 			return RemoteKey("lb.example:443", r, nil, nil, nil)
 		}(),
-		"static allowlist": func() string {
+		"tdx tcb status": func() string {
 			r := base
-			r.StaticAllowlist = true
+			r.TDXTCBStatus = []string{"UpToDate"}
 			return RemoteKey("lb.example:443", r, nil, nil, nil)
 		}(),
-		"init data": func() string {
+		"wider tdx tcb status": func() string {
 			r := base
-			r.StaticAllowlist = true
-			r.InitData = strings.Repeat("5e", 32)
+			r.TDXTCBStatus = []string{"UpToDate", "SWHardeningNeeded"}
 			return RemoteKey("lb.example:443", r, nil, nil, nil)
 		}(),
 		"allowlist digest":            RemoteKey("lb.example:443", base, []byte{1, 2, 3}, nil, nil),
@@ -159,6 +158,12 @@ func TestRemoteKey(t *testing.T) {
 			t.Errorf("%s collides with %s", name, prev)
 		}
 		seen[key] = name
+	}
+
+	reordered := base
+	reordered.TDXTCBStatus = []string{"SWHardeningNeeded", "UpToDate"}
+	if variants["wider tdx tcb status"] != RemoteKey("lb.example:443", reordered, nil, nil, nil) {
+		t.Fatal("key must be invariant under TDX TCB status order")
 	}
 
 	// Pinned-CA order must not matter.

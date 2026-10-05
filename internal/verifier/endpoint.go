@@ -21,11 +21,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/attestation-go/attestation/tdx"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teeverify"
 )
@@ -125,6 +126,9 @@ type SessionVerdict struct {
 	// TCBFloor names the SNP TCB floor this verdict enforced (empty when no
 	// --min-tcb pin is set).
 	TCBFloor string
+	// TDXTCBStatus is the least favourable Intel TCB status matched from the
+	// collateral (empty when no --tdx-tcb-status policy is set).
+	TDXTCBStatus string
 	// Stamp is the matched-workload stamp carried by the chain-verified mesh
 	// leaf, or nil when the leaf carries none. It is read on every attestation
 	// and ENFORCED only when the remote pins a workload name or an allowlist
@@ -134,19 +138,8 @@ type SessionVerdict struct {
 	// evidence binds the mesh leaf into the transcript, and the mesh CA's
 	// signature over that leaf is what vouches for the stamp inside it.
 	Stamp *MatchedWorkload
-	// StaticAllowlistDigest is the hex SHA-256 the committed mesh CA seals as
-	// its one lifetime policy, set only when the remote pins --static-allowlist
-	// and every sealed-policy check passed (staticallowlist.go). Unlike the
-	// leaf stamp it is hardware-rooted: the CA DER is committed in fresh
-	// evidence, and the CA's own embedded evidence verified under the remote's
-	// measurement policy.
-	StaticAllowlistDigest string
-	// SealedCALaunch is the launch digest of the sealed CA's verified evidence,
-	// set alongside StaticAllowlistDigest.
-	SealedCALaunch string
 	// Warning is a policy gap in an otherwise passing verdict — the MRTD-only
-	// note for specific-cluster TDX remotes without an image pin, or a seal
-	// that is verified but pinned to no reviewed document.
+	// note for specific-cluster TDX remotes without an image pin.
 	Warning string
 }
 
@@ -191,11 +184,6 @@ type EndpointAttester struct {
 	remote      config.Remote
 	pinnedCAs   []*x509.Certificate
 	webPKIRoots *x509.CertPool
-
-	// mu guards sealedCA, the memoised verification of the committed mesh
-	// CA's embedded evidence under --static-allowlist.
-	mu       sync.Mutex
-	sealedCA *sealedCAMemo
 }
 
 // NewEndpointAttester builds an endpoint attester.
@@ -229,7 +217,7 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 // leaf capture, bundle shape (version, nonce echo), served chain parsing and
 // committed-CA selection, identity-proof field equality, hardware evidence over
 // the recomputed transcript, proof of possession, mesh-leaf chain, serving-leaf
-// trust, measurement policy, workload policy, sealed policy.
+// trust, measurement policy, workload policy.
 func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) {
 	// Platform pins are resolved before any network round trip: a malformed
 	// image manifest, RTMR[3] pin, or TCB floor is a configuration error. The
@@ -321,7 +309,7 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	// exactly it. A bundle relayed through any other serving leaf fails here
 	// even when both leaves share an issuer.
 	reportData := attestLBReportData(bundle.FrontDoorMode, nonce, servingLeaf.Raw, meshLeaf.Raw, committedCA.Raw)
-	res, err := verifyEvidence(bundle, reportData[:], pins.minTCB)
+	res, err := verifyEvidence(bundle, reportData[:], pins)
 	if err != nil {
 		return nil, err
 	}
@@ -410,16 +398,6 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 		v.AllowlistVersion = stamp.AllowlistVersion
 	}
 
-	// (k) Sealed policy, only when pinned: the committed CA — whose DER the
-	// evidence above commits — must carry the static-allowlist stamp and its
-	// own verifiable launch evidence, the pinned allowlist file must hash to
-	// the sealed digest, and the leaf stamp must have been decided under it.
-	if pins.sealed {
-		if err := e.checkStaticAllowlist(ctx, committedCA, stamp, pins, v); err != nil {
-			return nil, fmt.Errorf("attest-lb: static allowlist: %w", err)
-		}
-	}
-
 	// An operator CA pin upgrades the derived-CA verdict to specific-cluster
 	// when the committed CA byte-equals it.
 	for _, pinned := range e.pinnedCAs {
@@ -477,18 +455,16 @@ func isSNPPlatform(p teetypes.PlatformType) bool {
 // remote: the TDX image tuple (all three of MRTD, RTMR[1] and RTMR[2] compare
 // exactly against the verified claims), the optional TDX runtime-register pin
 // (RTMR[3], which only ever rides on top of an image tuple — see
-// ValidatePinCombination), the SNP TCB floor, and the sealed-policy pin with
-// its optional init-data digest. Any pin set against evidence from a platform
-// it cannot apply to is a hard error.
+// ValidatePinCombination), the SNP TCB floor, and the accepted TDX TCB
+// statuses. Any pin set against evidence from a platform it cannot apply to is
+// a hard error.
 type platformPins struct {
 	image  *ImagePins
 	rtmr3  *[RegisterSize]byte
 	minTCB *teetypes.SnpTcb
-	// sealed requires the committed mesh CA to carry a verified static
-	// allowlist seal; initData additionally pins the sealed CA evidence's
-	// init-data claim (pod-as-CVM).
-	sealed   bool
-	initData []byte
+	// tdxTCBStatuses, when set, has the verifier fetch Intel collateral and
+	// accept only these TCB statuses.
+	tdxTCBStatuses []teetypes.TdxTcbStatus
 }
 
 // ValidatePinCombination enforces the two rules that relate a remote's TDX
@@ -550,12 +526,14 @@ func loadPlatformPins(r config.Remote) (platformPins, error) {
 			Microcode:  r.MinTCB.Microcode,
 		}
 	}
-	initData, err := ValidateStaticAllowlistPins(r.StaticAllowlist, r.InitData)
+	if r.StaticAllowlist || r.InitData != "" {
+		return platformPins{}, fmt.Errorf("configuration error: static_allowlist and init_data are no longer supported (c8s does not seal the allowlist into its mesh CA); remove the remote and add it again without them")
+	}
+	statuses, err := ParseTDXTCBStatuses(r.TDXTCBStatus)
 	if err != nil {
 		return platformPins{}, fmt.Errorf("configuration error: %w", err)
 	}
-	pins.sealed = r.StaticAllowlist
-	pins.initData = initData
+	pins.tdxTCBStatuses = statuses
 	return pins, nil
 }
 
@@ -569,6 +547,17 @@ func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.Veri
 	}
 	if p.minTCB != nil && !isSNPPlatform(platform) {
 		return fmt.Errorf("an SNP TCB floor (min_tcb) is set but the evidence platform is %q: the four-component TCB exists only on SEV-SNP, so this policy cannot be enforced against %q evidence", platform, platform)
+	}
+	if len(p.tdxTCBStatuses) > 0 {
+		if !isTDXPlatform(platform) {
+			return fmt.Errorf("a TDX TCB status policy (tdx_tcb_status) is set but the evidence platform is %q: Intel TCB statuses exist only on TDX, so this policy cannot be enforced against %q evidence", platform, platform)
+		}
+		// attestation-go enforced the policy; requiring its report keeps the
+		// verdict fail-closed if the option is ever not applied.
+		if res.TCBStatus == nil || !slices.Contains(p.tdxTCBStatuses, res.TCBStatus.TCBStatus) {
+			return fmt.Errorf("cannot enforce the TDX TCB status policy: the verifier reported no accepted TCB status")
+		}
+		v.TDXTCBStatus = string(res.TCBStatus.TCBStatus)
 	}
 
 	if p.image != nil {
@@ -890,14 +879,16 @@ var verifyEvidence = verifyEndpointEvidence
 // attestation-go verifier (teeverify dispatches on the bundle's platform tag)
 // and requires that the evidence binds expectedReportData — the attest-lb
 // transcript hash — directly in the report_data for bare-metal platforms, or
-// in the AK-signed vTPM quote for the Azure ones. minTCB, when set, is handed
-// to the verifier engine as the SNP TCB floor (go-sev-guest validates it
-// against the report's TCB fields). Debug-launched guests are rejected by the
+// in the AK-signed vTPM quote for the Azure ones. The SNP TCB floor, when set,
+// is handed to the verifier engine (go-sev-guest validates it against the
+// report's TCB fields). A TDX TCB status policy, when set, has the engine
+// fetch Intel collateral and check the PCK CRLs and TCB statuses; without one,
+// TDX verification is offline. Debug-launched guests are rejected by the
 // engine unconditionally: VerifyParams.AllowDebug defaults to false and is
 // never set here. All evidence parsing and cryptographic verification lives
 // in attestation-go; only the binding anchor and the policies are computed
 // here.
-func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte, minTCB *teetypes.SnpTcb) (*teetypes.VerificationResult, error) {
+func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte, pins platformPins) (*teetypes.VerificationResult, error) {
 	raw, err := json.Marshal(teetypes.AttestationEvidence{
 		Platform: teetypes.PlatformType(b.Platform),
 		Evidence: b.Evidence,
@@ -905,10 +896,10 @@ func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte, minT
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb: re-encode evidence: %w", err)
 	}
-	res, err := teeverify.Verify(raw, teetypes.VerifyParams{
+	res, err := teeverify.VerifyWithOptions(raw, teetypes.VerifyParams{
 		ExpectedReportData: expectedReportData,
-		MinTCB:             minTCB,
-	})
+		MinTCB:             pins.minTCB,
+	}, verifierOptions(pins))
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb (%s): %w", b.Platform, err)
 	}
@@ -916,6 +907,21 @@ func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte, minT
 		return nil, err
 	}
 	return res, nil
+}
+
+// verifierOptions turns on Intel collateral (TCB info, QE identity, PCK CRLs)
+// only when the remote sets a TDX TCB status policy; otherwise verification
+// stays offline.
+func verifierOptions(pins platformPins) teeverify.Options {
+	if len(pins.tdxTCBStatuses) == 0 {
+		return teeverify.Options{}
+	}
+	return teeverify.Options{TDX: tdx.Options{
+		GetCollateral:       true,
+		CheckRevocations:    true,
+		Getter:              newIntelPCSGetter(),
+		AcceptedTCBStatuses: pins.tdxTCBStatuses,
+	}}
 }
 
 // checkVerificationResult asserts the verifier's own verdict fields rather than
