@@ -33,7 +33,7 @@ func (b *countingBody) Close() error { return nil }
 // regression: a failed attest-lb policy check must happen before the
 // forwarding transport reads a prompt body or sends an HTTP request to the
 // backend. The verifier package separately tests certificate, measurement,
-// static-allowlist, and workload mismatch errors; this test proves their common
+// TCB, and workload mismatch errors; this test proves their common
 // proxy gate does not release request bytes after any attestation error.
 func TestAttestationFailureDoesNotReadPromptBody(t *testing.T) {
 	var attestHits, promptHits atomic.Int32

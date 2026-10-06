@@ -68,8 +68,8 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
 - **`attest-lb`** — the ordinary-TLS native-client protocol against the LB's
   `/.well-known/c8s/attest-lb` endpoint (the legacy `attest` spelling and the retired
   `?pq=false` query selector are gone; old configs are normalized automatically).
-  After each new upstream TLS handshake, and before any application bytes flow,
-  TEErminator fetches a fresh nonce-bound bundle and verifies, in order: the
+  Before any application bytes flow, TEErminator fetches a fresh nonce-bound bundle
+  and verifies, in order: the
   `c8s/attest-lb/v1` binding identifier and nonce echo; the hardware evidence over
   `report_data = SHA-384(LP(version) || LP(front_door_mode) || LP(nonce) || LP(SHA-256(serving_leaf_DER)) ||
   LP(SHA-256(mesh_leaf_DER)) || LP(SHA-256(mesh_CA_DER)))`, recomputed from the **exact
@@ -79,7 +79,10 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   chains to the mesh CA. In `acme` mode it passes WebPKI chain and hostname validation.
   The verdict is then **pinned to the exact
   serving-leaf DER** (not just its key): a substituted certificate — even one reusing the
-  attested key — refuses the handshake and forces re-attestation.
+  attested key — refuses the handshake and forces re-attestation. The daemon reuses a
+  passing verdict for one minute, and never past the serving leaf's expiry: new upstream
+  connections in that window are admitted only if they present the same leaf, and the
+  first request after it re-attests. A failed attestation is kept for the same minute.
 
   Key properties:
   - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is
@@ -105,27 +108,6 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     cluster itself (see below); the stamp's allowlist **version** counter, which `status`
     prints for a workload-pinned remote, is a *claim* until you check the document behind
     it that way.
-  - **Sealed policy.** `--static-allowlist` requires the committed mesh CA to be the one
-    a c8s CDS running with `--static-allowlist` mints ([c8s#522](https://github.com/confidential-dot-ai/c8s/pull/522)):
-    it must carry the static-allowlist stamp (OID `1.3.6.1.4.1.66378.1.3`, the SHA-256 of
-    the one document that CDS enforces for its lifetime) and RA-TLS evidence (OID
-    `…66378.1.1`) over its own public key. Because attest-lb already commits
-    `SHA-256(mesh_CA_DER)` into the nonce-fresh `report_data`, both extensions are covered
-    by per-handshake hardware evidence. TEErminator verifies the CA's embedded evidence
-    through `attestation-go`, requires its launch to pass the same measurement policy as
-    the front door (the `--measurements` allowlist or the `--image-manifest` tuple, plus
-    `--min-tcb` when set), requires the sealed digest to equal the SHA-256 of the
-    `--allowlist` file's exact bytes, and refuses a mesh leaf whose matched-workload stamp
-    was decided under any other snapshot. This is what closes the gap the workload pin
-    leaves open: with a dynamic allowlist the operator can widen the policy between two
-    requests and have CDS stamp a new pod; with a seal, changing the policy means launching
-    a new CDS and minting a new CA, which the next handshake refuses. Without `--allowlist`
-    the seal is verified but compared to no reviewed document, and the verdict says so.
-    `--init-data <hex>` additionally pins the sealed CA evidence's init-data claim (the
-    SHA-256 of the CDS pod's kata init-data document) for pod-as-CVM deployments. Both
-    require `--mode attest-lb`. On bare-metal SNP the CA certificate carries no VCEK, so
-    the first verification fetches it from AMD KDS; the CA is immutable, so its verified
-    claims are reused for later handshakes and only the policy is re-applied.
   - **Platform-complete pinning.** The `--measurements` allowlist pins the launch
     digest, which means different things per platform. On **Intel TDX** the launch
     digest (MRTD) measures only the TDVF firmware — the guest kernel and rootfs live in
@@ -148,10 +130,21 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     extra register pin exists; `--min-tcb <bootloader,tee,snp,microcode>` adds a
     component-wise minimum TCB floor (an all-zero floor gates nothing and is treated as
     no floor), and debug-launched guests are always rejected.
-    Cross-platform pins fail closed: a TDX pin (`--image-manifest`/`--expected-rtmr3`)
-    against SNP evidence is a hard error naming the platform, as is `--min-tcb` against
-    TDX evidence — never a silently ignored option. All three require
-    `--mode attest-lb`: on any other mode nothing would read them.
+    Cross-platform pins fail closed: a TDX pin
+    (`--image-manifest`/`--expected-rtmr3`/`--tdx-tcb-status`) against SNP evidence is a
+    hard error naming the platform, as is `--min-tcb` against TDX evidence — never a
+    silently ignored option. All four require `--mode attest-lb`: on any other mode
+    nothing would read them.
+  - **TDX TCB status.** By default TDX evidence is verified offline: the quote signature
+    and the PCK chain to the Intel root, with no TCB status. `--tdx-tcb-status <list>`
+    names the Intel TCB statuses you accept, for example `UpToDate` or
+    `UpToDate,SWHardeningNeeded`. With it, every attestation fetches the TCB info, QE
+    identity and PCK CRLs from Intel PCS, refuses a revoked PCK chain, and requires the
+    platform, TDX module and QE TCB levels to each carry an accepted status. Accepted
+    values are `UpToDate`, `SWHardeningNeeded`, `ConfigurationNeeded`,
+    `ConfigurationAndSWHardeningNeeded`, `OutOfDate` and `OutOfDateConfigurationNeeded`.
+    An unreachable Intel PCS fails the attestation. `status` prints the least favourable
+    matched status.
   - **Requires `public_tls.mode=cds` or `public_tls.mode=acme`.** The serving key must
     stay inside the TEE. A `cds` certificate chains to the mesh CA. An `acme`
     certificate chains to WebPKI and is also bound into fresh hardware evidence. A
@@ -179,21 +172,14 @@ $ ./teerminator remote add 127.0.0.1:8081 https://<LB-IP>/ \
 $ ./teerminator remote add 127.0.0.1:8082 https://<LB-IP>/ \
     --mode attest-lb --measurements <hex,...> --min-tcb 3,0,8,209
 
-# Sealed policy: the mesh CA must seal exactly the reviewed allowlist, and the CDS that
-# minted it must run on the pinned image.
+# TDX: also require an Intel TCB status of UpToDate or SWHardeningNeeded.
 $ ./teerminator remote add 127.0.0.1:8083 https://<LB-IP>/ \
     --mode attest-lb --image-manifest ./image-manifest.json \
-    --static-allowlist --allowlist ./static-allowlist.json --workload api
+    --tdx-tcb-status UpToDate,SWHardeningNeeded
 
 # Optional hardening: pin the mesh CA to upgrade the verdict to specific-cluster.
 $ ./teerminator certs add ./mesh-ca.pem
 ```
-
-`status` reports a sealed remote as `sealed allowlist <digest> (mesh CA launch <digest>)`.
-The digest is the same value `c8s allowlist digest <file>` prints, so a reviewer can pin
-the document they read without contacting the cluster; `allowlist fetch --pin` is the
-other way to obtain it, and under a seal the fetched bytes are also checked against the
-sealed digest.
 
 ### Fetching the allowlist
 

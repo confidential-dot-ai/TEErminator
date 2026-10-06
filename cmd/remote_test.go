@@ -100,23 +100,27 @@ func TestValidatePinModes(t *testing.T) {
 		rtmr3    = "deadbeef"
 		tcb      = "3,0,8,209"
 	)
+	tdxTCB := []string{"UpToDate"}
 	for _, tc := range []struct {
 		name                 string
 		mode                 config.AttestMode
 		manifest, rtmr3, tcb string
+		tdxTCB               []string
 		wantFlag             string
 	}{
-		{"attest-lb accepts every pin", config.AttestEndpoint, manifest, rtmr3, tcb, ""},
-		{"no mode, no pins", config.AttestNone, "", "", "", ""},
-		{"no mode rejects the image manifest", config.AttestNone, manifest, "", "", "--image-manifest"},
-		{"no mode rejects the rtmr3 pin", config.AttestNone, "", rtmr3, "", "--expected-rtmr3"},
-		{"no mode rejects the tcb floor", config.AttestNone, "", "", tcb, "--min-tcb"},
-		{"cds-cert rejects the image manifest", config.AttestCDSCert, manifest, "", "", "--image-manifest"},
-		{"cds-cert rejects the rtmr3 pin", config.AttestCDSCert, "", rtmr3, "", "--expected-rtmr3"},
-		{"cds-cert rejects the tcb floor", config.AttestCDSCert, "", "", tcb, "--min-tcb"},
+		{"attest-lb accepts every pin", config.AttestEndpoint, manifest, rtmr3, tcb, tdxTCB, ""},
+		{"no mode, no pins", config.AttestNone, "", "", "", nil, ""},
+		{"no mode rejects the image manifest", config.AttestNone, manifest, "", "", nil, "--image-manifest"},
+		{"no mode rejects the rtmr3 pin", config.AttestNone, "", rtmr3, "", nil, "--expected-rtmr3"},
+		{"no mode rejects the tcb floor", config.AttestNone, "", "", tcb, nil, "--min-tcb"},
+		{"no mode rejects the tdx tcb status", config.AttestNone, "", "", "", tdxTCB, "--tdx-tcb-status"},
+		{"cds-cert rejects the image manifest", config.AttestCDSCert, manifest, "", "", nil, "--image-manifest"},
+		{"cds-cert rejects the rtmr3 pin", config.AttestCDSCert, "", rtmr3, "", nil, "--expected-rtmr3"},
+		{"cds-cert rejects the tcb floor", config.AttestCDSCert, "", "", tcb, nil, "--min-tcb"},
+		{"cds-cert rejects the tdx tcb status", config.AttestCDSCert, "", "", "", tdxTCB, "--tdx-tcb-status"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validatePinModes(tc.mode, tc.manifest, tc.rtmr3, tc.tcb)
+			err := validatePinModes(tc.mode, tc.manifest, tc.rtmr3, tc.tcb, tc.tdxTCB)
 			if tc.wantFlag == "" {
 				if err != nil {
 					t.Fatalf("validatePinModes = %v, want it accepted", err)
@@ -152,40 +156,5 @@ func TestValidateRTMR3Flag(t *testing.T) {
 		if _, err := validateRTMR3Flag(bad); err == nil {
 			t.Errorf("validateRTMR3Flag(%q) accepted", bad)
 		}
-	}
-}
-
-func TestValidateStaticAllowlistFlags(t *testing.T) {
-	initData := strings.Repeat("5e", 32)
-	tests := []struct {
-		name     string
-		mode     config.AttestMode
-		static   bool
-		initData string
-		wantErr  string
-	}{
-		{"no pins on any mode", config.AttestNone, false, "", ""},
-		{"static on attest-lb", config.AttestEndpoint, true, "", ""},
-		{"static with init-data", config.AttestEndpoint, true, initData, ""},
-		{"static needs attest-lb", config.AttestNone, true, "", "--static-allowlist requires --mode attest-lb"},
-		{"static needs attest-lb (cds-cert)", config.AttestCDSCert, true, "", "--static-allowlist requires --mode attest-lb"},
-		{"init-data needs attest-lb", config.AttestNone, false, initData, "--init-data requires --mode attest-lb"},
-		{"init-data needs static", config.AttestEndpoint, false, initData, "--init-data requires --static-allowlist"},
-		{"init-data not hex", config.AttestEndpoint, true, "zz", "not hex"},
-		{"init-data wrong length", config.AttestEndpoint, true, "5e5e", "want 32"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateStaticAllowlistFlags(tc.mode, tc.static, tc.initData)
-			if tc.wantErr == "" {
-				if err != nil {
-					t.Fatalf("validateStaticAllowlistFlags(%q, %v, %q) = %v, want nil", tc.mode, tc.static, tc.initData, err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("validateStaticAllowlistFlags(%q, %v, %q) = %v, want error containing %q", tc.mode, tc.static, tc.initData, err, tc.wantErr)
-			}
-		})
 	}
 }

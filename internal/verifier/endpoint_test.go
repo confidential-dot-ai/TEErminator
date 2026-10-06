@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -352,11 +353,12 @@ type stubClaims struct {
 	launchDigest string
 	platformData map[string]any
 	tcb          teetypes.TcbInfo
+	tcbStatus    *teetypes.DcapVerificationStatus
 }
 
 // stubCalls records what the attester handed the evidence seam.
 type stubCalls struct {
-	minTCB *teetypes.SnpTcb
+	pins platformPins
 }
 
 // stubEvidence swaps the evidence-verification seam for a stub that only
@@ -375,8 +377,8 @@ func stubEvidenceClaims(t *testing.T, sc stubClaims) *stubCalls {
 	}
 	calls := &stubCalls{}
 	orig := verifyEvidence
-	verifyEvidence = func(b attestationBundle, expected []byte, minTCB *teetypes.SnpTcb) (*teetypes.VerificationResult, error) {
-		calls.minTCB = minTCB
+	verifyEvidence = func(b attestationBundle, expected []byte, pins platformPins) (*teetypes.VerificationResult, error) {
+		calls.pins = pins
 		var ev struct {
 			ReportData string `json:"report_data"`
 		}
@@ -398,6 +400,7 @@ func stubEvidenceClaims(t *testing.T, sc stubClaims) *stubCalls {
 				TCB:          sc.tcb,
 				PlatformData: sc.platformData,
 			},
+			TCBStatus: sc.tcbStatus,
 		}, nil
 	}
 	t.Cleanup(func() { verifyEvidence = orig })
@@ -1162,8 +1165,8 @@ func TestAttestLBMinTCB(t *testing.T) {
 			t.Fatal(err)
 		}
 		wantEngine := &teetypes.SnpTcb{Bootloader: 3, Tee: 0, Snp: 8, Microcode: 209}
-		if calls.minTCB == nil || *calls.minTCB != *wantEngine {
-			t.Errorf("engine received MinTCB %+v, want %+v", calls.minTCB, wantEngine)
+		if got := calls.pins.minTCB; got == nil || *got != *wantEngine {
+			t.Errorf("engine received MinTCB %+v, want %+v", got, wantEngine)
 		}
 		if v.TCBFloor != "bootloader=3,tee=0,snp=8,microcode=209" {
 			t.Errorf("TCBFloor = %q", v.TCBFloor)
@@ -1427,5 +1430,101 @@ func TestSessionCachePinning(t *testing.T) {
 	c.Invalidate("r")
 	if _, fresh, _ := c.FreshSession("r"); fresh {
 		t.Fatal("invalidated entry should not be fresh")
+	}
+}
+
+func TestAttestLBTDXTCBStatus(t *testing.T) {
+	accepted := []string{"UpToDate", "SWHardeningNeeded"}
+	reported := func(s teetypes.TdxTcbStatus) *teetypes.DcapVerificationStatus {
+		return &teetypes.DcapVerificationStatus{TCBStatus: s}
+	}
+	tests := []struct {
+		name       string
+		platform   string
+		statuses   []string
+		reported   *teetypes.DcapVerificationStatus
+		static     bool
+		wantStatus string
+		wantErr    string
+	}{
+		{name: "offline without a policy", platform: "tdx"},
+		{name: "accepted status is reported", platform: "tdx", statuses: accepted, reported: reported(teetypes.TdxSWHardeningNeeded), wantStatus: "SWHardeningNeeded"},
+		{name: "unaccepted status fails", platform: "tdx", statuses: accepted, reported: reported(teetypes.TdxOutOfDate), wantErr: "no accepted TCB status"},
+		{name: "unreported status fails closed", platform: "tdx", statuses: accepted, wantErr: "no accepted TCB status"},
+		{name: "SNP evidence fails closed", platform: "snp", statuses: accepted, wantErr: `evidence platform is "snp"`},
+		{name: "unknown status is a configuration error", platform: "tdx", statuses: []string{"uptodate"}, wantErr: "configuration error"},
+		{name: "revoked is a configuration error", platform: "tdx", statuses: []string{"Revoked"}, wantErr: "configuration error"},
+		{name: "removed static allowlist is a configuration error", platform: "tdx", static: true, wantErr: "static_allowlist and init_data are no longer supported"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claims := tdxStubClaims()
+			if tt.platform == "snp" {
+				claims = stubClaims{launchDigest: "a1"}
+			}
+			claims.tcbStatus = tt.reported
+			calls := stubEvidenceClaims(t, claims)
+			f := newLBFixture(t, fixtureOpts{})
+			ts := f.newServer(t, bundleSpec{platform: tt.platform})
+			remote := config.Remote{Mode: config.AttestEndpoint, TDXTCBStatus: tt.statuses, StaticAllowlist: tt.static}
+			if tt.platform == "tdx" {
+				remote.ImageManifestPath = pinManifest(t)
+			} else {
+				remote.Measurements = []string{"a1"}
+			}
+			v, err := newLBAttester(t, ts, remote, nil).Attest(context.Background())
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("Attest() = %v, want error containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Attest() = %v", err)
+			}
+			if v.TDXTCBStatus != tt.wantStatus {
+				t.Errorf("TDXTCBStatus = %q, want %q", v.TDXTCBStatus, tt.wantStatus)
+			}
+			if got := len(calls.pins.tdxTCBStatuses); got != len(tt.statuses) {
+				t.Errorf("engine received %d accepted statuses, want %d", got, len(tt.statuses))
+			}
+		})
+	}
+}
+
+func TestVerifierOptions(t *testing.T) {
+	offline := verifierOptions(platformPins{})
+	if offline.TDX.GetCollateral || offline.TDX.CheckRevocations || offline.TDX.Getter != nil {
+		t.Errorf("verifierOptions(no policy) = %+v, want offline", offline.TDX)
+	}
+	statuses := []teetypes.TdxTcbStatus{teetypes.TdxUpToDate}
+	online := verifierOptions(platformPins{tdxTCBStatuses: statuses})
+	if !online.TDX.GetCollateral || !online.TDX.CheckRevocations || online.TDX.Getter == nil || !slices.Equal(online.TDX.AcceptedTCBStatuses, statuses) {
+		t.Errorf("verifierOptions(UpToDate) = %+v, want collateral, revocation checks and the accepted statuses", online.TDX)
+	}
+}
+
+func TestParseTDXTCBStatuses(t *testing.T) {
+	tests := []struct {
+		in      []string
+		want    []teetypes.TdxTcbStatus
+		wantErr string
+	}{
+		{in: nil},
+		{in: []string{"UpToDate", "OutOfDate"}, want: []teetypes.TdxTcbStatus{teetypes.TdxUpToDate, teetypes.TdxOutOfDate}},
+		{in: []string{"UpToDate", "Revoked"}, wantErr: "cannot be accepted"},
+		{in: []string{"Latest"}, wantErr: "unknown TDX TCB status"},
+	}
+	for _, tt := range tests {
+		got, err := ParseTDXTCBStatuses(tt.in)
+		if tt.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("ParseTDXTCBStatuses(%q) = %v, want error containing %q", tt.in, err, tt.wantErr)
+			}
+			continue
+		}
+		if err != nil || !slices.Equal(got, tt.want) {
+			t.Errorf("ParseTDXTCBStatuses(%q) = %v, %v, want %v", tt.in, got, err, tt.want)
+		}
 	}
 }
