@@ -407,7 +407,7 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 			return nil, fmt.Errorf("attestation verification failed for %s: %w", host, err)
 		}
 		slog.Info("attestation verified", "mode", t.remote.Mode, "url", req.URL.String(),
-			"measurement", v.Measurement, "trust", v.TrustMode)
+			"measurement", v.Measurement, "trust", v.TrustMode, "route_digest", v.RouteDigest)
 		leaf = pinned
 	}
 	if leaf == ([32]byte{}) {

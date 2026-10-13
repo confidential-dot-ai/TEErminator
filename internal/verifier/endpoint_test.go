@@ -14,6 +14,7 @@ import (
 	_ "embed"
 	"encoding/asn1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -55,6 +56,7 @@ func TestAttestLBTranscriptGoldenVectors(t *testing.T) {
 		ServingLeafDERB64 string `json:"serving_leaf_der_b64"`
 		MeshLeafDERB64    string `json:"mesh_leaf_der_b64"`
 		MeshCADERB64      string `json:"mesh_ca_der_b64"`
+		RouteDigestB64    string `json:"route_digest_b64"`
 		ReportDataB64     string `json:"report_data_b64"`
 	}
 	if err := json.Unmarshal(transcriptVectors, &vectors); err != nil {
@@ -72,7 +74,7 @@ func TestAttestLBTranscriptGoldenVectors(t *testing.T) {
 	}
 	for _, v := range vectors {
 		t.Run(v.Description, func(t *testing.T) {
-			got := attestLBReportData(v.FrontDoorMode, unb64(v.NonceB64), unb64(v.ServingLeafDERB64), unb64(v.MeshLeafDERB64), unb64(v.MeshCADERB64))
+			got := attestLBReportData(v.FrontDoorMode, unb64(v.NonceB64), unb64(v.ServingLeafDERB64), unb64(v.MeshLeafDERB64), unb64(v.MeshCADERB64), unb64(v.RouteDigestB64))
 			if want := unb64(v.ReportDataB64); !bytes.Equal(got[:], want) {
 				t.Fatalf("report_data = %x, want %x", got, want)
 			}
@@ -217,6 +219,9 @@ func newLBFixture(t *testing.T, opts fixtureOpts) *lbFixture {
 	return f
 }
 
+// fixtureRouteDigest is the route digest the honest fixture LB attests.
+var fixtureRouteDigest = sha256.Sum256([]byte("fixture route manifest"))
+
 // bundleSpec controls what the fixture LB serves; the zero value is the honest
 // bundle for the fixture.
 type bundleSpec struct {
@@ -232,7 +237,10 @@ type bundleSpec struct {
 	signKey        *ecdsa.PrivateKey
 	breakSig       bool
 	evidence       func(reportData []byte) json.RawMessage // default: stub shape {"report_data": ...}
-	observe        func(*http.Request)                     // called with the request as received
+	routeDigest    *string                                 // route_digest served; default hex(fixtureRouteDigest)
+	// transcriptRoute is the digest committed by evidence; default fixtureRouteDigest.
+	transcriptRoute []byte
+	observe         func(*http.Request) // called with the request as received
 	// allowlist, when set, answers GET /allowlist on the same origin, as the
 	// front door does (the tls-lb proxies both routes). Unset leaves the route
 	// answering the attest-lb handler, i.e. not a served allowlist at all.
@@ -270,7 +278,11 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		if transcriptMode == "" {
 			transcriptMode = frontDoorMode
 		}
-		reportData := attestLBReportData(transcriptMode, nonce, servingDER, f.mesh.cert.Raw, f.ca.cert.Raw)
+		transcriptRoute := spec.transcriptRoute
+		if transcriptRoute == nil {
+			transcriptRoute = fixtureRouteDigest[:]
+		}
+		reportData := attestLBReportData(transcriptMode, nonce, servingDER, f.mesh.cert.Raw, f.ca.cert.Raw, transcriptRoute)
 		digest := sha512.Sum384(reportData[:])
 		signKey := spec.signKey
 		if signKey == nil {
@@ -318,8 +330,7 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		}
 		meshSum := sha256.Sum256(f.mesh.cert.Raw)
 		servingSum := sha256.Sum256(servingDER)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		body := map[string]any{
 			"version":         version,
 			"platform":        platform,
 			"generation":      1,
@@ -334,7 +345,13 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 				"signature":      base64.RawURLEncoding.EncodeToString(sig),
 			},
 			"serving_leaf_sha256": base64.RawURLEncoding.EncodeToString(servingSum[:]),
-		})
+			"route_digest":        hex.EncodeToString(fixtureRouteDigest[:]),
+		}
+		if spec.routeDigest != nil {
+			body["route_digest"] = *spec.routeDigest
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(body)
 	}
 	ts := httptest.NewUnstartedServer(http.HandlerFunc(handler))
 	ts.TLS = &tls.Config{Certificates: []tls.Certificate{{
@@ -511,6 +528,9 @@ func TestAttestLBHappyPath(t *testing.T) {
 		if v.WorkloadName != "" || v.AllowlistVersion != "" {
 			t.Errorf("unpinned verdict carries workload fields: %+v", v)
 		}
+		if want := hex.EncodeToString(fixtureRouteDigest[:]); v.RouteDigest != want {
+			t.Errorf("RouteDigest = %q, want %q", v.RouteDigest, want)
+		}
 	})
 
 	t.Run("specific-cluster with matching CA pin", func(t *testing.T) {
@@ -636,6 +656,58 @@ func TestAttestLBRejectsWrongVersion(t *testing.T) {
 			_, err := ea.Attest(context.Background())
 			if err == nil || !strings.Contains(err.Error(), version) || !strings.Contains(err.Error(), attestLBVersion) {
 				t.Fatalf("want version-mismatch error naming %q and %q, got %v", version, attestLBVersion, err)
+			}
+		})
+	}
+}
+
+func TestAttestLBRouteDigest(t *testing.T) {
+	stubEvidence(t)
+	f := newLBFixture(t, fixtureOpts{})
+	honest := hex.EncodeToString(fixtureRouteDigest[:])
+	other := strings.Repeat("6b", RouteDigestSize)
+	otherBytes := bytes.Repeat([]byte{0x6b}, RouteDigestSize)
+	str := func(s string) *string { return &s }
+
+	for _, tc := range []struct {
+		name    string
+		spec    bundleSpec
+		pins    []string
+		want    string // attested digest; default honest
+		wantErr string
+	}{
+		{name: "unpinned accepts the attested digest"},
+		{name: "pin matches", pins: []string{honest}},
+		{name: "rollover pins match either", pins: []string{other, honest}},
+		{name: "pin mismatch names both digests", pins: []string{other}, wantErr: "the router attests " + honest + ", want one of " + other},
+		{name: "missing route_digest", spec: bundleSpec{routeDigest: str("")}, wantErr: "no route_digest"},
+		{name: "uppercase route_digest", spec: bundleSpec{routeDigest: str(strings.ToUpper(honest))}, wantErr: "lowercase hex"},
+		{name: "short route_digest", spec: bundleSpec{routeDigest: str(honest[:62])}, wantErr: "lowercase hex"},
+		{name: "non-hex route_digest", spec: bundleSpec{routeDigest: str(strings.Repeat("zz", RouteDigestSize))}, wantErr: "lowercase hex"},
+		{name: "attests a non-default digest", spec: bundleSpec{transcriptRoute: otherBytes, routeDigest: str(other)}, pins: []string{other}, want: other},
+		{name: "forged route_digest fails the transcript", spec: bundleSpec{routeDigest: str(other)}, pins: []string{other}, wantErr: "report_data does not match"},
+		{name: "malformed pin is a configuration error", pins: []string{strings.ToUpper(honest)}, wantErr: "configuration error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := f.newServer(t, tc.spec)
+			remote := measuredRemote()
+			remote.RouteDigests = tc.pins
+			v, err := newLBAttester(t, ts, remote, nil).Attest(context.Background())
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Attest() = %v, want success", err)
+				}
+				want := tc.want
+				if want == "" {
+					want = honest
+				}
+				if v.RouteDigest != want {
+					t.Fatalf("RouteDigest = %q, want %q", v.RouteDigest, want)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Attest() = %v, want an error containing %q", err, tc.wantErr)
 			}
 		})
 	}

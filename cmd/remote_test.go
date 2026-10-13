@@ -101,26 +101,29 @@ func TestValidatePinModes(t *testing.T) {
 		tcb      = "3,0,8,209"
 	)
 	tdxTCB := []string{"UpToDate"}
+	routes := []string{strings.Repeat("ab", 32)}
 	for _, tc := range []struct {
 		name                 string
 		mode                 config.AttestMode
 		manifest, rtmr3, tcb string
-		tdxTCB               []string
+		tdxTCB, routes       []string
 		wantFlag             string
 	}{
-		{"attest-lb accepts every pin", config.AttestEndpoint, manifest, rtmr3, tcb, tdxTCB, ""},
-		{"no mode, no pins", config.AttestNone, "", "", "", nil, ""},
-		{"no mode rejects the image manifest", config.AttestNone, manifest, "", "", nil, "--image-manifest"},
-		{"no mode rejects the rtmr3 pin", config.AttestNone, "", rtmr3, "", nil, "--expected-rtmr3"},
-		{"no mode rejects the tcb floor", config.AttestNone, "", "", tcb, nil, "--min-tcb"},
-		{"no mode rejects the tdx tcb status", config.AttestNone, "", "", "", tdxTCB, "--tdx-tcb-status"},
-		{"cds-cert rejects the image manifest", config.AttestCDSCert, manifest, "", "", nil, "--image-manifest"},
-		{"cds-cert rejects the rtmr3 pin", config.AttestCDSCert, "", rtmr3, "", nil, "--expected-rtmr3"},
-		{"cds-cert rejects the tcb floor", config.AttestCDSCert, "", "", tcb, nil, "--min-tcb"},
-		{"cds-cert rejects the tdx tcb status", config.AttestCDSCert, "", "", "", tdxTCB, "--tdx-tcb-status"},
+		{"attest-lb accepts every pin", config.AttestEndpoint, manifest, rtmr3, tcb, tdxTCB, routes, ""},
+		{"no mode, no pins", config.AttestNone, "", "", "", nil, nil, ""},
+		{"no mode rejects the image manifest", config.AttestNone, manifest, "", "", nil, nil, "--image-manifest"},
+		{"no mode rejects the rtmr3 pin", config.AttestNone, "", rtmr3, "", nil, nil, "--expected-rtmr3"},
+		{"no mode rejects the tcb floor", config.AttestNone, "", "", tcb, nil, nil, "--min-tcb"},
+		{"no mode rejects the tdx tcb status", config.AttestNone, "", "", "", tdxTCB, nil, "--tdx-tcb-status"},
+		{"cds-cert rejects the image manifest", config.AttestCDSCert, manifest, "", "", nil, nil, "--image-manifest"},
+		{"cds-cert rejects the rtmr3 pin", config.AttestCDSCert, "", rtmr3, "", nil, nil, "--expected-rtmr3"},
+		{"cds-cert rejects the tcb floor", config.AttestCDSCert, "", "", tcb, nil, nil, "--min-tcb"},
+		{"cds-cert rejects the tdx tcb status", config.AttestCDSCert, "", "", "", tdxTCB, nil, "--tdx-tcb-status"},
+		{"no mode rejects the route digest", config.AttestNone, "", "", "", nil, routes, "--route-digest"},
+		{"cds-cert rejects the route digest", config.AttestCDSCert, "", "", "", nil, routes, "--route-digest"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validatePinModes(tc.mode, tc.manifest, tc.rtmr3, tc.tcb, tc.tdxTCB)
+			err := validatePinModes(tc.mode, tc.manifest, tc.rtmr3, tc.tcb, tc.tdxTCB, tc.routes)
 			if tc.wantFlag == "" {
 				if err != nil {
 					t.Fatalf("validatePinModes = %v, want it accepted", err)

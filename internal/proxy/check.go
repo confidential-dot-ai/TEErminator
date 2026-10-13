@@ -88,6 +88,7 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		if v.TDXTCBStatus != "" {
 			detail += ", tdx tcb status " + v.TDXTCBStatus
 		}
+		detail += ", route digest " + v.RouteDigest
 		if v.Warning != "" {
 			detail += " — WARNING: " + v.Warning
 		}

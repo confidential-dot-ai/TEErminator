@@ -94,8 +94,8 @@ func (c *SessionCache) Invalidate(key string) {
 // one-byte tag and uint32-BE length: the sorted lowercased measurement
 // allowlist, the pinned workload name, the pinned allowlist file digest (when
 // set), the pinned image-manifest file digest (when set), the expected-RTMR[3]
-// pin, the SNP TCB floor (when set), the sorted accepted TDX TCB statuses, and
-// the sorted pinned-CA DER SHA-256 fingerprints. Every policy input is part of
+// pin, the SNP TCB floor (when set), the sorted accepted TDX TCB statuses, the
+// sorted route-digest pins, and the sorted pinned-CA DER SHA-256 fingerprints. Every policy input is part of
 // the key, so a verdict cached under one policy or endpoint mode can never
 // authorize traffic under another.
 func RemoteKey(host string, r config.Remote, allowlistDigest, imageManifestDigest []byte, pinnedCAs []*x509.Certificate) string {
@@ -132,6 +132,11 @@ func RemoteKey(host string, r config.Remote, allowlistDigest, imageManifestDiges
 	sort.Strings(statuses)
 	for _, s := range statuses {
 		field('x', []byte(s))
+	}
+	routes := slices.Clone(r.RouteDigests)
+	sort.Strings(routes)
+	for _, d := range routes {
+		field('d', []byte(d))
 	}
 	fps := make([]string, len(pinnedCAs))
 	for i, ca := range pinnedCAs {

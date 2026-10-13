@@ -23,8 +23,8 @@ func newStatusCmd() *cobra.Command {
 
 Each remote is verified right now, with the same trust construction the proxy
 forwards over: remotes with --mode attest-lb run the full attest-lb
-verification (Verified / Failed, with the measurement, workload name, and
-trust mode printed below the table), remotes without an attestation mode are
+verification (Verified / Failed, with the measurement, workload name,
+trust mode and route digest printed below the table), remotes without an attestation mode are
 probed for reachability (Untrusted / Failed), and remotes whose mode the proxy
 cannot enforce yet are reported Failed. The results are persisted, so
 'remote ls' shows the last checked status.`,

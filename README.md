@@ -11,7 +11,7 @@ In particular it is meant to support the Confidential.ai stack and its confident
 forwards over: `--mode attest-lb` remotes run the full attest-lb verification,
 unattested remotes are probed for reachability, and modes the proxy cannot
 enforce yet report `Failed`. Details (the verified measurement, workload name,
-and trust mode, or the failure reason) are printed below the table, and results
+trust mode and route digest, or the failure reason) are printed below the table, and results
 are persisted so `remote ls` shows the last checked status.
 
 ```
@@ -21,7 +21,7 @@ Local            Remote                                                 Auth   M
 127.0.0.1:14323  https://confidential-vllm-production-stack.lunal.dev/  None   attest-lb  Verified
 [::1]:8080       https://api.ollama.provider.com/v1/                    Token  None       Failed
 
-127.0.0.1:14323: measurement 6d86eef8bfaea0f34a2a8dda5b8b0a97c9174a01d0a3546b930b16fceccb6d9e1e0d1cbc35e4a839e00e2b71c50ee2e2, workload api, trust deployment-class (ca-vouched)
+127.0.0.1:14323: measurement 6d86eef8bfaea0f34a2a8dda5b8b0a97c9174a01d0a3546b930b16fceccb6d9e1e0d1cbc35e4a839e00e2b71c50ee2e2, workload api, trust deployment-class (ca-vouched), route digest 3f1c9a0b7d2e4c6f8a1b3d5e7f9a0c2e4b6d8f1a3c5e7b9d0f2a4c6e8b1de07a
 ```
 
 Adding new remote TEE APIs:
@@ -72,8 +72,9 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   and verifies, in order: the
   `c8s/attest-lb/v1` binding identifier and nonce echo; the hardware evidence over
   `report_data = SHA-384(LP(version) || LP(front_door_mode) || LP(nonce) || LP(SHA-256(serving_leaf_DER)) ||
-  LP(SHA-256(mesh_leaf_DER)) || LP(SHA-256(mesh_CA_DER)))`, recomputed from the **exact
-  serving certificate observed on that very connection**; the mesh-leaf key's proof of
+  LP(SHA-256(mesh_leaf_DER)) || LP(SHA-256(mesh_CA_DER)) || LP(route_digest))`, recomputed from the **exact
+  serving certificate observed on that very connection** and the bundle's `route_digest`
+  (`LP(x)` is the 4-byte big-endian length of `x` followed by `x`); the mesh-leaf key's proof of
   possession over the same transcript; that the mesh leaf chains to the committed mesh
   CA; and that the serving leaf follows the attested mode's trust rule. In `cds` mode it
   chains to the mesh CA. In `acme` mode it passes WebPKI chain and hostname validation.
@@ -133,8 +134,8 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     Cross-platform pins fail closed: a TDX pin
     (`--image-manifest`/`--expected-rtmr3`/`--tdx-tcb-status`) against SNP evidence is a
     hard error naming the platform, as is `--min-tcb` against TDX evidence — never a
-    silently ignored option. All four require `--mode attest-lb`: on any other mode
-    nothing would read them.
+    silently ignored option. All four, and `--route-digest`, require `--mode attest-lb`:
+    on any other mode nothing would read them.
   - **TDX TCB status.** By default TDX evidence is verified offline: the quote signature
     and the PCK chain to the Intel root, with no TCB status. `--tdx-tcb-status <list>`
     names the Intel TCB statuses you accept, for example `UpToDate` or
@@ -145,6 +146,23 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     `ConfigurationAndSWHardeningNeeded`, `OutOfDate` and `OutOfDateConfigurationNeeded`.
     An unreachable Intel PCS fails the attestation. `status` prints the least favourable
     matched status.
+  - **Route digest.** The evidence binds `route_digest`, the SHA-256 of the route
+    manifest the router had applied when it admitted the handshake. The bundle carries
+    it as 64 lowercase hex characters; a bundle without it, or with any other form, is
+    refused, and a forged value fails the transcript. `status` prints it and the proxy
+    logs it on every attestation. `--route-digest <hex,...>` (config key
+    `route_digests`) requires the attested digest to be one of the listed values, and
+    the error names both. Take the value from `c8s routes digest FILE` or
+    `c8s routes show`: it hashes the manifest bytes as stored on CDS, so hashing a
+    reformatted copy or the signed envelope gives a digest that never matches. To
+    change routes without failing, add the new digest to `route_digests` in the config
+    file (the daemon reloads it; `remote add` sets pins only on a new remote), apply the
+    new manifest, wait for every router replica, then remove the old digest. The digest is an admission-time snapshot: a manifest applied after the
+    handshake routes later requests without new evidence until the next attestation.
+    TEErminator does not verify the published manifest under operator keys.
+    The field changes the attest-lb layout under the same `c8s/attest-lb/v1` binding
+    identifier, so this version and a router that predates route-bound evidence do not
+    interoperate in either direction.
   - **Requires `public_tls.mode=cds` or `public_tls.mode=acme`.** The serving key must
     stay inside the TEE. A `cds` certificate chains to the mesh CA. An `acme`
     certificate chains to WebPKI and is also bound into fresh hardware evidence. A
@@ -176,6 +194,10 @@ $ ./teerminator remote add 127.0.0.1:8082 https://<LB-IP>/ \
 $ ./teerminator remote add 127.0.0.1:8083 https://<LB-IP>/ \
     --mode attest-lb --image-manifest ./image-manifest.json \
     --tdx-tcb-status UpToDate,SWHardeningNeeded
+
+# Pin the route manifest; list two digests while routes change.
+$ ./teerminator remote add 127.0.0.1:8084 https://<LB-IP>/ \
+    --mode attest-lb --measurements <hex,...> --route-digest <old-hex>,<new-hex>
 
 # Optional hardening: pin the mesh CA to upgrade the verdict to specific-cluster.
 $ ./teerminator certs add ./mesh-ca.pem
@@ -261,4 +283,6 @@ The running daemon watches the config file: a `remote add`/`remote rm` or `certs
 stopping only the affected tunnels — no restart needed. Send `SIGHUP` to reload
 immediately. A tunnel whose policy or trust store changed is restarted; an edit that
 fails to apply (e.g. a port already taken) is logged and the daemon keeps serving the
-rest.
+rest. The config file refuses unknown keys, so a misspelled pin such as `routeDigests`
+fails the load instead of loading as unset; a reload that fails keeps the running
+tunnels unchanged.

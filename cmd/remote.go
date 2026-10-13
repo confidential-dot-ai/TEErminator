@@ -105,7 +105,7 @@ func validateImageManifestFlag(path string) (string, error) {
 // enforce it. Only attest-lb verifies hardware evidence, so on any other mode
 // these are inert: the remote reads as configured, and the gap only surfaces
 // much later — if ever — as traffic that was never measured.
-func validatePinModes(mode config.AttestMode, imageManifest, expectedRTMR3, minTCB string, tdxTCBStatus []string) error {
+func validatePinModes(mode config.AttestMode, imageManifest, expectedRTMR3, minTCB string, tdxTCBStatus, routeDigests []string) error {
 	if mode == config.AttestEndpoint {
 		return nil
 	}
@@ -114,6 +114,7 @@ func validatePinModes(mode config.AttestMode, imageManifest, expectedRTMR3, minT
 		{"--expected-rtmr3", expectedRTMR3},
 		{"--min-tcb", minTCB},
 		{"--tdx-tcb-status", strings.Join(tdxTCBStatus, ",")},
+		{"--route-digest", strings.Join(routeDigests, ",")},
 	} {
 		if pin.value != "" {
 			return fmt.Errorf("%s requires --mode attest-lb: nothing verifies hardware measurements in mode %q, so the pin would be stored but never enforced", pin.flag, mode)
@@ -177,6 +178,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 		expectedRTMR3 string
 		minTCB        string
 		tdxTCBStatus  []string
+		routeDigests  []string
 	)
 
 	cmd := &cobra.Command{
@@ -195,8 +197,11 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
 			}
 
-			if err := validatePinModes(attestMode, imageManifest, expectedRTMR3, minTCB, tdxTCBStatus); err != nil {
+			if err := validatePinModes(attestMode, imageManifest, expectedRTMR3, minTCB, tdxTCBStatus, routeDigests); err != nil {
 				return err
+			}
+			if err := verifier.ValidateRouteDigests(routeDigests); err != nil {
+				return fmt.Errorf("--route-digest: %w", err)
 			}
 			if _, err := verifier.ParseTDXTCBStatuses(tdxTCBStatus); err != nil {
 				return fmt.Errorf("--tdx-tcb-status: %w", err)
@@ -251,6 +256,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				ExpectedRTMR3:     rtmr3Stored,
 				MinTCB:            tcbFloor,
 				TDXTCBStatus:      tdxTCBStatus,
+				RouteDigests:      routeDigests,
 			}
 			if err := cfg.AddRemote(r); err != nil {
 				return err
@@ -279,6 +285,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 lowercase hex chars — pins the runtime measurement register, i.e. the ordered operator-key/workload-event chain extended after boot. This is a deployment property, NOT a cluster identity, and cannot replace an image pin, so it requires --image-manifest. TDX evidence only — with SNP evidence this is a policy error")
 	f.StringVar(&minTCB, "min-tcb", "", "minimum SNP TCB floor as four comma-separated components <bootloader,tee,snp,microcode> (each 0-255), enforced component-wise on the verified evidence. SNP evidence only — with TDX evidence this is a policy error")
 	f.StringSliceVar(&tdxTCBStatus, "tdx-tcb-status", nil, "Intel TCB statuses accepted for TDX evidence, comma-separated: UpToDate, SWHardeningNeeded, ConfigurationNeeded, ConfigurationAndSWHardeningNeeded, OutOfDate, OutOfDateConfigurationNeeded. When set, every attestation fetches TCB info, QE identity and PCK CRLs from Intel PCS, refuses a revoked PCK chain, and requires the platform, TDX module and QE TCB statuses to be in this list. When unset, TDX evidence is verified offline (quote signature and PCK chain only). TDX evidence only — with SNP evidence this is a policy error")
+	f.StringSliceVar(&routeDigests, "route-digest", nil, "accepted route digests (SHA-256 of the route manifest, 64 lowercase hex chars), comma-separated or repeated; the router must attest one of them. Pass the old and the new digest while routes change. Requires --mode attest-lb. Unset accepts any attested digest")
 	return cmd
 }
 

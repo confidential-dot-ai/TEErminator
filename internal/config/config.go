@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -114,6 +116,10 @@ type Remote struct {
 	// verified offline. TDX evidence only — with SNP evidence this pin is a
 	// policy error.
 	TDXTCBStatus []string `json:"tdx_tcb_status,omitempty"`
+	// RouteDigests pins the route manifest the router must attest, as 64
+	// lowercase hex chars each; any one matching passes, so listing the old
+	// and the new digest rides out a route change. Empty accepts any digest.
+	RouteDigests []string `json:"route_digests,omitempty"`
 	// StaticAllowlist and InitData belong to the removed sealed-mesh-CA
 	// policy. They are still read so a config that sets them fails closed
 	// instead of silently dropping the pin.
@@ -197,9 +203,15 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Unknown keys are refused: a misspelled pin would otherwise load as unset.
 	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, err
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("parsing %s: trailing data after the config object", path)
 	}
 	// Normalize the legacy "attest" mode spelling to "attest-lb" so configs
 	// written before the endpoint split keep working.

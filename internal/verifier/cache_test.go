@@ -146,6 +146,11 @@ func TestRemoteKey(t *testing.T) {
 			r.TDXTCBStatus = []string{"UpToDate", "SWHardeningNeeded"}
 			return RemoteKey("lb.example:443", r, nil, nil, nil)
 		}(),
+		"route digest pin": func() string {
+			r := base
+			r.RouteDigests = []string{strings.Repeat("ab", 32)}
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
+		}(),
 		"allowlist digest":            RemoteKey("lb.example:443", base, []byte{1, 2, 3}, nil, nil),
 		"image manifest digest":       RemoteKey("lb.example:443", base, nil, []byte{1, 2, 3}, nil),
 		"other image manifest digest": RemoteKey("lb.example:443", base, nil, []byte{4, 5, 6}, nil),
