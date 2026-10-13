@@ -14,6 +14,7 @@ import (
 	_ "embed"
 	"encoding/asn1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -237,6 +238,8 @@ type bundleSpec struct {
 	// front door does (the tls-lb proxies both routes). Unset leaves the route
 	// answering the attest-lb handler, i.e. not a served allowlist at all.
 	allowlist http.HandlerFunc
+	// measuredPolicies is the bundle's measured_policies list; nil omits it.
+	measuredPolicies []string
 }
 
 // newServer serves the attest-lb bundle over TLS with the fixture's serving
@@ -319,7 +322,7 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		meshSum := sha256.Sum256(f.mesh.cert.Raw)
 		servingSum := sha256.Sum256(servingDER)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		body := map[string]any{
 			"version":         version,
 			"platform":        platform,
 			"generation":      1,
@@ -334,7 +337,11 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 				"signature":      base64.RawURLEncoding.EncodeToString(sig),
 			},
 			"serving_leaf_sha256": base64.RawURLEncoding.EncodeToString(servingSum[:]),
-		})
+		}
+		if spec.measuredPolicies != nil {
+			body["measured_policies"] = spec.measuredPolicies
+		}
+		_ = json.NewEncoder(w).Encode(body)
 	}
 	ts := httptest.NewUnstartedServer(http.HandlerFunc(handler))
 	ts.TLS = &tls.Config{Certificates: []tls.Certificate{{
@@ -953,6 +960,27 @@ func TestAttestLBTDXImagePins(t *testing.T) {
 		}
 		if v.Warning != "" {
 			t.Errorf("complete TDX policy must not warn, got %q", v.Warning)
+		}
+	})
+
+	t.Run("measured policies replay from the RTMR[3] seed", func(t *testing.T) {
+		seed, vec := loadMeasuredPoliciesVector(t)
+		sc := tdxStubClaims()
+		sc.platformData["rtmr_3"] = vec.RTMR3[0]
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx", measuredPolicies: vec.Policies})
+		remote := config.Remote{
+			Mode:              config.AttestEndpoint,
+			ImageManifestPath: pinManifest(t),
+			ExpectedRTMR3:     hex.EncodeToString(seed[:]),
+		}
+		v, err := newLBAttester(t, ts, remote, nil).Attest(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := vec.Policies[:1]; !slices.Equal(v.MeasuredPolicies, want) {
+			t.Errorf("MeasuredPolicies = %v, want %v", v.MeasuredPolicies, want)
 		}
 	})
 
