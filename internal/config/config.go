@@ -99,8 +99,9 @@ type Remote struct {
 	// adding to it; setting both is a configuration error. TDX evidence only —
 	// with SNP evidence this pin is a policy error, never silently ignored.
 	ImageManifestPath string `json:"image_manifest_path,omitempty"`
-	// ExpectedRTMR3 pins TDX RTMR[3] — the runtime operator-key/workload event
-	// chain extended after boot — as 96 lowercase hex chars. A deployment
+	// ExpectedRTMR3 pins TDX RTMR[3] as 96 lowercase hex chars: the bare
+	// operator-key seed, which a node that measures its allowlist policies
+	// extends once per policy (replayed from the bundle's list). A deployment
 	// property, not a cluster identity: the host chooses which guest extends
 	// the register, so this pin requires ImageManifestPath alongside it and is
 	// a configuration error without one. TDX evidence only.

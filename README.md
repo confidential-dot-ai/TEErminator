@@ -119,9 +119,16 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     the manifest replaces `--measurements` rather than widening it: a second allowlist
     could only admit an image the manifest does not describe, and setting both is a
     configuration error. `--expected-rtmr3 <hex>`
-    optionally pins the runtime operator-key/workload chain on top, and *only* on top:
+    optionally pins RTMR[3] on top, and *only* on top:
     RTMR[3] records events extended into a guest whose image the untrusted host selects,
-    so it requires `--image-manifest` and is a configuration error without one. Because
+    so it requires `--image-manifest` and is a configuration error without one. Pin the
+    bare operator-key seed, the register before the node measures any policy. A node
+    that measures its allowlist policies extends RTMR[3] once per policy and lists them
+    in its bundle (`measured_policies`); TEErminator accepts the quote when the longest
+    prefix of that list that replays from the seed reaches the quoted register, and
+    reports that prefix in `check` and `status`. Nothing judges those policies yet, so
+    the verdict warns when any replayed. A malformed list, or one longer than 256
+    entries, fails closed. Because
     MRTD alone is
     not an image identity, a *deployment-class* TDX verdict without `--image-manifest` is
     a configuration error; with a specific-cluster CA pin it passes but the verdict
