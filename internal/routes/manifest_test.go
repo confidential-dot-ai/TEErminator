@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -70,7 +71,7 @@ func newCA(t testing.TB, key *ecdsa.PrivateKey) (string, *x509.Certificate, *ecd
 // baseManifest returns a valid manifest as a JSON tree that tests edit.
 func baseManifest(ca string) map[string]any {
 	return map[string]any{
-		"schema":        Schema,
+		"schema":        manifestSchema,
 		"revision":      12,
 		"notBefore":     "2026-09-01T00:00:00Z",
 		"maxAgeSeconds": 86400,
@@ -111,12 +112,12 @@ func backendOf(m map[string]any, i int) map[string]any {
 }
 
 func TestParseExample(t *testing.T) {
-	m, err := Parse(readExample(t))
+	m, err := parseManifest(readExample(t))
 	if err != nil {
-		t.Fatalf("Parse(example) = %v, want nil", err)
+		t.Fatalf("parseManifest(example) = %v, want nil", err)
 	}
 	if m.Revision != 12 || !slices.Equal(m.Hosts, []string{"app.example"}) {
-		t.Errorf("Parse(example) = %+v, want revision 12 routing app.example", m)
+		t.Errorf("parseManifest(example) = %+v, want revision 12 routing app.example", m)
 	}
 	for host, want := range map[string]bool{"app.example": true, "APP.example:443": true, "app.example.": false, "other.example": false} {
 		if got := m.Routes(host); got != want {
@@ -126,9 +127,9 @@ func TestParseExample(t *testing.T) {
 }
 
 func TestDigestGolden(t *testing.T) {
-	d := Digest(readExample(t))
+	d := sha256.Sum256(readExample(t))
 	if got := hex.EncodeToString(d[:]); got != goldenDigest {
-		t.Errorf("Digest(example) = %s, want %s", got, goldenDigest)
+		t.Errorf("sha256.Sum256(example) = %s, want %s", got, goldenDigest)
 	}
 }
 
@@ -137,11 +138,11 @@ func TestDigestGolden(t *testing.T) {
 func TestDigestExactBytes(t *testing.T) {
 	b := readExample(t)
 	spaced := append([]byte(" "), b...)
-	if _, err := Parse(spaced); err != nil {
-		t.Fatalf("Parse(spaced example) = %v, want nil", err)
+	if _, err := parseManifest(spaced); err != nil {
+		t.Fatalf("parseManifest(spaced example) = %v, want nil", err)
 	}
-	if Digest(spaced) == Digest(b) {
-		t.Errorf("Digest(spaced example) = Digest(example), want different")
+	if sha256.Sum256(spaced) == sha256.Sum256(b) {
+		t.Errorf("sha256.Sum256(spaced example) = sha256.Sum256(example), want different")
 	}
 }
 
@@ -191,8 +192,8 @@ func TestParseAccepts(t *testing.T) {
 			m := baseManifest(ca)
 			tt.edit(m)
 			b := encode(t, m)
-			if _, err := Parse(b); err != nil {
-				t.Errorf("Parse(%s) = %v, want nil", b, err)
+			if _, err := parseManifest(b); err != nil {
+				t.Errorf("parseManifest(%s) = %v, want nil", b, err)
 			}
 		})
 	}
@@ -355,9 +356,9 @@ func TestParseRejects(t *testing.T) {
 				tt.edit(m)
 				b = encode(t, m)
 			}
-			_, err := Parse(b)
+			_, err := parseManifest(b)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-				t.Errorf("Parse(%.200s) = %v, want error containing %q", b, err, tt.wantErr)
+				t.Errorf("parseManifest(%.200s) = %v, want error containing %q", b, err, tt.wantErr)
 			}
 		})
 	}

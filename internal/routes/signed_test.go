@@ -43,9 +43,16 @@ func mint(t testing.TB, key *ecdsa.PrivateKey, alg string, body []byte, edit fun
 	if edit != nil {
 		edit(claims)
 	}
-	hash := map[string]crypto.Hash{"ES256": crypto.SHA256, "ES384": crypto.SHA384, "ES512": crypto.SHA512}[alg]
 	header, _ := json.Marshal(map[string]string{"alg": alg, "typ": "JWT"})
 	payload, _ := json.Marshal(claims)
+	return mintRaw(t, key, header, payload)
+}
+
+// mintRaw signs a token over exactly header and payload, with the ES
+// algorithm of key's curve.
+func mintRaw(t testing.TB, key *ecdsa.PrivateKey, header, payload []byte) string {
+	t.Helper()
+	hash := map[int]crypto.Hash{256: crypto.SHA256, 384: crypto.SHA384, 521: crypto.SHA512}[key.Curve.Params().BitSize]
 	input := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload)
 	h := hash.New()
 	h.Write([]byte(input))
@@ -166,6 +173,8 @@ func TestVerifySigned(t *testing.T) {
 	invalid := []byte(`{"schema":"c8s.routes/v1"}`)
 	token := mint(t, key, "ES256", body, nil)
 	parts := strings.Split(token, ".")
+	sum := sha256.Sum256(body)
+	claimsJSON := `{"htm":"PUT","htu":"/routes","pbh":"` + base64.RawURLEncoding.EncodeToString(sum[:]) + `"}`
 	withHeader := func(header string) string {
 		return base64.RawURLEncoding.EncodeToString([]byte(header)) + "." + parts[1] + "." + parts[2]
 	}
@@ -187,6 +196,12 @@ func TestVerifySigned(t *testing.T) {
 		{name: "Bearer prefix", env: Envelope{body, "Bearer " + token}, wantErr: "header is malformed"},
 		{name: "two segments", env: Envelope{body, parts[0] + "." + parts[1]}, wantErr: "not a compact JWS"},
 		{name: "flipped signature", env: Envelope{body, parts[0] + "." + parts[1] + "." + flip(parts[2])}, wantErr: "not signed by any pinned operator key"},
+		{name: "crit header", env: Envelope{body, mintRaw(t, key, []byte(`{"alg":"ES256","crit":["exp"],"exp":1}`), []byte(claimsJSON))}, wantErr: "crit"},
+		{name: "duplicate header member", env: Envelope{body, mintRaw(t, key, []byte(`{"alg":"ES256","alg":"ES256"}`), []byte(claimsJSON))}, wantErr: "header is malformed"},
+		{name: "alg member in other case", env: Envelope{body, mintRaw(t, key, []byte(`{"ALG":"ES256"}`), []byte(claimsJSON))}, wantErr: `algorithm ""`},
+		{name: "duplicate claim", env: Envelope{body, mintRaw(t, key, []byte(`{"alg":"ES256"}`), []byte(strings.Replace(claimsJSON, `{`, `{"htm":"GET",`, 1)))}, wantErr: "claims are malformed"},
+		{name: "unpaired surrogate in a claim", env: Envelope{body, mintRaw(t, key, []byte(`{"alg":"ES256"}`), []byte(strings.Replace(claimsJSON, `{`, `{"x":"\ud800",`, 1)))}, wantErr: "claims are malformed"},
+		{name: "raw header and claims", env: Envelope{body, mintRaw(t, key, []byte(`{"alg":"ES256"}`), []byte(claimsJSON))}},
 		{name: "wrong htm", env: Envelope{body, mint(t, key, "ES256", body, func(c map[string]any) { c["htm"] = "POST" })}, wantErr: "htm"},
 		{name: "wrong htu", env: Envelope{body, mint(t, key, "ES256", body, func(c map[string]any) { c["htu"] = "/allowlist" })}, wantErr: "htu"},
 		{name: "htm in other case", env: Envelope{body, mint(t, key, "ES256", body, func(c map[string]any) { c["HTM"] = c["htm"]; delete(c, "htm") })}, wantErr: "htm"},
@@ -207,7 +222,7 @@ func TestVerifySigned(t *testing.T) {
 			if err != nil {
 				t.Fatalf("VerifySigned() = %v, want nil", err)
 			}
-			if s.Digest != Digest(tc.env.Manifest) || s.Manifest.Revision != 12 {
+			if s.Digest != sha256.Sum256(tc.env.Manifest) || s.Manifest.Revision != 12 {
 				t.Errorf("VerifySigned() = %+v, want the manifest's digest and revision 12", s)
 			}
 		})

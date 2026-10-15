@@ -227,13 +227,38 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 	}, nil
 }
 
+// attestDeadline bounds a whole Attest call, both attempts and every fetch,
+// shared between them: twice the proxy's 30 s per-request timeout. A caller's
+// shorter context deadline still applies.
+const attestDeadline = 60 * time.Second
+
 // Attest runs the per-handshake attest-lb verification and returns the verdict,
 // or an error (fail closed). The checks run strictly in this order: serving
 // leaf capture, bundle shape (version, nonce echo), served chain parsing and
 // committed-CA selection, identity-proof field equality, hardware evidence over
 // the recomputed transcript, proof of possession, mesh-leaf chain, serving-leaf
-// trust, measurement policy, workload policy, route check.
+// trust, measurement policy, workload policy, route check. With operator keys
+// the route publication is fetched alongside the handshake and checked last;
+// a revision below the floor, or a digest no re-fetch reconciles, gets one
+// more attestation on new connections.
 func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) {
+	ctx, cancel := context.WithTimeout(ctx, attestDeadline)
+	defer cancel()
+	v, err := e.attest(ctx)
+	if errors.Is(err, routes.ErrRollback) || errors.Is(err, errRouteMismatch) {
+		// A revision below the floor, or a handshake and publication that
+		// disagree, most likely means a replica that has not applied the
+		// newest manifest yet. New connections may reach one that has.
+		e.client.CloseIdleConnections()
+		first := err
+		if v, err = e.attest(ctx); err != nil {
+			return nil, fmt.Errorf("%w; after attesting again on new connections: %w", first, err)
+		}
+	}
+	return v, err
+}
+
+func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) {
 	// Platform pins are resolved before any network round trip: a malformed
 	// image manifest, RTMR[3] pin, or TCB floor is a configuration error. The
 	// manifest is re-read per attestation so an updated file takes effect (the
@@ -246,6 +271,12 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	routeKeys, err := routeCheck(e.remote)
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb: configuration error: %w", err)
+	}
+	var published <-chan publication
+	if len(routeKeys) > 0 {
+		pubCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		published = e.fetchPublication(pubCtx, routeKeys)
 	}
 
 	nonce := make([]byte, 32)
@@ -456,7 +487,7 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	// Last, so a mismatch reports a digest from an otherwise trusted router.
 	switch {
 	case len(routeKeys) > 0:
-		s, err := e.checkPublishedRoutes(ctx, routeKeys, routeDigest)
+		s, err := e.checkPublishedRoutes(ctx, routeKeys, routeDigest, <-published)
 		if err != nil {
 			return nil, fmt.Errorf("attest-lb: %w", err)
 		}

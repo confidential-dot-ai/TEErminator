@@ -123,7 +123,9 @@ type Remote struct {
 	// RouteOperatorKeys holds PEM ECDSA public keys. When set, the client
 	// fetches the router's published signed route manifest, verifies it under
 	// one of these keys and requires its digest to equal the attested one.
-	// Mutually exclusive with RouteDigests.
+	// Each entry is a bundle of one or more PUBLIC KEY blocks; `remote add`
+	// writes one key per entry, and a key listed twice is harmless. Mutually
+	// exclusive with RouteDigests.
 	RouteOperatorKeys []string `json:"route_operator_keys,omitempty"`
 	// StaticAllowlist and InitData belong to the removed sealed-mesh-CA
 	// policy. They are still read so a config that sets them fails closed

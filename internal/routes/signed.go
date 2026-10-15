@@ -81,7 +81,7 @@ func VerifySigned(env Envelope, keys []*ecdsa.PublicKey) (*Signed, error) {
 	if subtle.ConstantTimeCompare([]byte(pbh), []byte(base64.RawURLEncoding.EncodeToString(sum[:]))) != 1 {
 		return nil, errors.New("verify route write token: pbh does not match the manifest bytes")
 	}
-	m, err := Parse(env.Manifest)
+	m, err := parseManifest(env.Manifest)
 	if err != nil {
 		return nil, err
 	}
@@ -95,18 +95,21 @@ func verifyToken(keys []*ecdsa.PublicKey, token string) (map[string]any, error) 
 	if len(parts) != 3 {
 		return nil, errors.New("token is not a compact JWS")
 	}
-	var header struct {
-		Alg string `json:"alg"`
-	}
+	var header map[string]any
 	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil || json.Unmarshal(raw, &header) != nil {
+	if err != nil || validateJSON(raw) != nil || json.Unmarshal(raw, &header) != nil {
 		return nil, errors.New("token header is malformed")
 	}
+	// No extension is supported, so a critical one must be refused.
+	if _, ok := header["crit"]; ok {
+		return nil, errors.New("token header carries crit, and no JWS extension is supported")
+	}
+	alg, _ := header["alg"].(string)
 	var (
 		hash  crypto.Hash
 		curve elliptic.Curve
 	)
-	switch header.Alg {
+	switch alg {
 	case "ES256":
 		hash, curve = crypto.SHA256, elliptic.P256()
 	case "ES384":
@@ -114,7 +117,7 @@ func verifyToken(keys []*ecdsa.PublicKey, token string) (map[string]any, error) 
 	case "ES512":
 		hash, curve = crypto.SHA512, elliptic.P521()
 	default:
-		return nil, fmt.Errorf("token algorithm %q is not ES256, ES384 or ES512", header.Alg)
+		return nil, fmt.Errorf("token algorithm %q is not ES256, ES384 or ES512", alg)
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
 	size := (curve.Params().BitSize + 7) / 8
@@ -137,7 +140,7 @@ func verifyToken(keys []*ecdsa.PublicKey, token string) (map[string]any, error) 
 	}
 	var claims map[string]any
 	raw, err = base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil || json.Unmarshal(raw, &claims) != nil {
+	if err != nil || validateJSON(raw) != nil || json.Unmarshal(raw, &claims) != nil {
 		return nil, errors.New("token claims are malformed")
 	}
 	return claims, nil
@@ -193,6 +196,19 @@ var (
 	ErrRevisionConflict = errors.New("route manifest revision equals the accepted one with a different digest")
 )
 
+// RollbackError reports a manifest revision lower than the accepted one. It
+// matches ErrRollback.
+type RollbackError struct {
+	Revision, Accepted uint64
+}
+
+func (e *RollbackError) Error() string {
+	return fmt.Sprintf("%v: %d < %d", ErrRollback, e.Revision, e.Accepted)
+}
+
+// Is reports whether target is ErrRollback.
+func (e *RollbackError) Is(target error) bool { return target == ErrRollback }
+
 // Floor is the revision and digest of the last signed manifest a client
 // accepted. The zero Floor has accepted none. A Floor is safe for concurrent
 // use.
@@ -218,7 +234,7 @@ func (f *Floor) Accept(s *Signed) error {
 func (f *Floor) check(s *Signed) error {
 	switch r := s.Manifest.Revision; {
 	case r < f.revision:
-		return fmt.Errorf("%w: %d < %d", ErrRollback, r, f.revision)
+		return &RollbackError{Revision: r, Accepted: f.revision}
 	case r == f.revision && s.Digest != f.digest:
 		return fmt.Errorf("%w: revision %d", ErrRevisionConflict, r)
 	}

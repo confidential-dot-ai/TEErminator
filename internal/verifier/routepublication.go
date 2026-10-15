@@ -55,30 +55,52 @@ func routeCheck(r config.Remote) ([]*ecdsa.PublicKey, error) {
 	return keys, nil
 }
 
-// checkPublishedRoutes fetches the published signed manifest, verifies it
-// under keys, and requires its digest to equal the attested one. The
-// publication may come from another replica than the handshake, so on a
-// mismatch it fetches once more and takes the second manifest only if its
-// revision is higher than the first's. The manifest it takes must pass the
-// attester's revision floor, which then rises to it.
-func (e *EndpointAttester) checkPublishedRoutes(ctx context.Context, keys []*ecdsa.PublicKey, attested [RouteDigestSize]byte) (*routes.Signed, error) {
-	s, err := e.publishedRoutes(ctx, keys)
-	if err != nil {
-		return nil, err
+// errRouteMismatch reports a published manifest whose digest differs from the
+// attested one after the re-fetch.
+var errRouteMismatch = errors.New("route digest mismatch")
+
+// publication is the outcome of one publication fetch and check.
+type publication struct {
+	signed *routes.Signed
+	err    error
+}
+
+// fetchPublication starts the publication fetch alongside the attest-lb
+// handshake. It stops when ctx is done; the buffered channel lets it finish
+// even when nobody reads the result.
+func (e *EndpointAttester) fetchPublication(ctx context.Context, keys []*ecdsa.PublicKey) <-chan publication {
+	ch := make(chan publication, 1)
+	go func() {
+		s, err := e.publishedRoutes(ctx, keys)
+		ch <- publication{s, err}
+	}()
+	return ch
+}
+
+// checkPublishedRoutes requires the published manifest, fetched before the
+// handshake verified, to have the attested digest. The publication may come
+// from another replica than the handshake, so on a mismatch it fetches once
+// more on a new connection and takes that manifest if its digest matches.
+// The manifest it takes must pass the attester's revision floor, which then
+// rises to it.
+func (e *EndpointAttester) checkPublishedRoutes(ctx context.Context, keys []*ecdsa.PublicKey, attested [RouteDigestSize]byte, first publication) (*routes.Signed, error) {
+	if first.err != nil {
+		return nil, first.err
 	}
+	s := first.signed
 	if s.Digest != attested {
-		first := s
 		// A new connection may reach another replica behind an L4 balancer.
+		// The attester's transports speak HTTP/1.1, so the re-fetch cannot
+		// share the handshake's still-open connection.
 		e.client.CloseIdleConnections()
-		if s, err = e.publishedRoutes(ctx, keys); err != nil {
-			return nil, fmt.Errorf("route digest mismatch: the router attests %x, the published manifest revision %d has %x, and the re-fetch failed: %w", attested, first.Manifest.Revision, first.Digest, err)
+		again, err := e.publishedRoutes(ctx, keys)
+		if err != nil {
+			return nil, fmt.Errorf("%w: the router attests %x, the published manifest revision %d has %x, and the re-fetch failed: %w", errRouteMismatch, attested, s.Manifest.Revision, s.Digest, err)
 		}
-		if s.Manifest.Revision <= first.Manifest.Revision {
-			return nil, fmt.Errorf("route digest mismatch: the router attests %x, the published manifest revision %d has %x, and the re-fetched revision %d is not newer; retry once every router replica has applied the same manifest", attested, first.Manifest.Revision, first.Digest, s.Manifest.Revision)
+		if again.Digest != attested {
+			return nil, fmt.Errorf("%w: the router attests %x, the published manifests revisions %d and %d have %x and %x; retry once every router replica has applied the same manifest", errRouteMismatch, attested, s.Manifest.Revision, again.Manifest.Revision, s.Digest, again.Digest)
 		}
-		if s.Digest != attested {
-			return nil, fmt.Errorf("route digest mismatch: the router attests %x, the published manifests revisions %d and %d have %x and %x; retry once every router replica has applied the same manifest", attested, first.Manifest.Revision, s.Manifest.Revision, first.Digest, s.Digest)
-		}
+		s = again
 	}
 	// The proxy sends the remote URL host as Host, and the router selects
 	// routes by it, so a manifest without that host routes no request.
@@ -86,11 +108,11 @@ func (e *EndpointAttester) checkPublishedRoutes(ctx context.Context, keys []*ecd
 		return nil, fmt.Errorf("the operator-signed route manifest revision %d has no routes for host %q: the router would answer every request with 404; route the host in the manifest or fix the remote URL", s.Manifest.Revision, e.attestURL.Hostname())
 	}
 	if err := e.routeFloor.Accept(s); err != nil {
-		action := "the router serves an older manifest than this tunnel accepted; to roll back on purpose, sign the old routes under a higher revision"
-		if errors.Is(err, routes.ErrRevisionConflict) {
-			action = "two manifests were signed under the same revision; sign the intended one under a higher revision"
+		action := "two manifests were signed under the same revision; sign the intended one under a higher revision"
+		if rb, ok := errors.AsType[*routes.RollbackError](err); ok {
+			action = fmt.Sprintf("a router replica may not have applied revision %d yet; retry after the rollout. If this persists, the router serves an older manifest than this tunnel accepted; to roll back on purpose, sign the old routes under a higher revision", rb.Accepted)
 		}
-		return nil, fmt.Errorf("published route manifest: %w (digest %s): %s, or restart the daemon to reset the floor", err, hex.EncodeToString(s.Digest[:]), action)
+		return nil, fmt.Errorf("published route manifest (digest %s): %w: %s", hex.EncodeToString(s.Digest[:]), err, action)
 	}
 	return s, nil
 }

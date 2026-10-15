@@ -161,22 +161,32 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     handshake routes later requests without new evidence until the next attestation.
   - **Route operator keys.** Instead of digests, `--route-operator-key <pem-file>`
     (repeatable; config key `route_operator_keys`, which stores the PEM keys themselves)
-    pins the ECDSA public keys the operator signs route manifests with. After each
+    pins the ECDSA public keys the operator signs route manifests with. With each
     attestation TEErminator fetches the manifest the router publishes at
-    `/.well-known/c8s/routes`, verifies its write token under one of the keys and the
-    manifest schema, and requires its digest to equal the attested one. The router must
-    run with route publication enabled; a 404 fails the attestation. The publication can
-    come from another router replica than the handshake, so on a digest mismatch it
-    fetches once more on a new connection and accepts only a higher revision. Each tunnel
-    keeps the last revision and digest it accepted in memory and refuses a lower revision,
-    or the same revision with another digest. The daemon forgets it on restart, and a
-    tunnel forgets it when it restarts after an edit to its remote or to the trust store.
-    `status` runs each check with an empty floor, so it does not detect a rollback.
+    `/.well-known/c8s/routes`, alongside the handshake. Once the evidence verifies, it
+    checks the manifest's write token under one of the keys and the manifest schema, and
+    requires the manifest digest to equal the attested one. The router must run with
+    route publication enabled. The publication can come from another router replica
+    than the handshake, so on a digest mismatch it fetches once more on a new connection
+    and accepts that manifest if its digest matches, even when the first fetch showed a
+    newer signed revision; only the floor below refuses older revisions.
+    Each tunnel keeps the last revision and digest it accepted in memory and refuses a
+    lower revision, or the same revision with another digest. A lower revision, or a
+    digest the re-fetch does not reconcile, usually means a replica that has not applied
+    the newest manifest yet, so the tunnel attests once more on new connections before
+    it fails. That repeats the whole verification, so such a failure takes up to twice
+    as long to report. One attestation, retry included, shares a 60-second deadline, so
+    a slow first attempt can leave no time for the retry. `status` (10 seconds by
+    default) and `allowlist fetch` are also bounded by their own `--timeout`. The daemon forgets the floor on
+    restart, and a tunnel forgets it when it restarts after an edit to its remote or to
+    the trust store. `status` and `allowlist fetch` start each check with an empty
+    floor, so they do not detect a rollback.
     The manifest must also route the remote URL's host, since the proxy sends it as
     `Host`, so the remote URL needs a DNS name the manifest routes, not an IP address.
-    During a route change, an attestation fails when the handshake and the publication
-    see different manifests that the re-fetch does not reconcile, and the proxy refuses
-    traffic for that remote until the re-attestation interval (one minute) has passed.
+    This check makes the remote depend on the publication: when it fails (404, any other
+    error status, a digest no fetch reconciles, or a revision below the floor), the
+    proxy refuses traffic for that remote until the re-attestation interval (one
+    minute) has passed. Route changes on several replicas can cause such a window.
     `--route-digest` and `--route-operator-key` are mutually exclusive. With
     neither, `status` reports the digest as `unverified`.
     The field changes the attest-lb layout under the same `c8s/attest-lb/v1` binding

@@ -10,7 +10,6 @@ package routes
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -25,8 +24,8 @@ import (
 	"time"
 )
 
-// Schema identifies the manifest format.
-const Schema = "c8s.routes/v1"
+// manifestSchema identifies the manifest format.
+const manifestSchema = "c8s.routes/v1"
 
 const (
 	maxRevision      = 1<<53 - 1
@@ -56,15 +55,9 @@ func (m *Manifest) Routes(host string) bool {
 	return slices.Contains(m.Hosts, string(b))
 }
 
-// Digest returns the route digest of manifest bytes: SHA-256 of exactly
-// those bytes.
-func Digest(manifest []byte) [sha256.Size]byte {
-	return sha256.Sum256(manifest)
-}
-
-// Parse validates manifest bytes against the c8s.routes/v1 schema and
+// parseManifest validates manifest bytes against the c8s.routes/v1 schema and
 // rejects the whole manifest on the first failure.
-func Parse(manifest []byte) (*Manifest, error) {
+func parseManifest(manifest []byte) (*Manifest, error) {
 	m, err := parse(manifest)
 	if err != nil {
 		return nil, fmt.Errorf("route manifest: %w", err)
@@ -84,8 +77,8 @@ func parse(data []byte) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	if schema != Schema {
-		return nil, fmt.Errorf("schema: got %q, want %q", schema, Schema)
+	if schema != manifestSchema {
+		return nil, fmt.Errorf("schema: got %q, want %q", schema, manifestSchema)
 	}
 	var m Manifest
 	if m.Revision, err = integer(top["revision"], "revision", maxRevision); err != nil {
