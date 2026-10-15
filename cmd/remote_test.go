@@ -1,6 +1,11 @@
 package cmd
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,28 +107,31 @@ func TestValidatePinModes(t *testing.T) {
 	)
 	tdxTCB := []string{"UpToDate"}
 	routes := []string{strings.Repeat("ab", 32)}
+	keys := []string{"operator.pub"}
 	for _, tc := range []struct {
 		name                 string
 		mode                 config.AttestMode
 		manifest, rtmr3, tcb string
-		tdxTCB, routes       []string
+		tdxTCB, routes, keys []string
 		wantFlag             string
 	}{
-		{"attest-lb accepts every pin", config.AttestEndpoint, manifest, rtmr3, tcb, tdxTCB, routes, ""},
-		{"no mode, no pins", config.AttestNone, "", "", "", nil, nil, ""},
-		{"no mode rejects the image manifest", config.AttestNone, manifest, "", "", nil, nil, "--image-manifest"},
-		{"no mode rejects the rtmr3 pin", config.AttestNone, "", rtmr3, "", nil, nil, "--expected-rtmr3"},
-		{"no mode rejects the tcb floor", config.AttestNone, "", "", tcb, nil, nil, "--min-tcb"},
-		{"no mode rejects the tdx tcb status", config.AttestNone, "", "", "", tdxTCB, nil, "--tdx-tcb-status"},
-		{"cds-cert rejects the image manifest", config.AttestCDSCert, manifest, "", "", nil, nil, "--image-manifest"},
-		{"cds-cert rejects the rtmr3 pin", config.AttestCDSCert, "", rtmr3, "", nil, nil, "--expected-rtmr3"},
-		{"cds-cert rejects the tcb floor", config.AttestCDSCert, "", "", tcb, nil, nil, "--min-tcb"},
-		{"cds-cert rejects the tdx tcb status", config.AttestCDSCert, "", "", "", tdxTCB, nil, "--tdx-tcb-status"},
-		{"no mode rejects the route digest", config.AttestNone, "", "", "", nil, routes, "--route-digest"},
-		{"cds-cert rejects the route digest", config.AttestCDSCert, "", "", "", nil, routes, "--route-digest"},
+		{"attest-lb accepts every pin", config.AttestEndpoint, manifest, rtmr3, tcb, tdxTCB, routes, keys, ""},
+		{"no mode, no pins", config.AttestNone, "", "", "", nil, nil, nil, ""},
+		{"no mode rejects the image manifest", config.AttestNone, manifest, "", "", nil, nil, nil, "--image-manifest"},
+		{"no mode rejects the rtmr3 pin", config.AttestNone, "", rtmr3, "", nil, nil, nil, "--expected-rtmr3"},
+		{"no mode rejects the tcb floor", config.AttestNone, "", "", tcb, nil, nil, nil, "--min-tcb"},
+		{"no mode rejects the tdx tcb status", config.AttestNone, "", "", "", tdxTCB, nil, nil, "--tdx-tcb-status"},
+		{"cds-cert rejects the image manifest", config.AttestCDSCert, manifest, "", "", nil, nil, nil, "--image-manifest"},
+		{"cds-cert rejects the rtmr3 pin", config.AttestCDSCert, "", rtmr3, "", nil, nil, nil, "--expected-rtmr3"},
+		{"cds-cert rejects the tcb floor", config.AttestCDSCert, "", "", tcb, nil, nil, nil, "--min-tcb"},
+		{"cds-cert rejects the tdx tcb status", config.AttestCDSCert, "", "", "", tdxTCB, nil, nil, "--tdx-tcb-status"},
+		{"no mode rejects the route digest", config.AttestNone, "", "", "", nil, routes, nil, "--route-digest"},
+		{"cds-cert rejects the route digest", config.AttestCDSCert, "", "", "", nil, routes, nil, "--route-digest"},
+		{"no mode rejects the route operator key", config.AttestNone, "", "", "", nil, nil, keys, "--route-operator-key"},
+		{"cds-cert rejects the route operator key", config.AttestCDSCert, "", "", "", nil, nil, keys, "--route-operator-key"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validatePinModes(tc.mode, tc.manifest, tc.rtmr3, tc.tcb, tc.tdxTCB, tc.routes)
+			err := validatePinModes(tc.mode, tc.manifest, tc.rtmr3, tc.tcb, tc.tdxTCB, tc.routes, tc.keys)
 			if tc.wantFlag == "" {
 				if err != nil {
 					t.Fatalf("validatePinModes = %v, want it accepted", err)
@@ -158,6 +166,52 @@ func TestValidateRTMR3Flag(t *testing.T) {
 	for _, bad := range []string{"aabb", strings.ToUpper(pin), strings.Repeat("zz", 48), "4d 4d"} {
 		if _, err := validateRTMR3Flag(bad); err == nil {
 			t.Errorf("validateRTMR3Flag(%q) accepted", bad)
+		}
+	}
+}
+
+// TestReadRouteOperatorKeys checks that --route-operator-key stores one PEM
+// block per key, read from every file, and refuses anything but public keys.
+func TestReadRouteOperatorKeys(t *testing.T) {
+	dir := t.TempDir()
+	block := func(typ string, der []byte) string {
+		return string(pem.EncodeToMemory(&pem.Block{Type: typ, Bytes: der}))
+	}
+	var pubs []string
+	var priv []byte
+	for range 3 {
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der, err := x509.MarshalPKIXPublicKey(&k.PublicKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pubs = append(pubs, block("PUBLIC KEY", der))
+		if priv, err = x509.MarshalPKCS8PrivateKey(k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	two := write("two.pub", pubs[0]+pubs[1])
+	one := write("one.pub", pubs[2])
+	got, err := readRouteOperatorKeys([]string{two, one})
+	if err != nil {
+		t.Fatalf("readRouteOperatorKeys() = %v", err)
+	}
+	if strings.Join(got, "") != strings.Join(pubs, "") {
+		t.Errorf("readRouteOperatorKeys() = %q, want %q", got, pubs)
+	}
+	for _, bad := range []string{write("private.pem", block("PRIVATE KEY", priv)), filepath.Join(dir, "missing.pub")} {
+		if _, err := readRouteOperatorKeys([]string{bad}); err == nil {
+			t.Errorf("readRouteOperatorKeys(%s) = nil, want error", filepath.Base(bad))
 		}
 	}
 }

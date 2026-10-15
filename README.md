@@ -11,7 +11,7 @@ In particular it is meant to support the Confidential.ai stack and its confident
 forwards over: `--mode attest-lb` remotes run the full attest-lb verification,
 unattested remotes are probed for reachability, and modes the proxy cannot
 enforce yet report `Failed`. Details (the verified measurement, workload name,
-trust mode and route digest, or the failure reason) are printed below the table, and results
+trust mode, route digest and how it was checked, or the failure reason) are printed below the table, and results
 are persisted so `remote ls` shows the last checked status.
 
 ```
@@ -21,7 +21,7 @@ Local            Remote                                                 Auth   M
 127.0.0.1:14323  https://confidential-vllm-production-stack.lunal.dev/  None   attest-lb  Verified
 [::1]:8080       https://api.ollama.provider.com/v1/                    Token  None       Failed
 
-127.0.0.1:14323: measurement 6d86eef8bfaea0f34a2a8dda5b8b0a97c9174a01d0a3546b930b16fceccb6d9e1e0d1cbc35e4a839e00e2b71c50ee2e2, workload api, trust deployment-class (ca-vouched), route digest 3f1c9a0b7d2e4c6f8a1b3d5e7f9a0c2e4b6d8f1a3c5e7b9d0f2a4c6e8b1de07a
+127.0.0.1:14323: measurement 6d86eef8bfaea0f34a2a8dda5b8b0a97c9174a01d0a3546b930b16fceccb6d9e1e0d1cbc35e4a839e00e2b71c50ee2e2, workload api, trust deployment-class (ca-vouched), route digest 3f1c9a0b7d2e4c6f8a1b3d5e7f9a0c2e4b6d8f1a3c5e7b9d0f2a4c6e8b1de07a (operator-signed, revision 12)
 ```
 
 Adding new remote TEE APIs:
@@ -134,7 +134,7 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     Cross-platform pins fail closed: a TDX pin
     (`--image-manifest`/`--expected-rtmr3`/`--tdx-tcb-status`) against SNP evidence is a
     hard error naming the platform, as is `--min-tcb` against TDX evidence — never a
-    silently ignored option. All four, and `--route-digest`, require `--mode attest-lb`:
+    silently ignored option. All four, `--route-digest` and `--route-operator-key` require `--mode attest-lb`:
     on any other mode nothing would read them.
   - **TDX TCB status.** By default TDX evidence is verified offline: the quote signature
     and the PCK chain to the Intel root, with no TCB status. `--tdx-tcb-status <list>`
@@ -159,7 +159,26 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     file (the daemon reloads it; `remote add` sets pins only on a new remote), apply the
     new manifest, wait for every router replica, then remove the old digest. The digest is an admission-time snapshot: a manifest applied after the
     handshake routes later requests without new evidence until the next attestation.
-    TEErminator does not verify the published manifest under operator keys.
+  - **Route operator keys.** Instead of digests, `--route-operator-key <pem-file>`
+    (repeatable; config key `route_operator_keys`, which stores the PEM keys themselves)
+    pins the ECDSA public keys the operator signs route manifests with. After each
+    attestation TEErminator fetches the manifest the router publishes at
+    `/.well-known/c8s/routes`, verifies its write token under one of the keys and the
+    manifest schema, and requires its digest to equal the attested one. The router must
+    run with route publication enabled; a 404 fails the attestation. The publication can
+    come from another router replica than the handshake, so on a digest mismatch it
+    fetches once more on a new connection and accepts only a higher revision. Each tunnel
+    keeps the last revision and digest it accepted in memory and refuses a lower revision,
+    or the same revision with another digest. The daemon forgets it on restart, and a
+    tunnel forgets it when it restarts after an edit to its remote or to the trust store.
+    `status` runs each check with an empty floor, so it does not detect a rollback.
+    The manifest must also route the remote URL's host, since the proxy sends it as
+    `Host`, so the remote URL needs a DNS name the manifest routes, not an IP address.
+    During a route change, an attestation fails when the handshake and the publication
+    see different manifests that the re-fetch does not reconcile, and the proxy refuses
+    traffic for that remote until the re-attestation interval (one minute) has passed.
+    `--route-digest` and `--route-operator-key` are mutually exclusive. With
+    neither, `status` reports the digest as `unverified`.
     The field changes the attest-lb layout under the same `c8s/attest-lb/v1` binding
     identifier, so this version and a router that predates route-bound evidence do not
     interoperate in either direction.
@@ -198,6 +217,10 @@ $ ./teerminator remote add 127.0.0.1:8083 https://<LB-IP>/ \
 # Pin the route manifest; list two digests while routes change.
 $ ./teerminator remote add 127.0.0.1:8084 https://<LB-IP>/ \
     --mode attest-lb --measurements <hex,...> --route-digest <old-hex>,<new-hex>
+
+# Or accept any route manifest the operator signed, published by the router.
+$ ./teerminator remote add 127.0.0.1:8085 https://app.example/ \
+    --mode attest-lb --measurements <hex,...> --route-operator-key ./operator.pub
 
 # Optional hardening: pin the mesh CA to upgrade the verdict to specific-cluster.
 $ ./teerminator certs add ./mesh-ca.pem

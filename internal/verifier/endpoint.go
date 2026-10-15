@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/routes"
 	"github.com/confidential-dot-ai/attestation-go/attestation/tdx"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teeverify"
@@ -142,6 +143,12 @@ type SessionVerdict struct {
 	// manifest the router had applied when it admitted this handshake. Later
 	// requests may be routed by a newer manifest without new evidence.
 	RouteDigest string
+	// RouteCheck is how RouteDigest was checked: RoutePinned,
+	// RouteOperatorSigned or RouteUnverified.
+	RouteCheck string
+	// RouteRevision is the revision of the operator-signed manifest
+	// RouteDigest names; zero unless RouteCheck is RouteOperatorSigned.
+	RouteRevision uint64
 	// Warning is a policy gap in an otherwise passing verdict — the MRTD-only
 	// note for specific-cluster TDX remotes without an image pin.
 	Warning string
@@ -189,6 +196,9 @@ type EndpointAttester struct {
 	remote      config.Remote
 	pinnedCAs   []*x509.Certificate
 	webPKIRoots *x509.CertPool
+	// routeFloor is the last published manifest this attester accepted.
+	// It lives as long as the attester, so a restart forgets it.
+	routeFloor routes.Floor
 }
 
 // NewEndpointAttester builds an endpoint attester.
@@ -222,7 +232,7 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 // leaf capture, bundle shape (version, nonce echo), served chain parsing and
 // committed-CA selection, identity-proof field equality, hardware evidence over
 // the recomputed transcript, proof of possession, mesh-leaf chain, serving-leaf
-// trust, measurement policy, workload policy, route-digest pins.
+// trust, measurement policy, workload policy, route check.
 func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) {
 	// Platform pins are resolved before any network round trip: a malformed
 	// image manifest, RTMR[3] pin, or TCB floor is a configuration error. The
@@ -233,8 +243,9 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb: %w", err)
 	}
-	if err := ValidateRouteDigests(e.remote.RouteDigests); err != nil {
-		return nil, fmt.Errorf("attest-lb: configuration error: route_digests: %w", err)
+	routeKeys, err := routeCheck(e.remote)
+	if err != nil {
+		return nil, fmt.Errorf("attest-lb: configuration error: %w", err)
 	}
 
 	nonce := make([]byte, 32)
@@ -443,8 +454,20 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 		v.addWarning("TDX policy covers MRTD only — the guest kernel (RTMR[1]) and rootfs (RTMR[2]) are UNMEASURED by this policy; pin the full image tuple with `remote add --image-manifest`")
 	}
 	// Last, so a mismatch reports a digest from an otherwise trusted router.
-	if err := checkRouteDigest(bundle.RouteDigest, e.remote.RouteDigests); err != nil {
-		return nil, fmt.Errorf("attest-lb: %w", err)
+	switch {
+	case len(routeKeys) > 0:
+		s, err := e.checkPublishedRoutes(ctx, routeKeys, routeDigest)
+		if err != nil {
+			return nil, fmt.Errorf("attest-lb: %w", err)
+		}
+		v.RouteCheck, v.RouteRevision = RouteOperatorSigned, s.Manifest.Revision
+	case len(e.remote.RouteDigests) > 0:
+		if err := checkRouteDigest(bundle.RouteDigest, e.remote.RouteDigests); err != nil {
+			return nil, fmt.Errorf("attest-lb: %w", err)
+		}
+		v.RouteCheck = RoutePinned
+	default:
+		v.RouteCheck = RouteUnverified
 	}
 	return v, nil
 }

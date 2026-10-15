@@ -120,6 +120,11 @@ type Remote struct {
 	// lowercase hex chars each; any one matching passes, so listing the old
 	// and the new digest rides out a route change. Empty accepts any digest.
 	RouteDigests []string `json:"route_digests,omitempty"`
+	// RouteOperatorKeys holds PEM ECDSA public keys. When set, the client
+	// fetches the router's published signed route manifest, verifies it under
+	// one of these keys and requires its digest to equal the attested one.
+	// Mutually exclusive with RouteDigests.
+	RouteOperatorKeys []string `json:"route_operator_keys,omitempty"`
 	// StaticAllowlist and InitData belong to the removed sealed-mesh-CA
 	// policy. They are still read so a config that sets them fails closed
 	// instead of silently dropping the pin.

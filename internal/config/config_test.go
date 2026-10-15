@@ -68,6 +68,7 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 		name, raw, wantKey string
 	}{
 		{"misspelled remote key", `{"remotes":[{"local":"127.0.0.1:8080","remote":"https://lb.example/","mode":"attest-lb","routeDigests":["ab"]}]}`, "routeDigests"},
+		{"misspelled route operator keys", `{"remotes":[{"local":"127.0.0.1:8080","remote":"https://lb.example/","mode":"attest-lb","route_operator_key":["k"]}]}`, "route_operator_key"},
 		{"unknown top-level key", `{"remotes":[],"remote":[]}`, `"remote"`},
 		{"trailing brace", `{"remotes":[]}}`, "trailing data"},
 		{"trailing object", `{"remotes":[]} {}`, "trailing data"},
@@ -98,7 +99,7 @@ func TestLoadAcceptsEveryWrittenKey(t *testing.T) {
 			Token: "t", Mode: AttestEndpoint, DiscoveryURL: "https://d", ServerName: "s",
 			Measurements: []string{"a1"}, WorkloadName: "api", AllowlistPath: "/a", ImageManifestPath: "/i",
 			ExpectedRTMR3: "r", MinTCB: &TCBFloor{Bootloader: 1}, TDXTCBStatus: []string{"UpToDate"},
-			RouteDigests: []string{"ab"}, StaticAllowlist: true, InitData: "x",
+			RouteDigests: []string{"ab"}, RouteOperatorKeys: []string{"k"}, StaticAllowlist: true, InitData: "x",
 			Pin: &CertPin{SHA256: "h", NotAfter: "n", PEM: "p"},
 		}},
 		Certs: []Cert{{Fingerprint: "f", CommonName: "c", PEM: "p"}},

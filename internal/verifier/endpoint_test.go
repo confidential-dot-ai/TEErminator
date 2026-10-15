@@ -245,6 +245,8 @@ type bundleSpec struct {
 	// front door does (the tls-lb proxies both routes). Unset leaves the route
 	// answering the attest-lb handler, i.e. not a served allowlist at all.
 	allowlist http.HandlerFunc
+	// routes, when set, answers GET /.well-known/c8s/routes.
+	routes http.HandlerFunc
 }
 
 // newServer serves the attest-lb bundle over TLS with the fixture's serving
@@ -258,6 +260,10 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		}
 		if spec.allowlist != nil && r.URL.Path == allowlistRoute {
 			spec.allowlist(w, r)
+			return
+		}
+		if spec.routes != nil && r.URL.Path == wellKnownRoutes {
+			spec.routes(w, r)
 			return
 		}
 		nonceB64 := r.URL.Query().Get("nonce")
