@@ -247,6 +247,8 @@ type bundleSpec struct {
 	allowlist http.HandlerFunc
 	// routes, when set, answers GET /.well-known/c8s/routes.
 	routes http.HandlerFunc
+	// measuredPolicies is the bundle's measured_policies list; nil omits it.
+	measuredPolicies []string
 }
 
 // newServer serves the attest-lb bundle over TLS with the fixture's serving
@@ -355,6 +357,9 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		}
 		if spec.routeDigest != nil {
 			body["route_digest"] = *spec.routeDigest
+		}
+		if spec.measuredPolicies != nil {
+			body["measured_policies"] = spec.measuredPolicies
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(body)
@@ -1031,6 +1036,27 @@ func TestAttestLBTDXImagePins(t *testing.T) {
 		}
 		if v.Warning != "" {
 			t.Errorf("complete TDX policy must not warn, got %q", v.Warning)
+		}
+	})
+
+	t.Run("measured policies replay from the RTMR[3] seed", func(t *testing.T) {
+		seed, vec := loadMeasuredPoliciesVector(t)
+		sc := tdxStubClaims()
+		sc.platformData["rtmr_3"] = vec.RTMR3[0]
+		stubEvidenceClaims(t, sc)
+		f := newLBFixture(t, fixtureOpts{})
+		ts := f.newServer(t, bundleSpec{platform: "tdx", measuredPolicies: vec.Policies})
+		remote := config.Remote{
+			Mode:              config.AttestEndpoint,
+			ImageManifestPath: pinManifest(t),
+			ExpectedRTMR3:     hex.EncodeToString(seed[:]),
+		}
+		v, err := newLBAttester(t, ts, remote, nil).Attest(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := vec.Policies[:1]; !slices.Equal(v.MeasuredPolicies, want) {
+			t.Errorf("MeasuredPolicies = %v, want %v", v.MeasuredPolicies, want)
 		}
 	})
 

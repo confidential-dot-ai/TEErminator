@@ -82,6 +82,9 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		if len(v.RTMRsPinned) > 0 {
 			detail += ", rtmrs pinned " + strings.Join(v.RTMRsPinned, " ")
 		}
+		if len(v.MeasuredPolicies) > 0 {
+			detail += ", measured policies " + strings.Join(v.MeasuredPolicies, " ")
+		}
 		if v.TCBFloor != "" {
 			detail += ", tcb floor " + v.TCBFloor
 		}

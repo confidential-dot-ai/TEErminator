@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"github.com/confidential-dot-ai/attestation-go/attestation/tdx"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teeverify"
+	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 )
 
 // ErrNotImplemented is returned for attestation modes that are defined but not
@@ -149,6 +151,11 @@ type SessionVerdict struct {
 	// RouteRevision is the revision of the operator-signed manifest
 	// RouteDigest names; zero unless RouteCheck is RouteOperatorSigned.
 	RouteRevision uint64
+	// MeasuredPolicies is the prefix of the node's measured-policy journal
+	// that replays from the --expected-rtmr3 seed to the quoted RTMR[3], in
+	// extend order. Empty when the register equals the seed or no seed is
+	// pinned.
+	MeasuredPolicies []string
 	// Warning is a policy gap in an otherwise passing verdict — the MRTD-only
 	// note for specific-cluster TDX remotes without an image pin.
 	Warning string
@@ -181,6 +188,9 @@ type attestationBundle struct {
 	FrontDoorMode string          `json:"front_door_mode"`
 	IdentityProof identityProof   `json:"identity_proof"`
 	RouteDigest   string          `json:"route_digest"`
+	// MeasuredPolicies is the node's journal of policy digests extended into
+	// RTMR[3]. It is outside the transcript: only its replay authenticates it.
+	MeasuredPolicies []string `json:"measured_policies"`
 }
 
 // EndpointAttester implements the attest-lb mode. baseURL is the LB origin
@@ -436,7 +446,7 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 	// (i') Platform-complete pins: TDX runtime registers and the SNP TCB floor
 	// are enforced on the verified claims, fail closed — including any pin set
 	// against evidence from a platform it cannot apply to.
-	if err := pins.enforce(platform, res, v); err != nil {
+	if err := pins.enforce(platform, res, v, bundle.MeasuredPolicies); err != nil {
 		return nil, fmt.Errorf("attest-lb: %w", err)
 	}
 
@@ -616,8 +626,9 @@ func loadPlatformPins(r config.Remote) (platformPins, error) {
 // enforce applies the platform pins to the verified claims, recording what was
 // enforced in the verdict. It fails closed on any pin whose platform does not
 // match the evidence, on absent or malformed claims, and on any mismatch —
-// never an ignored option.
-func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.VerificationResult, v *SessionVerdict) error {
+// never an ignored option. measured is the bundle's measured-policy journal,
+// read only against an RTMR[3] pin.
+func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.VerificationResult, v *SessionVerdict, measured []string) error {
 	if (p.image != nil || p.rtmr3 != nil) && !isTDXPlatform(platform) {
 		return fmt.Errorf("a TDX pin (image manifest / expected RTMR[3]) is set but the evidence platform is %q: runtime measurement registers exist only on TDX, so this policy cannot be enforced against %q evidence", platform, platform)
 	}
@@ -658,8 +669,16 @@ func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.Veri
 		}
 	}
 	if p.rtmr3 != nil {
-		if err := check(3, "runtime operator-key/workload chain", p.rtmr3[:]); err != nil {
-			return err
+		if len(measured) == 0 {
+			if err := check(3, rtmr3Meaning, p.rtmr3[:]); err != nil {
+				return err
+			}
+		} else {
+			reg, err := replayRTMR3(res, *p.rtmr3, measured, v)
+			if err != nil {
+				return err
+			}
+			v.RTMRsPinned = append(v.RTMRsPinned, "3:"+hex.EncodeToString(reg[:]))
 		}
 	}
 	if p.minTCB != nil {
@@ -675,6 +694,46 @@ func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.Veri
 			p.minTCB.Bootloader, p.minTCB.Tee, p.minTCB.Snp, p.minTCB.Microcode)
 	}
 	return nil
+}
+
+const rtmr3Meaning = "runtime operator-key/policy chain"
+
+// maxMeasuredPolicies bounds the measured-policy journal a bundle may carry.
+const maxMeasuredPolicies = 256
+
+var canonicalPolicyDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// replayRTMR3 accepts the quoted RTMR[3] when it equals seed, or seed
+// extended with the first n entries of measured for some n, and records those
+// n entries on the verdict. The journal is read after the quote, so it may
+// run ahead of the register; any malformed or oversized journal fails closed.
+func replayRTMR3(res *teetypes.VerificationResult, seed [RegisterSize]byte, measured []string, v *SessionVerdict) ([RegisterSize]byte, error) {
+	if len(measured) > maxMeasuredPolicies {
+		return seed, fmt.Errorf("cannot enforce the RTMR[3] pin: the bundle lists %d measured policies, more than %d", len(measured), maxMeasuredPolicies)
+	}
+	for _, d := range measured {
+		if !canonicalPolicyDigest.MatchString(d) {
+			return seed, fmt.Errorf("cannot enforce the RTMR[3] pin: measured policy %q is not sha256:<64 lowercase hex>", d)
+		}
+	}
+	got, err := rtmrClaim(res, 3)
+	if err != nil {
+		return seed, err
+	}
+	reg := seed
+	for n := 0; ; n++ {
+		if bytes.Equal(got, reg[:]) {
+			if n > 0 {
+				v.MeasuredPolicies = slices.Clone(measured[:n])
+				v.addWarning(fmt.Sprintf("replayed %d measured policies, none judged", n))
+			}
+			return reg, nil
+		}
+		if n == len(measured) {
+			return seed, fmt.Errorf("RTMR[3] (%s) is %x, expected %x, and the node's %d measured policies do not replay from it to that value", rtmr3Meaning, got, seed, len(measured))
+		}
+		reg = runtimemeasure.Extend(reg, runtimemeasure.Event(measured[n]))
+	}
 }
 
 // checkImageMRTD compares the launch digest byte-exactly against the image
@@ -699,20 +758,30 @@ func checkImageMRTD(res *teetypes.VerificationResult, image *ImagePins) error {
 // checkRTMR compares one pinned TDX runtime register against the verified
 // claims, failing closed on an absent or malformed claim.
 func checkRTMR(res *teetypes.VerificationResult, idx int, meaning string, want []byte) error {
+	got, err := rtmrClaim(res, idx)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(got, want) {
+		return fmt.Errorf("RTMR[%d] (%s) is %x, expected %x", idx, meaning, got, want)
+	}
+	return nil
+}
+
+// rtmrClaim reads TDX runtime register idx from the verified claims, failing
+// closed on an absent or malformed claim.
+func rtmrClaim(res *teetypes.VerificationResult, idx int) ([]byte, error) {
 	key := fmt.Sprintf("rtmr_%d", idx)
 	got, _ := res.Claims.PlatformData[key].(string)
 	got = strings.ToLower(strings.TrimSpace(got))
 	if got == "" {
-		return fmt.Errorf("cannot enforce the RTMR[%d] pin: the verified claims carry no %s", idx, key)
+		return nil, fmt.Errorf("cannot enforce the RTMR[%d] pin: the verified claims carry no %s", idx, key)
 	}
 	gb, err := hex.DecodeString(got)
 	if err != nil || len(gb) != RegisterSize {
-		return fmt.Errorf("cannot enforce the RTMR[%d] pin: %s claim is malformed (%q)", idx, key, got)
+		return nil, fmt.Errorf("cannot enforce the RTMR[%d] pin: %s claim is malformed (%q)", idx, key, got)
 	}
-	if !bytes.Equal(gb, want) {
-		return fmt.Errorf("RTMR[%d] (%s) is %s, expected %s", idx, meaning, got, hex.EncodeToString(want))
-	}
-	return nil
+	return gb, nil
 }
 
 // checkTCBFloor compares the verified reported-TCB claims component-wise
