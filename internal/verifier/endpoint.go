@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/routes"
 	"github.com/confidential-dot-ai/attestation-go/attestation/tdx"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teeverify"
@@ -140,6 +141,16 @@ type SessionVerdict struct {
 	// evidence binds the mesh leaf into the transcript, and the mesh CA's
 	// signature over that leaf is what vouches for the stamp inside it.
 	Stamp *MatchedWorkload
+	// RouteDigest is the attested route digest (64 lowercase hex): the route
+	// manifest the router had applied when it admitted this handshake. Later
+	// requests may be routed by a newer manifest without new evidence.
+	RouteDigest string
+	// RouteCheck is how RouteDigest was checked: RoutePinned,
+	// RouteOperatorSigned or RouteUnverified.
+	RouteCheck string
+	// RouteRevision is the revision of the operator-signed manifest
+	// RouteDigest names; zero unless RouteCheck is RouteOperatorSigned.
+	RouteRevision uint64
 	// MeasuredPolicies is the prefix of the node's measured-policy journal
 	// that replays from the --expected-rtmr3 seed to the quoted RTMR[3], in
 	// extend order. Empty when the register equals the seed or no seed is
@@ -176,6 +187,7 @@ type attestationBundle struct {
 	CDSCertPEM    string          `json:"cds_cert_pem"`
 	FrontDoorMode string          `json:"front_door_mode"`
 	IdentityProof identityProof   `json:"identity_proof"`
+	RouteDigest   string          `json:"route_digest"`
 	// MeasuredPolicies is the node's journal of policy digests extended into
 	// RTMR[3]. It is outside the transcript: only its replay authenticates it.
 	MeasuredPolicies []string `json:"measured_policies"`
@@ -194,6 +206,9 @@ type EndpointAttester struct {
 	remote      config.Remote
 	pinnedCAs   []*x509.Certificate
 	webPKIRoots *x509.CertPool
+	// routeFloor is the last published manifest this attester accepted.
+	// It lives as long as the attester, so a restart forgets it.
+	routeFloor routes.Floor
 }
 
 // NewEndpointAttester builds an endpoint attester.
@@ -222,13 +237,38 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 	}, nil
 }
 
+// attestDeadline bounds a whole Attest call, both attempts and every fetch,
+// shared between them: twice the proxy's 30 s per-request timeout. A caller's
+// shorter context deadline still applies.
+const attestDeadline = 60 * time.Second
+
 // Attest runs the per-handshake attest-lb verification and returns the verdict,
 // or an error (fail closed). The checks run strictly in this order: serving
 // leaf capture, bundle shape (version, nonce echo), served chain parsing and
 // committed-CA selection, identity-proof field equality, hardware evidence over
 // the recomputed transcript, proof of possession, mesh-leaf chain, serving-leaf
-// trust, measurement policy, workload policy.
+// trust, measurement policy, workload policy, route check. With operator keys
+// the route publication is fetched alongside the handshake and checked last;
+// a revision below the floor, or a digest no re-fetch reconciles, gets one
+// more attestation on new connections.
 func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) {
+	ctx, cancel := context.WithTimeout(ctx, attestDeadline)
+	defer cancel()
+	v, err := e.attest(ctx)
+	if errors.Is(err, routes.ErrRollback) || errors.Is(err, errRouteMismatch) {
+		// A revision below the floor, or a handshake and publication that
+		// disagree, most likely means a replica that has not applied the
+		// newest manifest yet. New connections may reach one that has.
+		e.client.CloseIdleConnections()
+		first := err
+		if v, err = e.attest(ctx); err != nil {
+			return nil, fmt.Errorf("%w; after attesting again on new connections: %w", first, err)
+		}
+	}
+	return v, err
+}
+
+func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) {
 	// Platform pins are resolved before any network round trip: a malformed
 	// image manifest, RTMR[3] pin, or TCB floor is a configuration error. The
 	// manifest is re-read per attestation so an updated file takes effect (the
@@ -237,6 +277,16 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	pins, err := loadPlatformPins(e.remote)
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb: %w", err)
+	}
+	routeKeys, err := routeCheck(e.remote)
+	if err != nil {
+		return nil, fmt.Errorf("attest-lb: configuration error: %w", err)
+	}
+	var published <-chan publication
+	if len(routeKeys) > 0 {
+		pubCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		published = e.fetchPublication(pubCtx, routeKeys)
 	}
 
 	nonce := make([]byte, 32)
@@ -289,6 +339,15 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	if !isTEEFrontDoorMode(bundle.FrontDoorMode) {
 		return nil, fmt.Errorf("attest-lb: unsupported front_door_mode %q (want %q or %q; %q is attest-pq-only)", bundle.FrontDoorMode, frontDoorModeCDS, frontDoorModeACME, frontDoorModeWebPKI)
 	}
+	// The served digest is read, not trusted: the transcript commits it, so a
+	// forged value fails the evidence check below.
+	if bundle.RouteDigest == "" {
+		return nil, fmt.Errorf("attest-lb: bundle carries no route_digest; upgrade the c8s router to a release that serves it")
+	}
+	routeDigest, err := parseRouteDigest(bundle.RouteDigest)
+	if err != nil {
+		return nil, fmt.Errorf("attest-lb: bundle: %w", err)
+	}
 
 	// (c) Served chain: first block is the mesh leaf; the committed CA is
 	// selected among the remaining blocks by the proof's mesh_ca_sha256.
@@ -318,7 +377,7 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 	// mesh identity, and our nonce, and require the hardware evidence to bind
 	// exactly it. A bundle relayed through any other serving leaf fails here
 	// even when both leaves share an issuer.
-	reportData := attestLBReportData(bundle.FrontDoorMode, nonce, servingLeaf.Raw, meshLeaf.Raw, committedCA.Raw)
+	reportData := attestLBReportData(bundle.FrontDoorMode, nonce, servingLeaf.Raw, meshLeaf.Raw, committedCA.Raw, routeDigest[:])
 	res, err := verifyEvidence(bundle, reportData[:], pins)
 	if err != nil {
 		return nil, err
@@ -381,6 +440,7 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 		Profile:      ProfileCAVouched,
 		LeafSHA256:   sha256.Sum256(servingLeaf.Raw),
 		LeafNotAfter: servingLeaf.NotAfter,
+		RouteDigest:  bundle.RouteDigest,
 	}
 
 	// (i') Platform-complete pins: TDX runtime registers and the SNP TCB floor
@@ -433,6 +493,22 @@ func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) 
 			return nil, fmt.Errorf("attest-lb: configuration error: deployment-class trust over TDX evidence needs an image pin — the measurement allowlist covers only MRTD, which measures the TDVF firmware, so the guest kernel and rootfs are unmeasured; pin the full MRTD+RTMR[1]+RTMR[2] tuple with `remote add --image-manifest`")
 		}
 		v.addWarning("TDX policy covers MRTD only — the guest kernel (RTMR[1]) and rootfs (RTMR[2]) are UNMEASURED by this policy; pin the full image tuple with `remote add --image-manifest`")
+	}
+	// Last, so a mismatch reports a digest from an otherwise trusted router.
+	switch {
+	case len(routeKeys) > 0:
+		s, err := e.checkPublishedRoutes(ctx, routeKeys, routeDigest, <-published)
+		if err != nil {
+			return nil, fmt.Errorf("attest-lb: %w", err)
+		}
+		v.RouteCheck, v.RouteRevision = RouteOperatorSigned, s.Manifest.Revision
+	case len(e.remote.RouteDigests) > 0:
+		if err := checkRouteDigest(bundle.RouteDigest, e.remote.RouteDigests); err != nil {
+			return nil, fmt.Errorf("attest-lb: %w", err)
+		}
+		v.RouteCheck = RoutePinned
+	default:
+		v.RouteCheck = RouteUnverified
 	}
 	return v, nil
 }
@@ -741,12 +817,13 @@ func isTEEFrontDoorMode(mode string) bool {
 //
 //	report_data = SHA-384( LP("c8s/attest-lb/v1") || LP(front_door_mode) || LP(nonce) ||
 //	    LP(SHA-256(serving_leaf_DER)) || LP(SHA-256(mesh_leaf_DER)) ||
-//	    LP(SHA-256(mesh_CA_DER)) )
+//	    LP(SHA-256(mesh_CA_DER)) || LP(route_digest) )
 //
-// where LP(x) = uint32-big-endian(len(x)) || x. The serving-leaf hash covers
-// the FULL certificate DER, not the SPKI, so a substituted certificate with the
-// same key still fails.
-func attestLBReportData(frontDoorMode string, nonce, servingLeafDER, meshLeafDER, meshCADER []byte) [48]byte {
+// where LP(x) = uint32-big-endian(len(x)) || x and route_digest is the 32-byte
+// SHA-256 of the applied route manifest. The serving-leaf hash covers the FULL
+// certificate DER, not the SPKI, so a substituted certificate with the same key
+// still fails.
+func attestLBReportData(frontDoorMode string, nonce, servingLeafDER, meshLeafDER, meshCADER, routeDigest []byte) [48]byte {
 	h := sha512.New384()
 	lp := func(b []byte) {
 		var n [4]byte
@@ -763,6 +840,7 @@ func attestLBReportData(frontDoorMode string, nonce, servingLeafDER, meshLeafDER
 	lp(meshSum[:])
 	caSum := sha256.Sum256(meshCADER)
 	lp(caSum[:])
+	lp(routeDigest)
 	var out [48]byte
 	h.Sum(out[:0])
 	return out

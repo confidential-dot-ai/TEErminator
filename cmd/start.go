@@ -110,8 +110,11 @@ type runningTunnel struct {
 
 // tunnelKey snapshots everything a tunnel's behaviour depends on: the remote's
 // full policy and the trust store the tunnel's TLS config and CA pins were
-// built from. A reload restarts a tunnel exactly when its key changes.
+// built from. A reload restarts a tunnel exactly when its key changes. The
+// last checked status is not policy: `status` writes it, and a restart would
+// drop the tunnel's route revision floor.
 func tunnelKey(r config.Remote, certs []config.Cert) string {
+	r.Status = ""
 	remoteJSON, _ := json.Marshal(r)    // struct of strings and numbers; never fails
 	certsJSON, _ := json.Marshal(certs) // ditto
 	return string(remoteJSON) + "\x00" + string(certsJSON)

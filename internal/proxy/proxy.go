@@ -152,14 +152,20 @@ func (t *Tunnel) Stop() error {
 // h3Transport tries HTTP/3 (QUIC) first and falls back to standard HTTPS/HTTP.
 // A per-host cache remembers hosts where HTTP/3 failed so that subsequent
 // requests skip the QUIC attempt and go directly through the fallback.
+// attester is the per-handshake attestation the transport gates on; tests
+// replace it to control timing.
+type attester interface {
+	Attest(ctx context.Context) (*verifier.SessionVerdict, error)
+}
+
 type h3Transport struct {
 	h3       *http3.Transport
 	fallback *http.Transport
 
 	// attestation enforcement (per-remote, independent of other tunnels)
 	remote    config.Remote
-	ea        *verifier.EndpointAttester // attest-lb mode: active per-handshake attester
-	blocked   error                      // set for recognised-but-unimplemented modes: fail closed without forwarding
+	ea        attester // attest-lb mode: active per-handshake attester
+	blocked   error    // set for recognised-but-unimplemented modes: fail closed without forwarding
 	cache     *verifier.SessionCache
 	remoteKey string
 
@@ -230,7 +236,7 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 	}
 
 	var (
-		ea        *verifier.EndpointAttester
+		ea        attester
 		blocked   error
 		cache     *verifier.SessionCache
 		remoteKey = target.Host
@@ -393,22 +399,27 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 		return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
 	}
 	if !fresh {
+		started := t.cache.Now()
 		v, err := t.ea.Attest(req.Context())
-		var pinned [32]byte
-		var notAfter time.Time
-		if v != nil {
-			pinned = v.LeafSHA256
-			notAfter = v.LeafNotAfter
-		}
-		t.cache.RecordSession(t.remoteKey, err == nil, pinned, notAfter, err)
 		if err != nil {
+			// A cancelled client request says nothing about the remote.
+			if req.Context().Err() == nil {
+				t.cache.RecordFailure(t.remoteKey, started, err)
+			}
 			slog.Warn("attestation verification failed; refusing to forward",
 				"mode", t.remote.Mode, "url", req.URL.String(), "error", err)
 			return nil, fmt.Errorf("attestation verification failed for %s: %w", host, err)
 		}
+		if !t.cache.RecordPass(t.remoteKey, started, v.LeafSHA256, v.LeafNotAfter) {
+			// A later attestation failed: refuse. A later pass leaves this
+			// verified leaf usable.
+			if _, fresh, ok := t.cache.FreshSession(t.remoteKey); fresh && !ok {
+				return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
+			}
+		}
 		slog.Info("attestation verified", "mode", t.remote.Mode, "url", req.URL.String(),
-			"measurement", v.Measurement, "trust", v.TrustMode)
-		leaf = pinned
+			"measurement", v.Measurement, "trust", v.TrustMode, "route_digest", v.RouteDigest, "route_check", v.RouteCheck, "route_revision", v.RouteRevision)
+		leaf = v.LeafSHA256
 	}
 	if leaf == ([32]byte{}) {
 		// Unreachable via either branch above, and deliberately fatal rather

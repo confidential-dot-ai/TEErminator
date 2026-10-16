@@ -24,41 +24,50 @@ func writeManifest(t *testing.T, content string) string {
 }
 
 func TestLoadImageManifestValid(t *testing.T) {
-	// Extra unknown fields are allowed: build manifests carry other data, and
-	// only the three register keys must be unambiguous — a repeated unknown
-	// key (and a nested object naming "mrtd") is none of this loader's
-	// business.
-	p := writeManifest(t, `{
-		"schema": 3, "schema": 4,
-		"artifacts": {"kernel": "deadbeef", "mrtd": "ignored", "mrtd": "ignored"},
-		"mrtd": "`+mrtdHex+`",
-		"rtmr1": "`+rtmr1Hex+`",
-		"rtmr2": "`+rtmr2Hex+`"
-	}`)
-	pins, err := LoadImageManifest(p)
-	if err != nil {
-		t.Fatalf("LoadImageManifest: %v", err)
-	}
-	for _, reg := range []struct {
-		name string
-		got  [RegisterSize]byte
-		want string
-	}{
-		{"mrtd", pins.MRTD, mrtdHex},
-		{"rtmr1", pins.RTMR1, rtmr1Hex},
-		{"rtmr2", pins.RTMR2, rtmr2Hex},
+	// Extra fields are allowed: build manifests carry other data. A nested
+	// object naming "mrtd" under some other key is not the pin.
+	for _, tc := range []struct{ name, content string }{
+		{"flat", `{
+			"schema": 3,
+			"artifacts": {"kernel": "deadbeef", "mrtd": "ignored"},
+			"mrtd": "` + mrtdHex + `",
+			"rtmr1": "` + rtmr1Hex + `",
+			"rtmr2": "` + rtmr2Hex + `"
+		}`},
+		{"nested under tdx (confos v3)", `{
+			"version": 3,
+			"build": {"platform": "tdx"},
+			"tdx": {
+				"firmware": {"path": "OVMF.tdx.fd"},
+				"mrtd": "` + mrtdHex + `",
+				"rtmr1": "` + rtmr1Hex + `",
+				"rtmr2": "` + rtmr2Hex + `"
+			}
+		}`},
 	} {
-		if hex.EncodeToString(reg.got[:]) != reg.want {
-			t.Errorf("%s = %x, want %s", reg.name, reg.got, reg.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			pins, err := LoadImageManifest(writeManifest(t, tc.content))
+			if err != nil {
+				t.Fatalf("LoadImageManifest: %v", err)
+			}
+			for _, reg := range []struct {
+				name string
+				got  [RegisterSize]byte
+				want string
+			}{
+				{"mrtd", pins.MRTD, mrtdHex},
+				{"rtmr1", pins.RTMR1, rtmr1Hex},
+				{"rtmr2", pins.RTMR2, rtmr2Hex},
+			} {
+				if hex.EncodeToString(reg.got[:]) != reg.want {
+					t.Errorf("%s = %x, want %s", reg.name, reg.got, reg.want)
+				}
+			}
+		})
 	}
 }
 
-// TestLoadImageManifestFixture loads the checked-in fixture, which exercises
-// the accepted format end to end. c8s holds no copy of this file, so it proves
-// nothing about the c8s parser on its own: what keeps the two aligned is that
-// this file's reject table below is maintained as a verbatim copy of the c8s
-// pkg/runtimemeasure one, so a divergence shows up as a diff.
+// TestLoadImageManifestFixture loads the checked-in flat fixture end to end.
 func TestLoadImageManifestFixture(t *testing.T) {
 	pins, err := LoadImageManifest(filepath.Join("testdata", "image_manifest.json"))
 	if err != nil {
@@ -114,6 +123,15 @@ func TestLoadImageManifestRejects(t *testing.T) {
 		{"duplicate rtmr2",
 			`{"mrtd":"` + mrtdHex + `","rtmr1":"` + rtmr1Hex + `","rtmr2":"` + rtmr2Hex + `","rtmr2":"` + rtmr2Hex + `"}`,
 			`duplicate "rtmr2"`},
+		{"duplicate inside tdx",
+			`{"tdx":{"mrtd":"` + mrtdHex + `","mrtd":"` + strings.Repeat("ff", RegisterSize) + `","rtmr1":"` + rtmr1Hex + `","rtmr2":"` + rtmr2Hex + `"}}`,
+			`duplicate "mrtd"`},
+		{"flat register beside tdx",
+			`{"mrtd":"` + mrtdHex + `","rtmr1":"` + rtmr1Hex + `","rtmr2":"` + rtmr2Hex + `","tdx":{"mrtd":"` + strings.Repeat("ff", RegisterSize) + `","rtmr1":"` + rtmr1Hex + `","rtmr2":"` + rtmr2Hex + `"}}`,
+			`both at the top level and under "tdx"`},
+		{"tdx missing rtmr2",
+			`{"tdx":{"mrtd":"` + mrtdHex + `","rtmr1":"` + rtmr1Hex + `"}}`,
+			`missing "rtmr2"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := LoadImageManifest(writeManifest(t, tc.content))

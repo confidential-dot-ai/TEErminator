@@ -184,3 +184,30 @@ func TestDaemonWatchPicksUpNewRemote(t *testing.T) {
 	waitForBody(t, "http://"+local2, "ok")
 	waitForBody(t, "http://"+local1, "ok")
 }
+
+// TestTunnelKey checks which edits restart a tunnel. The stored status is not
+// policy: `status` writes it, and a restart would drop the route floor.
+func TestTunnelKey(t *testing.T) {
+	base := config.Remote{Local: "127.0.0.1:8080", Remote: "https://app.example/", Mode: config.AttestEndpoint, Status: config.StatusFailed}
+	certs := []config.Cert{{Fingerprint: "f", CommonName: "c", PEM: "p"}}
+	for _, tc := range []struct {
+		name     string
+		edit     func(r *config.Remote)
+		certs    []config.Cert
+		wantSame bool
+	}{
+		{"status only", func(r *config.Remote) { r.Status = config.StatusVerified }, certs, true},
+		{"route operator keys", func(r *config.Remote) { r.RouteOperatorKeys = []string{"k"} }, certs, false},
+		{"route digests", func(r *config.Remote) { r.RouteDigests = []string{"ab"} }, certs, false},
+		{"measurements", func(r *config.Remote) { r.Measurements = []string{"a1"} }, certs, false},
+		{"trust store", func(*config.Remote) {}, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edited := base
+			tc.edit(&edited)
+			if same := tunnelKey(base, certs) == tunnelKey(edited, tc.certs); same != tc.wantSame {
+				t.Errorf("tunnelKey(base) == tunnelKey(%s) is %v, want %v", tc.name, same, tc.wantSame)
+			}
+		})
+	}
+}

@@ -16,13 +16,13 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 	c.now = func() time.Time { return now }
 
 	if _, fresh, _ := c.FreshSession("host"); fresh {
-		t.Fatal("expected no verdict before first RecordSession")
+		t.Fatal("expected no verdict before first RecordPass")
 	}
 
 	spki := [32]byte{4, 2}
-	c.RecordSession("host", true, spki, now.Add(time.Hour), nil)
+	c.RecordPass("host", c.Now(), spki, now.Add(time.Hour))
 	if got, fresh, ok := c.FreshSession("host"); !fresh || !ok || got != spki {
-		t.Fatal("expected fresh+ok pinned verdict right after RecordSession")
+		t.Fatal("expected fresh+ok pinned verdict right after RecordPass")
 	}
 
 	// 30s later: still within the 60s TTL -> reused.
@@ -31,7 +31,7 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 		t.Fatal("expected verdict still fresh at 30s")
 	}
 
-	// 90s after RecordSession: expired -> must re-attest.
+	// 90s after RecordPass: expired -> must re-attest.
 	now = now.Add(60 * time.Second)
 	if _, fresh, _ := c.FreshSession("host"); fresh {
 		t.Fatal("expected verdict to expire past TTL")
@@ -40,7 +40,7 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 
 func TestSessionCacheRemembersFailure(t *testing.T) {
 	c := NewSessionCache(time.Minute)
-	c.RecordSession("bad", false, [32]byte{}, time.Time{}, errors.New("boom"))
+	c.RecordFailure("bad", c.Now(), errors.New("boom"))
 	_, fresh, ok := c.FreshSession("bad")
 	if !fresh || ok {
 		t.Fatalf("expected fresh failure verdict, got fresh=%v ok=%v", fresh, ok)
@@ -48,6 +48,45 @@ func TestSessionCacheRemembersFailure(t *testing.T) {
 	c.Invalidate("bad")
 	if _, fresh, _ := c.FreshSession("bad"); fresh {
 		t.Fatal("expected Invalidate to clear the verdict")
+	}
+}
+
+// TestRecordKeepsLatestAttempt checks that the verdict of the attestation
+// that began last wins, whichever order the verdicts are recorded in.
+func TestRecordKeepsLatestAttempt(t *testing.T) {
+	now := time.Unix(1000, 0)
+	earlier, later := now.Add(-time.Second), now
+	leaf := [32]byte{1}
+	for _, tc := range []struct {
+		name   string
+		record func(c *SessionCache)
+		wantOK bool
+	}{
+		{"failure that began before the pass", func(c *SessionCache) {
+			c.RecordPass("host", later, leaf, now.Add(time.Hour))
+			c.RecordFailure("host", earlier, errors.New("boom"))
+		}, true},
+		{"failure that began after the pass", func(c *SessionCache) {
+			c.RecordPass("host", earlier, leaf, now.Add(time.Hour))
+			c.RecordFailure("host", later, errors.New("boom"))
+		}, false},
+		{"pass that began before the failure", func(c *SessionCache) {
+			c.RecordFailure("host", later, errors.New("boom"))
+			c.RecordPass("host", earlier, leaf, now.Add(time.Hour))
+		}, false},
+		{"pass that began after the failure", func(c *SessionCache) {
+			c.RecordFailure("host", earlier, errors.New("boom"))
+			c.RecordPass("host", later, leaf, now.Add(time.Hour))
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewSessionCache(time.Minute)
+			c.now = func() time.Time { return now }
+			tc.record(c)
+			if _, fresh, ok := c.FreshSession("host"); !fresh || ok != tc.wantOK {
+				t.Errorf("FreshSession() = fresh %v, ok %v; want fresh, ok %v", fresh, ok, tc.wantOK)
+			}
+		})
 	}
 }
 
@@ -64,7 +103,7 @@ func TestExpiredServedLeafForcesReverify(t *testing.T) {
 	c.now = func() time.Time { return now }
 
 	leaf := [32]byte{7}
-	c.RecordSession("host", true, leaf, now.Add(10*time.Second), nil)
+	c.RecordPass("host", c.Now(), leaf, now.Add(10*time.Second))
 	if _, fresh, ok := c.FreshSession("host"); !fresh || !ok {
 		t.Fatal("verdict should be fresh inside both the TTL and the leaf validity")
 	}
@@ -77,7 +116,7 @@ func TestExpiredServedLeafForcesReverify(t *testing.T) {
 
 	// The TTL still binds independently: a long-lived leaf does not extend it.
 	now = time.Unix(2000, 0)
-	c.RecordSession("host", true, leaf, now.Add(24*time.Hour), nil)
+	c.RecordPass("host", c.Now(), leaf, now.Add(24*time.Hour))
 	now = now.Add(time.Hour + time.Second)
 	if _, fresh, _ := c.FreshSession("host"); fresh {
 		t.Fatal("a long-lived leaf must not extend the re-attest interval")
@@ -144,6 +183,16 @@ func TestRemoteKey(t *testing.T) {
 		"wider tdx tcb status": func() string {
 			r := base
 			r.TDXTCBStatus = []string{"UpToDate", "SWHardeningNeeded"}
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
+		}(),
+		"route digest pin": func() string {
+			r := base
+			r.RouteDigests = []string{strings.Repeat("ab", 32)}
+			return RemoteKey("lb.example:443", r, nil, nil, nil)
+		}(),
+		"route operator key": func() string {
+			r := base
+			r.RouteOperatorKeys = []string{"-----BEGIN PUBLIC KEY-----"}
 			return RemoteKey("lb.example:443", r, nil, nil, nil)
 		}(),
 		"allowlist digest":            RemoteKey("lb.example:443", base, []byte{1, 2, 3}, nil, nil),

@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"bufio"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +15,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/routes"
 	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 	"github.com/spf13/cobra"
 )
@@ -105,7 +108,7 @@ func validateImageManifestFlag(path string) (string, error) {
 // enforce it. Only attest-lb verifies hardware evidence, so on any other mode
 // these are inert: the remote reads as configured, and the gap only surfaces
 // much later — if ever — as traffic that was never measured.
-func validatePinModes(mode config.AttestMode, imageManifest, expectedRTMR3, minTCB string, tdxTCBStatus []string) error {
+func validatePinModes(mode config.AttestMode, imageManifest, expectedRTMR3, minTCB string, tdxTCBStatus, routeDigests, routeOperatorKeys []string) error {
 	if mode == config.AttestEndpoint {
 		return nil
 	}
@@ -114,6 +117,8 @@ func validatePinModes(mode config.AttestMode, imageManifest, expectedRTMR3, minT
 		{"--expected-rtmr3", expectedRTMR3},
 		{"--min-tcb", minTCB},
 		{"--tdx-tcb-status", strings.Join(tdxTCBStatus, ",")},
+		{"--route-digest", strings.Join(routeDigests, ",")},
+		{"--route-operator-key", strings.Join(routeOperatorKeys, ",")},
 	} {
 		if pin.value != "" {
 			return fmt.Errorf("%s requires --mode attest-lb: nothing verifies hardware measurements in mode %q, so the pin would be stored but never enforced", pin.flag, mode)
@@ -165,6 +170,31 @@ func parseMinTCBFlag(s string) (*config.TCBFloor, error) {
 	return &floor, nil
 }
 
+// readRouteOperatorKeys reads the --route-operator-key files and returns one
+// PEM PUBLIC KEY block per key, the form route_operator_keys stores, so the
+// daemon needs no file at run time.
+func readRouteOperatorKeys(paths []string) ([]string, error) {
+	var out []string
+	for _, p := range paths {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("reading --route-operator-key: %w", err)
+		}
+		keys, err := routes.ParsePublicKeys(raw)
+		if err != nil {
+			return nil, fmt.Errorf("--route-operator-key %s: %w", p, err)
+		}
+		for _, k := range keys {
+			der, err := x509.MarshalPKIXPublicKey(k)
+			if err != nil {
+				return nil, fmt.Errorf("--route-operator-key %s: %w", p, err)
+			}
+			out = append(out, string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})))
+		}
+	}
+	return out, nil
+}
+
 func newRemoteAddCmd(name string) *cobra.Command {
 	var (
 		mode          string
@@ -177,6 +207,8 @@ func newRemoteAddCmd(name string) *cobra.Command {
 		expectedRTMR3 string
 		minTCB        string
 		tdxTCBStatus  []string
+		routeDigests  []string
+		routeKeyFiles []string
 	)
 
 	cmd := &cobra.Command{
@@ -195,8 +227,22 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
 			}
 
-			if err := validatePinModes(attestMode, imageManifest, expectedRTMR3, minTCB, tdxTCBStatus); err != nil {
+			if err := validatePinModes(attestMode, imageManifest, expectedRTMR3, minTCB, tdxTCBStatus, routeDigests, routeKeyFiles); err != nil {
 				return err
+			}
+			if len(routeDigests) > 0 && len(routeKeyFiles) > 0 {
+				return fmt.Errorf("--route-digest and --route-operator-key are mutually exclusive: each is a complete route check; pass one")
+			}
+			if err := verifier.ValidateRouteDigests(routeDigests); err != nil {
+				return fmt.Errorf("--route-digest: %w", err)
+			}
+			routeOperatorKeys, err := readRouteOperatorKeys(routeKeyFiles)
+			if err != nil {
+				return err
+			}
+			// The router routes by the Host header, and a manifest names no IP.
+			if u, err := url.Parse(remoteURL); len(routeKeyFiles) > 0 && (err != nil || net.ParseIP(u.Hostname()) != nil) {
+				return fmt.Errorf("--route-operator-key needs a <remote-url> with a DNS name the route manifest routes, not %q", remoteURL)
 			}
 			if _, err := verifier.ParseTDXTCBStatuses(tdxTCBStatus); err != nil {
 				return fmt.Errorf("--tdx-tcb-status: %w", err)
@@ -251,6 +297,8 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				ExpectedRTMR3:     rtmr3Stored,
 				MinTCB:            tcbFloor,
 				TDXTCBStatus:      tdxTCBStatus,
+				RouteDigests:      routeDigests,
+				RouteOperatorKeys: routeOperatorKeys,
 			}
 			if err := cfg.AddRemote(r); err != nil {
 				return err
@@ -275,10 +323,12 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
 	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb)")
 	f.StringVar(&allowlistPath, "allowlist", "", "path to a pinned canonical-allowlist JSON file; hashed exactly as read against the stamp's digest, and the stamped name must resolve in it (attest-lb)")
-	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (JSON object with mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, published with the image build); all three registers are pinned exactly against this one manifest, so the guest kernel and rootfs are verified rather than only the firmware. Replaces --measurements rather than adding to it. TDX evidence only — with SNP evidence this is a policy error")
+	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, nested under tdx as the confos build writes them or at the top level; published with the image build); all three registers are pinned exactly against this one manifest, so the guest kernel and rootfs are verified rather than only the firmware. Replaces --measurements rather than adding to it. TDX evidence only — with SNP evidence this is a policy error")
 	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 lowercase hex chars: the bare operator-key seed, the register before the node measures any policy. A node that measures its allowlist policies is accepted when the policy list in its bundle replays from this seed to the quoted register. This is a deployment property, NOT a cluster identity, and cannot replace an image pin, so it requires --image-manifest. TDX evidence only — with SNP evidence this is a policy error")
 	f.StringVar(&minTCB, "min-tcb", "", "minimum SNP TCB floor as four comma-separated components <bootloader,tee,snp,microcode> (each 0-255), enforced component-wise on the verified evidence. SNP evidence only — with TDX evidence this is a policy error")
 	f.StringSliceVar(&tdxTCBStatus, "tdx-tcb-status", nil, "Intel TCB statuses accepted for TDX evidence, comma-separated: UpToDate, SWHardeningNeeded, ConfigurationNeeded, ConfigurationAndSWHardeningNeeded, OutOfDate, OutOfDateConfigurationNeeded. When set, every attestation fetches TCB info, QE identity and PCK CRLs from Intel PCS, refuses a revoked PCK chain, and requires the platform, TDX module and QE TCB statuses to be in this list. When unset, TDX evidence is verified offline (quote signature and PCK chain only). TDX evidence only — with SNP evidence this is a policy error")
+	f.StringSliceVar(&routeDigests, "route-digest", nil, "accepted route digests (SHA-256 of the route manifest, 64 lowercase hex chars), comma-separated or repeated; the router must attest one of them. Pass the old and the new digest while routes change. Mutually exclusive with --route-operator-key. Requires --mode attest-lb. With neither, any attested digest is accepted and reported as unverified")
+	f.StringArrayVar(&routeKeyFiles, "route-operator-key", nil, "PEM file of ECDSA operator public keys (P-256, P-384 or P-521), repeatable. With each attestation, fetch the router's published signed route manifest (/.well-known/c8s/routes), verify it under one of these keys, and require its digest to equal the attested one and its revision not to roll back. The router must enable route publication, and the manifest must route the <remote-url> host, so use a DNS name, not an IP. Mutually exclusive with --route-digest. Requires --mode attest-lb")
 	return cmd
 }
 
