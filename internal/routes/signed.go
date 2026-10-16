@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Envelope is the wire form of a signed manifest:
@@ -60,15 +61,30 @@ type Signed struct {
 	Digest   [sha256.Size]byte
 }
 
+// MaxTokenValidity is the widest exp−iat window of a write token, matching
+// the c8s CDS bound.
+const MaxTokenValidity = 5 * time.Minute
+
 // VerifySigned verifies env under the operator keys, in order: the token's
-// signature (ES256, ES384 or ES512), htm PUT and htu /routes, pbh against
-// the manifest bytes, then the manifest schema. It checks no time claim: the
-// token authorized a write that the c8s CDS checked when it happened, and a
-// published manifest outlives its token.
+// signature (ES256, ES384 or ES512), exp−iat within MaxTokenValidity, htm PUT
+// and htu /routes, pbh against the manifest bytes, then the manifest schema.
+// It does not compare exp or iat with the clock: the token authorized a write
+// that the c8s CDS checked when it happened, and a published manifest
+// outlives its token.
 func VerifySigned(env Envelope, keys []*ecdsa.PublicKey) (*Signed, error) {
 	claims, err := verifyToken(keys, env.Token)
 	if err != nil {
 		return nil, fmt.Errorf("verify route write token: %w", err)
+	}
+	// Bounding the window keeps a long-lived token, which CDS would refuse,
+	// from authorizing a manifest here.
+	iat, iatOK := claims["iat"].(float64)
+	exp, expOK := claims["exp"].(float64)
+	if !iatOK || !expOK {
+		return nil, errors.New("verify route write token: iat and exp must be numeric dates")
+	}
+	if validity := time.Duration((exp - iat) * float64(time.Second)); validity <= 0 || validity > MaxTokenValidity {
+		return nil, fmt.Errorf("verify route write token: validity %s outside (0, %s]", validity, MaxTokenValidity)
 	}
 	if htm, _ := claims["htm"].(string); htm != "PUT" {
 		return nil, fmt.Errorf("verify route write token: htm %q, want %q", htm, "PUT")

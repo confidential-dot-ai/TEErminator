@@ -113,9 +113,9 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     digest, which means different things per platform. On **Intel TDX** the launch
     digest (MRTD) measures only the TDVF firmware — the guest kernel and rootfs live in
     RTMR[1]/RTMR[2] — so a complete image policy is the MRTD+RTMR[1]+RTMR[2] tuple,
-    pinned with `--image-manifest <file>` (a JSON build-artifact manifest with `mrtd`,
-    `rtmr1`, `rtmr2`, each 96 lowercase hex chars; the same format c8s
-    `pkg/runtimemeasure` reads). All three registers are compared byte-exactly against
+    pinned with `--image-manifest <file>` (a confos build manifest with `mrtd`,
+    `rtmr1`, `rtmr2` under `tdx`, or a flat JSON object with the three, each 96
+    lowercase hex chars; read by the attestation-go `runtimemeasure` loader `c8s verify` uses). All three registers are compared byte-exactly against
     the verified claims — the launch digest against the manifest's own MRTD included — so
     the manifest replaces `--measurements` rather than widening it: a second allowlist
     could only admit an image the manifest does not describe, and setting both is a

@@ -174,7 +174,7 @@ func TestVerifySigned(t *testing.T) {
 	token := mint(t, key, "ES256", body, nil)
 	parts := strings.Split(token, ".")
 	sum := sha256.Sum256(body)
-	claimsJSON := `{"htm":"PUT","htu":"/routes","pbh":"` + base64.RawURLEncoding.EncodeToString(sum[:]) + `"}`
+	claimsJSON := `{"iat":1,"exp":61,"htm":"PUT","htu":"/routes","pbh":"` + base64.RawURLEncoding.EncodeToString(sum[:]) + `"}`
 	withHeader := func(header string) string {
 		return base64.RawURLEncoding.EncodeToString([]byte(header)) + "." + parts[1] + "." + parts[2]
 	}
@@ -187,8 +187,18 @@ func TestVerifySigned(t *testing.T) {
 		{name: "ES384", env: Envelope{body, mint(t, p384, "ES384", body, nil)}},
 		{name: "expired token", env: Envelope{body, mint(t, key, "ES256", body, func(c map[string]any) {
 			c["iat"] = time.Now().Add(-90 * 24 * time.Hour).Unix()
-			c["exp"] = time.Now().Add(-89 * 24 * time.Hour).Unix()
+			c["exp"] = time.Now().Add(-90*24*time.Hour + time.Minute).Unix()
 		})}},
+		{name: "validity at the bound", env: Envelope{body, mint(t, key, "ES256", body, func(c map[string]any) {
+			c["iat"], c["exp"] = 1000, 1000+int(MaxTokenValidity.Seconds())
+		})}},
+		{name: "validity beyond the bound", env: Envelope{body, mint(t, key, "ES256", body, func(c map[string]any) {
+			c["iat"], c["exp"] = 1000, 1001+int(MaxTokenValidity.Seconds())
+		})}, wantErr: "validity"},
+		{name: "exp before iat", env: Envelope{body, mint(t, key, "ES256", body, func(c map[string]any) { c["exp"] = c["iat"] })}, wantErr: "validity"},
+		{name: "missing iat", env: Envelope{body, mint(t, key, "ES256", body, func(c map[string]any) { delete(c, "iat") })}, wantErr: "numeric dates"},
+		{name: "missing exp", env: Envelope{body, mint(t, key, "ES256", body, func(c map[string]any) { delete(c, "exp") })}, wantErr: "numeric dates"},
+		{name: "string iat", env: Envelope{body, mint(t, key, "ES256", body, func(c map[string]any) { c["iat"] = "1000" })}, wantErr: "numeric dates"},
 		{name: "untrusted key", env: Envelope{body, mint(t, other, "ES256", body, nil)}, wantErr: "not signed by any pinned operator key"},
 		{name: "algorithm none", env: Envelope{body, withHeader(`{"alg":"none"}`)}, wantErr: `algorithm "none"`},
 		{name: "algorithm HS256", env: Envelope{body, withHeader(`{"alg":"HS256"}`)}, wantErr: `algorithm "HS256"`},
