@@ -313,3 +313,28 @@ func TestFloor(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifyWriteToken(t *testing.T) {
+	key := genKey(t, elliptic.P256())
+	keys := []*ecdsa.PublicKey{&key.PublicKey}
+	body := []byte(`{"schema":"c8s.allowlist/v1","workloads":{}}`)
+	allowlist := mint(t, key, "ES256", body, func(c map[string]any) { c["htu"] = "/allowlist" })
+	for _, tc := range []struct {
+		name    string
+		token   string
+		path    string
+		body    []byte
+		wantErr string
+	}{
+		{name: "allowlist token", token: allowlist, path: "/allowlist", body: body},
+		{name: "route token for an allowlist", token: mint(t, key, "ES256", body, nil), path: "/allowlist", body: body, wantErr: "htu"},
+		{name: "other bytes", token: allowlist, path: "/allowlist", body: append(slices.Clone(body), ' '), wantErr: "pbh"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := VerifyWriteToken(keys, tc.token, tc.path, tc.body)
+			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Errorf("VerifyWriteToken(%s) = %v, want error containing %q", tc.path, err, tc.wantErr)
+			}
+		})
+	}
+}

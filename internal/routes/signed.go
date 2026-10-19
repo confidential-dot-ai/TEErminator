@@ -65,43 +65,53 @@ type Signed struct {
 // the c8s CDS bound.
 const MaxTokenValidity = 5 * time.Minute
 
-// VerifySigned verifies env under the operator keys, in order: the token's
-// signature (ES256, ES384 or ES512), exp−iat within MaxTokenValidity, htm PUT
-// and htu /routes, pbh against the manifest bytes, then the manifest schema.
-// It does not compare exp or iat with the clock: the token authorized a write
-// that the c8s CDS checked when it happened, and a published manifest
-// outlives its token.
+// VerifySigned verifies env under the operator keys: the write token (see
+// VerifyWriteToken) for PUT /routes over the manifest bytes, then the
+// manifest schema.
 func VerifySigned(env Envelope, keys []*ecdsa.PublicKey) (*Signed, error) {
-	claims, err := verifyToken(keys, env.Token)
-	if err != nil {
+	if err := VerifyWriteToken(keys, env.Token, "/routes", env.Manifest); err != nil {
 		return nil, fmt.Errorf("verify route write token: %w", err)
-	}
-	// Bounding the window keeps a long-lived token, which CDS would refuse,
-	// from authorizing a manifest here.
-	iat, iatOK := claims["iat"].(float64)
-	exp, expOK := claims["exp"].(float64)
-	if !iatOK || !expOK {
-		return nil, errors.New("verify route write token: iat and exp must be numeric dates")
-	}
-	if validity := time.Duration((exp - iat) * float64(time.Second)); validity <= 0 || validity > MaxTokenValidity {
-		return nil, fmt.Errorf("verify route write token: validity %s outside (0, %s]", validity, MaxTokenValidity)
-	}
-	if htm, _ := claims["htm"].(string); htm != "PUT" {
-		return nil, fmt.Errorf("verify route write token: htm %q, want %q", htm, "PUT")
-	}
-	if htu, _ := claims["htu"].(string); htu != "/routes" {
-		return nil, fmt.Errorf("verify route write token: htu %q, want %q", htu, "/routes")
-	}
-	pbh, _ := claims["pbh"].(string)
-	sum := sha256.Sum256(env.Manifest)
-	if subtle.ConstantTimeCompare([]byte(pbh), []byte(base64.RawURLEncoding.EncodeToString(sum[:]))) != 1 {
-		return nil, errors.New("verify route write token: pbh does not match the manifest bytes")
 	}
 	m, err := parseManifest(env.Manifest)
 	if err != nil {
 		return nil, err
 	}
-	return &Signed{Manifest: m, Digest: sum}, nil
+	return &Signed{Manifest: m, Digest: sha256.Sum256(env.Manifest)}, nil
+}
+
+// VerifyWriteToken checks a stored c8s operator write token, the rules of
+// c8s's operatorauth.VerifyStored: the signature (ES256, ES384 or ES512)
+// under one of keys, exp−iat within MaxTokenValidity, htm PUT, htu path and
+// pbh against body. It does not compare exp or iat with the clock: the token
+// authorized a write that the c8s CDS checked when it happened, and the
+// written document outlives its token.
+func VerifyWriteToken(keys []*ecdsa.PublicKey, token, path string, body []byte) error {
+	claims, err := verifyToken(keys, token)
+	if err != nil {
+		return err
+	}
+	// Bounding the window keeps a long-lived token, which CDS would refuse,
+	// from authorizing a write here.
+	iat, iatOK := claims["iat"].(float64)
+	exp, expOK := claims["exp"].(float64)
+	if !iatOK || !expOK {
+		return errors.New("iat and exp must be numeric dates")
+	}
+	if validity := time.Duration((exp - iat) * float64(time.Second)); validity <= 0 || validity > MaxTokenValidity {
+		return fmt.Errorf("validity %s outside (0, %s]", validity, MaxTokenValidity)
+	}
+	if htm, _ := claims["htm"].(string); htm != "PUT" {
+		return fmt.Errorf("htm %q, want %q", htm, "PUT")
+	}
+	if htu, _ := claims["htu"].(string); htu != path {
+		return fmt.Errorf("htu %q, want %q", htu, path)
+	}
+	pbh, _ := claims["pbh"].(string)
+	sum := sha256.Sum256(body)
+	if subtle.ConstantTimeCompare([]byte(pbh), []byte(base64.RawURLEncoding.EncodeToString(sum[:]))) != 1 {
+		return errors.New("pbh does not match the written bytes")
+	}
+	return nil
 }
 
 // verifyToken checks a compact JWS signature under any of keys and returns
