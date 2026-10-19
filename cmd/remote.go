@@ -17,6 +17,7 @@ import (
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
 	"github.com/confidential-dot-ai/TEErminator/internal/routes"
 	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
+	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 	"github.com/spf13/cobra"
 )
 
@@ -108,24 +109,20 @@ func validateImageManifestFlag(path string) (string, error) {
 // enforce it. Only attest-lb verifies hardware evidence, so on any other mode
 // these are inert: the remote reads as configured, and the gap only surfaces
 // much later — if ever — as traffic that was never measured.
-func validatePinModes(mode config.AttestMode, imageManifest, expectedRTMR3, minTCB string, tdxTCBStatus, routeDigests, routeOperatorKeys []string) error {
+func validatePinModes(mode config.AttestMode, pins []pinFlag) error {
 	if mode == config.AttestEndpoint {
 		return nil
 	}
-	for _, pin := range []struct{ flag, value string }{
-		{"--image-manifest", imageManifest},
-		{"--expected-rtmr3", expectedRTMR3},
-		{"--min-tcb", minTCB},
-		{"--tdx-tcb-status", strings.Join(tdxTCBStatus, ",")},
-		{"--route-digest", strings.Join(routeDigests, ",")},
-		{"--route-operator-key", strings.Join(routeOperatorKeys, ",")},
-	} {
+	for _, pin := range pins {
 		if pin.value != "" {
 			return fmt.Errorf("%s requires --mode attest-lb: nothing verifies hardware measurements in mode %q, so the pin would be stored but never enforced", pin.flag, mode)
 		}
 	}
 	return nil
 }
+
+// pinFlag is a pin flag and its value, empty when unset.
+type pinFlag struct{ flag, value string }
 
 // validateRTMR3Flag validates the --expected-rtmr3 pin and returns the value to
 // store. Surrounding whitespace is trimmed here, at the flag boundary only: a
@@ -170,24 +167,24 @@ func parseMinTCBFlag(s string) (*config.TCBFloor, error) {
 	return &floor, nil
 }
 
-// readRouteOperatorKeys reads the --route-operator-key files and returns one
-// PEM PUBLIC KEY block per key, the form route_operator_keys stores, so the
-// daemon needs no file at run time.
-func readRouteOperatorKeys(paths []string) ([]string, error) {
+// readOperatorKeys reads flag's PEM files and returns one PEM PUBLIC KEY
+// block per key, the form route_operator_keys and trust_operator_keys store,
+// so the daemon needs no file at run time.
+func readOperatorKeys(flag string, paths []string) ([]string, error) {
 	var out []string
 	for _, p := range paths {
 		raw, err := os.ReadFile(p)
 		if err != nil {
-			return nil, fmt.Errorf("reading --route-operator-key: %w", err)
+			return nil, fmt.Errorf("reading %s: %w", flag, err)
 		}
 		keys, err := routes.ParsePublicKeys(raw)
 		if err != nil {
-			return nil, fmt.Errorf("--route-operator-key %s: %w", p, err)
+			return nil, fmt.Errorf("%s %s: %w", flag, p, err)
 		}
 		for _, k := range keys {
 			der, err := x509.MarshalPKIXPublicKey(k)
 			if err != nil {
-				return nil, fmt.Errorf("--route-operator-key %s: %w", p, err)
+				return nil, fmt.Errorf("%s %s: %w", flag, p, err)
 			}
 			out = append(out, string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})))
 		}
@@ -209,6 +206,14 @@ func newRemoteAddCmd(name string) *cobra.Command {
 		tdxTCBStatus  []string
 		routeDigests  []string
 		routeKeyFiles []string
+		routesFloor   string
+		operatorPkey  string
+		rtmrs         []string
+		initData      string
+		sandboxID     string
+		pinPolicies   []string
+		trustOperator bool
+		trustKeyFiles []string
 	)
 
 	cmd := &cobra.Command{
@@ -227,7 +232,22 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
 			}
 
-			if err := validatePinModes(attestMode, imageManifest, expectedRTMR3, minTCB, tdxTCBStatus, routeDigests, routeKeyFiles); err != nil {
+			if err := validatePinModes(attestMode, []pinFlag{
+				{"--image-manifest", imageManifest},
+				{"--expected-rtmr3", expectedRTMR3},
+				{"--operator-pkey", operatorPkey},
+				{"--rtmr", strings.Join(rtmrs, ",")},
+				{"--init-data", initData},
+				{"--sandbox-id", sandboxID},
+				{"--min-tcb", minTCB},
+				{"--tdx-tcb-status", strings.Join(tdxTCBStatus, ",")},
+				{"--route-digest", strings.Join(routeDigests, ",")},
+				{"--route-operator-key", strings.Join(routeKeyFiles, ",")},
+				{"--routes-floor", routesFloor},
+				{"--pin-policy", strings.Join(pinPolicies, ",")},
+				{"--trust-operator", map[bool]string{true: "true"}[trustOperator]},
+				{"--trust-operator-key", strings.Join(trustKeyFiles, ",")},
+			}); err != nil {
 				return err
 			}
 			if len(routeDigests) > 0 && len(routeKeyFiles) > 0 {
@@ -236,7 +256,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			if err := verifier.ValidateRouteDigests(routeDigests); err != nil {
 				return fmt.Errorf("--route-digest: %w", err)
 			}
-			routeOperatorKeys, err := readRouteOperatorKeys(routeKeyFiles)
+			routeOperatorKeys, err := readOperatorKeys("--route-operator-key", routeKeyFiles)
 			if err != nil {
 				return err
 			}
@@ -247,10 +267,27 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			if _, err := verifier.ParseTDXTCBStatuses(tdxTCBStatus); err != nil {
 				return fmt.Errorf("--tdx-tcb-status: %w", err)
 			}
-			// How the measurement pins relate to each other is one rule set,
-			// shared with the verifier so a config the CLI refuses to write is
-			// also a config the daemon refuses to run.
-			if err := verifier.ValidatePinCombination(measurements, imageManifest, expectedRTMR3); err != nil {
+			trustOperatorKeys, err := readOperatorKeys("--trust-operator-key", trustKeyFiles)
+			if err != nil {
+				return err
+			}
+			// How the pins relate to each other is one rule set, shared with
+			// the verifier so a config the CLI refuses to write is also a
+			// config the daemon refuses to run.
+			if err := verifier.ValidatePinCombination(config.Remote{
+				Measurements: measurements, ImageManifestPath: imageManifest, ExpectedRTMR3: expectedRTMR3,
+				OperatorPubkeyPath: operatorPkey, RTMRs: rtmrs, InitDataDigest: initData, SandboxID: sandboxID,
+				RouteOperatorKeys: routeOperatorKeys, RouteFloor: routesFloor,
+				PinnedPolicies: pinPolicies, TrustOperator: trustOperator, TrustOperatorKeys: trustOperatorKeys,
+			}); err != nil {
+				return err
+			}
+			operatorPkeyStored, err := validateOperatorPkeyFlag(operatorPkey)
+			if err != nil {
+				return err
+			}
+			pinPoliciesStored, err := validatePinPolicyFlags(pinPolicies)
+			if err != nil {
 				return err
 			}
 
@@ -283,22 +320,30 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			}
 
 			r := config.Remote{
-				Local:             localAddr,
-				Remote:            remoteURL,
-				Auth:              config.AuthNone,
-				Status:            config.StatusUnknown,
-				Mode:              attestMode,
-				Measurements:      measurements,
-				DiscoveryURL:      discoveryURL,
-				ServerName:        serverName,
-				WorkloadName:      workload,
-				AllowlistPath:     allowlistStored,
-				ImageManifestPath: manifestStored,
-				ExpectedRTMR3:     rtmr3Stored,
-				MinTCB:            tcbFloor,
-				TDXTCBStatus:      tdxTCBStatus,
-				RouteDigests:      routeDigests,
-				RouteOperatorKeys: routeOperatorKeys,
+				Local:              localAddr,
+				Remote:             remoteURL,
+				Auth:               config.AuthNone,
+				Status:             config.StatusUnknown,
+				Mode:               attestMode,
+				Measurements:       measurements,
+				DiscoveryURL:       discoveryURL,
+				ServerName:         serverName,
+				WorkloadName:       workload,
+				AllowlistPath:      allowlistStored,
+				ImageManifestPath:  manifestStored,
+				ExpectedRTMR3:      rtmr3Stored,
+				MinTCB:             tcbFloor,
+				TDXTCBStatus:       tdxTCBStatus,
+				RouteDigests:       routeDigests,
+				RouteOperatorKeys:  routeOperatorKeys,
+				RouteFloor:         routesFloor,
+				OperatorPubkeyPath: operatorPkeyStored,
+				RTMRs:              rtmrs,
+				InitDataDigest:     initData,
+				SandboxID:          sandboxID,
+				PinnedPolicies:     pinPoliciesStored,
+				TrustOperator:      trustOperator,
+				TrustOperatorKeys:  trustOperatorKeys,
 			}
 			if err := cfg.AddRemote(r); err != nil {
 				return err
@@ -329,7 +374,53 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringSliceVar(&tdxTCBStatus, "tdx-tcb-status", nil, "Intel TCB statuses accepted for TDX evidence, comma-separated: UpToDate, SWHardeningNeeded, ConfigurationNeeded, ConfigurationAndSWHardeningNeeded, OutOfDate, OutOfDateConfigurationNeeded. When set, every attestation fetches TCB info, QE identity and PCK CRLs from Intel PCS, refuses a revoked PCK chain, and requires the platform, TDX module and QE TCB statuses to be in this list. When unset, TDX evidence is verified offline (quote signature and PCK chain only). TDX evidence only — with SNP evidence this is a policy error")
 	f.StringSliceVar(&routeDigests, "route-digest", nil, "accepted route digests (SHA-256 of the route manifest, 64 lowercase hex chars), comma-separated or repeated; the router must attest one of them. Pass the old and the new digest while routes change. Mutually exclusive with --route-operator-key. Requires --mode attest-lb. With neither, any attested digest is accepted and reported as unverified")
 	f.StringArrayVar(&routeKeyFiles, "route-operator-key", nil, "PEM file of ECDSA operator public keys (P-256, P-384 or P-521), repeatable. With each attestation, fetch the router's published signed route manifest (/.well-known/c8s/routes), verify it under one of these keys, and require its digest to equal the attested one and its revision not to roll back. The router must enable route publication, and the manifest must route the <remote-url> host, so use a DNS name, not an IP. Mutually exclusive with --route-digest. Requires --mode attest-lb")
+	f.StringVar(&routesFloor, "routes-floor", "", "with --route-operator-key: <revision>:<route digest hex> of the last signed route manifest accepted; each tunnel starts its rollback floor there, so a published manifest with a lower revision, or the same revision and another digest, fails")
+	f.StringVar(&operatorPkey, "operator-pkey", "", "path to the operator PUBLIC key PEM (the exact file bytes the guest initrd hashed); pins RTMR[3] to its seed, SHA-384(0x00*48 || SHA-384(file bytes)), so the register need not be computed by hand. Mutually exclusive with --expected-rtmr3 and --rtmr 3=; requires --image-manifest. TDX evidence only")
+	f.StringSliceVar(&rtmrs, "rtmr", nil, "TDX runtime register pins as <index>=<96 lowercase hex>, index 1, 2 or 3 (repeatable / comma-separated). RTMR[1] and RTMR[2] are the guest kernel and rootfs, so they exclude --image-manifest; pinning both beside --measurements counts as an image pin. RTMR[3] is another spelling of --expected-rtmr3 and requires --image-manifest. TDX evidence only")
+	f.StringVar(&initData, "init-data", "", "expected init-data digest: SHA-256 hex of the init-data document; the evidence must commit exactly this digest (SNP HOST_DATA, TDX MR_CONFIG_ID, PCR[8] on Azure)")
+	f.StringVar(&sandboxID, "sandbox-id", "", "CRI pod sandbox ID the committed mesh leaf must carry (OID 1.3.6.1.4.1.66378.1.4); CA-vouched, like --workload")
+	f.StringSliceVar(&pinPolicies, "pin-policy", nil, "accepted allowlist policies (repeatable / comma-separated), each a sha256:<hex> digest or the path of an allowlist document hashed exactly as read (the bytes GET /allowlist serves): every policy in the node's replayed history, and the one the mesh leaf was issued under, must be one of these. Requires an RTMR[3] seed (--operator-pkey or --expected-rtmr3); excludes --trust-operator")
+	f.BoolVar(&trustOperator, "trust-operator", false, "accept every policy in the node's replayed history, and the one the mesh leaf was issued under, only when CDS stores its document with a write token signed under --trust-operator-key: each one is fetched from /allowlist/objects/sha256/<hex>, re-hashed, and its token verified. Requires an RTMR[3] seed and --trust-operator-key; excludes --pin-policy")
+	f.StringArrayVar(&trustKeyFiles, "trust-operator-key", nil, "PEM file of ECDSA operator public keys --trust-operator accepts signatures from (repeatable). Requires --trust-operator; --route-operator-key does not feed it")
 	return cmd
+}
+
+// validateOperatorPkeyFlag checks --operator-pkey holds one P-256 PEM public
+// key and returns the absolute path to store.
+func validateOperatorPkeyFlag(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading --operator-pkey: %w", err)
+	}
+	if _, err := runtimemeasure.ParsePublicKeyPEM(raw); err != nil {
+		return "", fmt.Errorf("--operator-pkey %s: %w", path, err)
+	}
+	return filepath.Abs(path)
+}
+
+// validatePinPolicyFlags resolves each --pin-policy entry once to catch a bad
+// digest or document, and returns the entries to store: digests as given,
+// files as absolute paths.
+func validatePinPolicyFlags(entries []string) ([]string, error) {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if _, err := verifier.PinnedPolicyDigest(e); err != nil {
+			return nil, fmt.Errorf("--pin-policy: %w", err)
+		}
+		if strings.HasPrefix(e, "sha256:") {
+			out = append(out, e)
+			continue
+		}
+		abs, err := filepath.Abs(e)
+		if err != nil {
+			return nil, fmt.Errorf("resolving --pin-policy path: %w", err)
+		}
+		out = append(out, abs)
+	}
+	return out, nil
 }
 
 func newRemoteAuthCmd() *cobra.Command {

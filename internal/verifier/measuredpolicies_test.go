@@ -104,8 +104,8 @@ func TestEnforceMeasuredPolicies(t *testing.T) {
 				t.Errorf("MeasuredPolicies = %v, want %v", v.MeasuredPolicies, tc.want)
 			}
 			wantWarn := ""
-			if len(tc.want) > 0 {
-				wantWarn = fmt.Sprintf("replayed %d measured policies, none judged", len(tc.want))
+			if tc.pin == nil && len(tc.measured) > 0 {
+				wantWarn = fmt.Sprintf("the evidence lists %d measured policies, but no RTMR[3] seed is pinned (operator_pubkey_path or expected_rtmr3), so they were not replayed or judged", len(tc.measured))
 			}
 			if v.Warning != wantWarn {
 				t.Errorf("Warning = %q, want %q", v.Warning, wantWarn)

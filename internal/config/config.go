@@ -27,8 +27,11 @@ const (
 type TrustStatus string
 
 const (
-	StatusUnknown   TrustStatus = "Unknown"
-	StatusVerified  TrustStatus = "Verified"
+	StatusUnknown  TrustStatus = "Unknown"
+	StatusVerified TrustStatus = "Verified"
+	// StatusPartial is a passing attestation that leaves some claim unproven,
+	// such as a measured policy history nothing judged. The proxy forwards.
+	StatusPartial   TrustStatus = "Partial"
 	StatusUntrusted TrustStatus = "Untrusted"
 	StatusFailed    TrustStatus = "Failed"
 )
@@ -128,6 +131,42 @@ type Remote struct {
 	// writes one key per entry, and a key listed twice is harmless. Mutually
 	// exclusive with RouteDigests.
 	RouteOperatorKeys []string `json:"route_operator_keys,omitempty"`
+	// RouteFloor is the "<revision>:<64 hex digest>" of the last signed route
+	// manifest accepted, the starting floor of each tunnel: a published
+	// manifest with a lower revision, or that revision with another digest,
+	// fails. Requires RouteOperatorKeys.
+	RouteFloor string `json:"route_floor,omitempty"`
+	// OperatorPubkeyPath points at the operator public-key PEM the guest
+	// initrd hashed. RTMR[3] is pinned to its seed, SHA-384(0x00*48 ||
+	// SHA-384(file bytes)). Exclusive with ExpectedRTMR3; requires
+	// ImageManifestPath. TDX evidence only.
+	OperatorPubkeyPath string `json:"operator_pubkey_path,omitempty"`
+	// RTMRs pins TDX runtime registers by hand as "<index>=<96 hex>", index
+	// 1, 2 or 3. RTMR[1] and RTMR[2] are the image, so they exclude
+	// ImageManifestPath; RTMR[3] is a third spelling of the seed and, like
+	// ExpectedRTMR3, requires it. TDX evidence only.
+	RTMRs []string `json:"rtmrs,omitempty"`
+	// InitDataDigest pins the init-data binding the evidence commits (SNP
+	// HOST_DATA, TDX MR_CONFIG_ID, PCR[8] on Azure), as 64 hex chars: the
+	// SHA-256 of the init-data document.
+	InitDataDigest string `json:"init_data_digest,omitempty"`
+	// SandboxID pins the CRI pod sandbox ID CDS stamped on the committed mesh
+	// leaf (OID 1.3.6.1.4.1.66378.1.4). CA-vouched, like WorkloadName.
+	SandboxID string `json:"sandbox_id,omitempty"`
+	// PinnedPolicies is the set of allowlist policies the node may have
+	// enforced: each entry is a "sha256:<64 hex>" digest or the path of an
+	// allowlist document, hashed exactly as read. Every policy in the node's
+	// replayed history, and the one the mesh leaf was issued under, must be
+	// in the set. Exclusive with TrustOperator; requires an RTMR[3] seed.
+	PinnedPolicies []string `json:"pinned_policies,omitempty"`
+	// TrustOperator accepts every policy in the node's replayed history, and
+	// the one the mesh leaf was issued under, whose document CDS stores with
+	// a write token signed under TrustOperatorKeys. Exclusive with
+	// PinnedPolicies; requires an RTMR[3] seed and TrustOperatorKeys.
+	TrustOperator bool `json:"trust_operator,omitempty"`
+	// TrustOperatorKeys holds the PEM ECDSA public keys TrustOperator accepts
+	// signatures from, one PUBLIC KEY block per entry.
+	TrustOperatorKeys []string `json:"trust_operator_keys,omitempty"`
 	// StaticAllowlist and InitData belong to the removed sealed-mesh-CA
 	// policy. They are still read so a config that sets them fails closed
 	// instead of silently dropping the pin.

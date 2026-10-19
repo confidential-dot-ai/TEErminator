@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 )
 
 // caFor returns the test server's self-signed certificate as an ExtraCAs entry,
@@ -83,4 +84,16 @@ func TestCheckRemote(t *testing.T) {
 			t.Fatalf("status = %s, want Failed", res.Status)
 		}
 	})
+}
+
+func TestVerdictResult(t *testing.T) {
+	v := &verifier.SessionVerdict{Measurement: "a1", TrustMode: verifier.TrustDeploymentClass, MeasuredPolicies: []string{"sha256:ab"}, PolicyCheck: verifier.PolicyUnchecked}
+	if got := verdictResult(v, "127.0.0.1:8080"); got.Status != config.StatusVerified {
+		t.Errorf("verdictResult(full) status = %s, want %s", got.Status, config.StatusVerified)
+	}
+	v.Partial, v.NotProven = true, []string{"the node's policy history"}
+	got := verdictResult(v, "127.0.0.1:8080")
+	if got.Status != config.StatusPartial || !strings.Contains(got.Detail, "NOT PROVEN: the node's policy history") || !strings.Contains(got.Detail, "policy history unchecked") {
+		t.Errorf("verdictResult(partial) = %+v, want Partial naming what is not proven", got)
+	}
 }

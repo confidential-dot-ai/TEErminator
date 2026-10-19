@@ -247,6 +247,8 @@ type bundleSpec struct {
 	allowlist http.HandlerFunc
 	// routes, when set, answers GET /.well-known/c8s/routes.
 	routes http.HandlerFunc
+	// objects, when set, answers GET /allowlist/objects/sha256/...
+	objects http.HandlerFunc
 	// measuredPolicies is the bundle's measured_policies list; nil omits it.
 	measuredPolicies []string
 }
@@ -266,6 +268,10 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		}
 		if spec.routes != nil && r.URL.Path == wellKnownRoutes {
 			spec.routes(w, r)
+			return
+		}
+		if spec.objects != nil && strings.HasPrefix(r.URL.Path, allowlistObjects) {
+			spec.objects(w, r)
 			return
 		}
 		nonceB64 := r.URL.Query().Get("nonce")
@@ -382,6 +388,9 @@ type stubClaims struct {
 	platformData map[string]any
 	tcb          teetypes.TcbInfo
 	tcbStatus    *teetypes.DcapVerificationStatus
+	// initDataMatch answers an init-data pin: the stub reports a match only
+	// when the pin equals it.
+	initDataMatch []byte
 }
 
 // stubCalls records what the attester handed the evidence seam.
@@ -428,11 +437,22 @@ func stubEvidenceClaims(t *testing.T, sc stubClaims) *stubCalls {
 				TCB:          sc.tcb,
 				PlatformData: sc.platformData,
 			},
-			TCBStatus: sc.tcbStatus,
+			TCBStatus:     sc.tcbStatus,
+			InitDataMatch: initDataMatch(pins.initData, sc.initDataMatch),
 		}, nil
 	}
 	t.Cleanup(func() { verifyEvidence = orig })
 	return calls
+}
+
+// initDataMatch is what a verifier reports for an init-data pin against the
+// evidence's committed digest: nil without a pin.
+func initDataMatch(pin, committed []byte) *bool {
+	if pin == nil {
+		return nil
+	}
+	match := bytes.Equal(pin, committed)
+	return &match
 }
 
 // newLBAttester builds an attester against ts, mirroring the proxy's attest-lb
@@ -1212,28 +1232,48 @@ func TestAttestLBTDXImagePins(t *testing.T) {
 	})
 }
 
-// TestValidatePinCombination covers the two evidence-independent pin rules as
-// a unit, since both `remote add` and the stored config are gated by them: a
+// TestValidatePinCombination covers the evidence-independent pin rules as a
+// unit, since both `remote add` and the stored config are gated by them: a
 // config the CLI refuses to write must also be one the daemon refuses to run.
-// c8s applies the same two to `c8s verify` (internal/cmds/verify, buildPolicy).
+// c8s applies the same rules to `c8s verify` (internal/cmds/verify).
 func TestValidatePinCombination(t *testing.T) {
 	const manifest = "/tmp/manifest.json"
+	digest := "sha256:" + strings.Repeat("ab", 32)
+	reg := strings.Repeat("4d", RegisterSize)
 	for _, tc := range []struct {
-		name                        string
-		measurements                []string
-		imageManifest, expectedRTMR string
-		wantErr                     string
+		name    string
+		r       config.Remote
+		wantErr string
 	}{
-		{"nothing pinned", nil, "", "", ""},
-		{"allowlist alone", []string{mrtdHex}, "", "", ""},
-		{"manifest alone", nil, manifest, "", ""},
-		{"manifest carries the rtmr3 pin", nil, manifest, rtmr3Hex, ""},
-		{"allowlist beside a manifest", []string{mrtdHex}, manifest, "", "mutually exclusive"},
-		{"rtmr3 without a manifest", nil, "", rtmr3Hex, "--expected-rtmr3 requires --image-manifest"},
-		{"rtmr3 with only an allowlist", []string{mrtdHex}, "", rtmr3Hex, "--expected-rtmr3 requires --image-manifest"},
+		{"nothing pinned", config.Remote{}, ""},
+		{"allowlist alone", config.Remote{Measurements: []string{mrtdHex}}, ""},
+		{"manifest alone", config.Remote{ImageManifestPath: manifest}, ""},
+		{"manifest carries the rtmr3 pin", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex}, ""},
+		{"manifest carries the operator key", config.Remote{ImageManifestPath: manifest, OperatorPubkeyPath: "/k.pub"}, ""},
+		{"manifest carries rtmr 3=", config.Remote{ImageManifestPath: manifest, RTMRs: []string{"3=" + reg}}, ""},
+		{"allowlist beside a manifest", config.Remote{Measurements: []string{mrtdHex}, ImageManifestPath: manifest}, "mutually exclusive"},
+		{"rtmr3 without a manifest", config.Remote{ExpectedRTMR3: rtmr3Hex}, "--expected-rtmr3 requires --image-manifest"},
+		{"rtmr3 with only an allowlist", config.Remote{Measurements: []string{mrtdHex}, ExpectedRTMR3: rtmr3Hex}, "--expected-rtmr3 requires --image-manifest"},
+		{"operator key without a manifest", config.Remote{OperatorPubkeyPath: "/k.pub"}, "--operator-pkey requires --image-manifest"},
+		{"two seeds", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, OperatorPubkeyPath: "/k.pub"}, "name the register once"},
+		{"rtmr 1= beside a manifest", config.Remote{ImageManifestPath: manifest, RTMRs: []string{"1=" + reg}}, "cannot be combined with --image-manifest"},
+		{"rtmr 1= and 2= by hand", config.Remote{Measurements: []string{mrtdHex}, RTMRs: []string{"1=" + reg, "2=" + reg}}, ""},
+		{"rtmr 0=", config.Remote{RTMRs: []string{"0=" + reg}}, "RTMR[0] is not pinnable"},
+		{"pinned policies with a seed", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, PinnedPolicies: []string{digest}}, ""},
+		{"pinned policies without a seed", config.Remote{ImageManifestPath: manifest, PinnedPolicies: []string{digest}}, "require an RTMR[3] seed"},
+		{"trust operator with keys", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, TrustOperator: true, TrustOperatorKeys: []string{"k"}}, ""},
+		{"trust operator without keys", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, TrustOperator: true}, "requires --trust-operator-key"},
+		{"trust operator keys alone", config.Remote{TrustOperatorKeys: []string{"k"}}, "requires --trust-operator"},
+		{"both history checks", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, PinnedPolicies: []string{digest}, TrustOperator: true, TrustOperatorKeys: []string{"k"}}, "mutually exclusive"},
+		{"route floor without keys", config.Remote{RouteFloor: "1:" + strings.Repeat("ab", 32)}, "requires --route-operator-key"},
+		{"route floor", config.Remote{RouteOperatorKeys: []string{"k"}, RouteFloor: "1:" + strings.Repeat("ab", 32)}, ""},
+		{"malformed route floor", config.Remote{RouteOperatorKeys: []string{"k"}, RouteFloor: "x:ab"}, "revision"},
+		{"init data", config.Remote{InitDataDigest: strings.Repeat("ab", 32)}, ""},
+		{"short init data", config.Remote{InitDataDigest: "ab"}, "--init-data"},
+		{"malformed sandbox id", config.Remote{SandboxID: "a b"}, "--sandbox-id"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidatePinCombination(tc.measurements, tc.imageManifest, tc.expectedRTMR)
+			err := ValidatePinCombination(tc.r)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("ValidatePinCombination = %v, want it accepted", err)

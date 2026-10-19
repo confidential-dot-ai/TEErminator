@@ -244,6 +244,13 @@ type Floor struct {
 	digest   [sha256.Size]byte
 }
 
+// Set starts the floor at a manifest accepted earlier, by revision and digest.
+func (f *Floor) Set(revision uint64, digest [sha256.Size]byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revision, f.digest = revision, digest
+}
+
 // Accept raises the floor to s when its revision is higher than the floor's,
 // or equal with the same digest, and returns an error otherwise. Checking
 // and raising are one step, so concurrent verifications never lower it.
