@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -59,6 +60,69 @@ func TestLoadNormalizesLegacyAttestMode(t *testing.T) {
 	}
 	if got := cfg.Remotes[0].Mode; got != AttestEndpoint {
 		t.Fatalf("mode = %q, want %q", got, AttestEndpoint)
+	}
+}
+
+func TestLoadRejectsUnknownKeys(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, wantKey string
+	}{
+		{"misspelled remote key", `{"remotes":[{"local":"127.0.0.1:8080","remote":"https://lb.example/","mode":"attest-lb","routeDigests":["ab"]}]}`, "routeDigests"},
+		{"misspelled route operator keys", `{"remotes":[{"local":"127.0.0.1:8080","remote":"https://lb.example/","mode":"attest-lb","route_operator_key":["k"]}]}`, "route_operator_key"},
+		{"unknown top-level key", `{"remotes":[],"remote":[]}`, `"remote"`},
+		{"trailing brace", `{"remotes":[]}}`, "trailing data"},
+		{"trailing object", `{"remotes":[]} {}`, "trailing data"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("XDG_CONFIG_HOME", dir)
+			if err := os.MkdirAll(filepath.Join(dir, "teerminator"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "teerminator", "config.json"), []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.wantKey) {
+				t.Fatalf("Load() = %v, want an error naming %s", err, tc.wantKey)
+			}
+		})
+	}
+}
+
+// TestLoadAcceptsEveryWrittenKey round-trips a remote with every field set, so
+// nothing Save writes is refused on the next Load.
+func TestLoadAcceptsEveryWrittenKey(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg := &Config{
+		Remotes: []Remote{{
+			Local: "127.0.0.1:8080", Remote: "https://lb.example/", Auth: AuthToken, Status: StatusVerified,
+			Token: "t", Mode: AttestEndpoint, DiscoveryURL: "https://d", ServerName: "s",
+			Measurements: []string{"a1"}, WorkloadName: "api", AllowlistPath: "/a", ImageManifestPath: "/i",
+			ExpectedRTMR3: "r", MinTCB: &TCBFloor{Bootloader: 1}, TDXTCBStatus: []string{"UpToDate"},
+			RouteDigests: []string{"ab"}, RouteOperatorKeys: []string{"k"}, StaticAllowlist: true, InitData: "x",
+			Pin: &CertPin{SHA256: "h", NotAfter: "n", PEM: "p"},
+		}},
+		Certs: []Cert{{Fingerprint: "f", CommonName: "c", PEM: "p"}},
+	}
+	requireAllSet(t, reflect.ValueOf(cfg.Remotes[0]))
+	requireAllSet(t, reflect.ValueOf(cfg.Certs[0]))
+	requireAllSet(t, reflect.ValueOf(*cfg.Remotes[0].Pin))
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() = %v, want the saved config to load", err)
+	}
+}
+
+// requireAllSet fails for any zero field, so a field added later must join
+// the round trip above.
+func requireAllSet(t *testing.T, v reflect.Value) {
+	t.Helper()
+	for i := range v.NumField() {
+		if v.Field(i).IsZero() {
+			t.Errorf("%s.%s is unset; add it to TestLoadAcceptsEveryWrittenKey", v.Type().Name(), v.Type().Field(i).Name)
+		}
 	}
 }
 

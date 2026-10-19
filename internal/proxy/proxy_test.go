@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 )
 
 // startTunnel is a test helper that creates a tunnel pointing at backend and
@@ -790,7 +792,7 @@ func TestForwardingPinSurvivesCacheInvalidation(t *testing.T) {
 	defer func() { _ = tr.Close() }()
 
 	pin := leafHashOf(attested.Certificate())
-	tr.cache.RecordSession(tr.remoteKey, true, pin, time.Now().Add(time.Hour), nil)
+	tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), pin, time.Now().Add(time.Hour))
 	forwarding := tr.transportFor(pin)
 
 	// The race: the verdict vanishes after the caller decided on it and before
@@ -846,7 +848,7 @@ func TestHandshakePinBlocksBeforeSend(t *testing.T) {
 		defer func() { _ = tr.Close() }()
 		// Seed a fresh passing verdict directly so the round trip skips the
 		// attester and exercises only the handshake-time pin.
-		tr.cache.RecordSession(tr.remoteKey, true, pin, time.Now().Add(time.Hour), nil)
+		tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), pin, time.Now().Add(time.Hour))
 		req, _ := http.NewRequest("GET", backend.URL, nil)
 		resp, err := tr.RoundTrip(req)
 		if err != nil {
@@ -878,5 +880,108 @@ func TestHandshakePinBlocksBeforeSend(t *testing.T) {
 	}
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("matching pin: backend hits = %d, want 1", got)
+	}
+}
+
+// blockingAttester returns verdict once release is closed, or the request's
+// context error if that comes first. It closes entered when called.
+type blockingAttester struct {
+	entered, release chan struct{}
+	verdict          *verifier.SessionVerdict
+}
+
+func (a *blockingAttester) Attest(ctx context.Context) (*verifier.SessionVerdict, error) {
+	close(a.entered)
+	select {
+	case <-a.release:
+		return a.verdict, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestAttestationVerdictOrdering checks how roundTripEndpoint records a
+// verdict that races another: a pass superseded by a failure recorded from a
+// later attestation is refused, and a cancelled request records nothing.
+func TestAttestationVerdictOrdering(t *testing.T) {
+	var hits atomic.Int32
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, "ok")
+	}))
+	defer backend.Close()
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := backend.Certificate()
+
+	for _, tc := range []struct {
+		name string
+		// during runs while Attest blocks; it returns whether to release it.
+		during    func(tr *h3Transport, cancel context.CancelFunc) bool
+		wantErr   string
+		wantFresh bool // a verdict is cached afterwards
+	}{
+		{
+			name: "pass superseded by a later failure",
+			during: func(tr *h3Transport, _ context.CancelFunc) bool {
+				tr.cache.RecordFailure(tr.remoteKey, tr.cache.Now().Add(time.Second), errors.New("later attestation failed"))
+				return true
+			},
+			wantErr:   "attestation previously failed",
+			wantFresh: true,
+		},
+		{
+			name: "cancelled request",
+			during: func(_ *h3Transport, cancel context.CancelFunc) bool {
+				cancel()
+				return false
+			},
+			wantErr: "context canceled",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hits.Store(0)
+			tr, err := newH3Transport(target, Options{
+				Remote:           config.Remote{Mode: config.AttestEndpoint},
+				ReattestInterval: time.Minute,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tr.Close() }()
+			stub := &blockingAttester{
+				entered: make(chan struct{}),
+				release: make(chan struct{}),
+				verdict: &verifier.SessionVerdict{LeafSHA256: leafHashOf(cert), LeafNotAfter: cert.NotAfter},
+			}
+			tr.ea = stub
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req, _ := http.NewRequestWithContext(ctx, "GET", backend.URL, nil)
+			done := make(chan error, 1)
+			go func() {
+				resp, err := tr.RoundTrip(req)
+				if resp != nil {
+					_ = resp.Body.Close()
+				}
+				done <- err
+			}()
+			<-stub.entered
+			if tc.during(tr, cancel) {
+				close(stub.release)
+			}
+			if err := <-done; err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("RoundTrip() = %v, want an error containing %q", err, tc.wantErr)
+			}
+			if n := hits.Load(); n != 0 {
+				t.Errorf("backend received %d requests, want 0", n)
+			}
+			if _, fresh, _ := tr.cache.FreshSession(tr.remoteKey); fresh != tc.wantFresh {
+				t.Errorf("FreshSession() fresh = %v, want %v", fresh, tc.wantFresh)
+			}
+		})
 	}
 }

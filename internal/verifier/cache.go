@@ -31,7 +31,9 @@ type SessionCache struct {
 }
 
 type verdict struct {
-	ok      bool
+	ok bool
+	// started is when the attestation began, verifAt when it was recorded.
+	started time.Time
 	verifAt time.Time
 	err     error
 	leaf    [32]byte // SHA-256 of the attested serving-leaf DER the session is pinned to
@@ -45,12 +47,34 @@ func NewSessionCache(ttl time.Duration) *SessionCache {
 	return &SessionCache{ttl: ttl, now: time.Now, state: make(map[string]verdict)}
 }
 
-// RecordSession stores an attestation verdict together with the SHA-256 of the
-// attested serving-leaf DER the session is pinned to and that leaf's expiry.
-func (c *SessionCache) RecordSession(key string, ok bool, leaf [32]byte, notAfter time.Time, err error) {
+// Now returns the time on the cache's clock, for the started argument of
+// RecordPass and RecordFailure.
+func (c *SessionCache) Now() time.Time { return c.now() }
+
+// RecordPass stores a passing verdict for an attestation that began at
+// started, with the SHA-256 of the attested serving-leaf DER the session is
+// pinned to and that leaf's expiry.
+// It reports whether it stored the verdict rather than keeping a newer one.
+func (c *SessionCache) RecordPass(key string, started time.Time, leaf [32]byte, notAfter time.Time) bool {
+	return c.record(key, verdict{ok: true, started: started, leaf: leaf, notAfter: notAfter})
+}
+
+// RecordFailure stores a failed attestation that began at started.
+func (c *SessionCache) RecordFailure(key string, started time.Time, err error) {
+	_ = c.record(key, verdict{started: started, err: err}) // a newer verdict is kept either way
+}
+
+// record keeps whichever verdict comes from the attestation that began last,
+// so a slow concurrent attestation never replaces newer evidence.
+func (c *SessionCache) record(key string, v verdict) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.state[key] = verdict{ok: ok, verifAt: c.now(), err: err, leaf: leaf, notAfter: notAfter}
+	if held, ok := c.state[key]; ok && held.started.After(v.started) {
+		return false
+	}
+	v.verifAt = c.now()
+	c.state[key] = v
+	return true
 }
 
 // FreshSession returns the pinned leaf hash for a still-valid passing verdict.
@@ -94,8 +118,9 @@ func (c *SessionCache) Invalidate(key string) {
 // one-byte tag and uint32-BE length: the sorted lowercased measurement
 // allowlist, the pinned workload name, the pinned allowlist file digest (when
 // set), the pinned image-manifest file digest (when set), the expected-RTMR[3]
-// pin, the SNP TCB floor (when set), the sorted accepted TDX TCB statuses, and
-// the sorted pinned-CA DER SHA-256 fingerprints. Every policy input is part of
+// pin, the SNP TCB floor (when set), the sorted accepted TDX TCB statuses, the
+// sorted route-digest pins, the sorted route operator key PEMs, and the
+// sorted pinned-CA DER SHA-256 fingerprints. Every policy input is part of
 // the key, so a verdict cached under one policy or endpoint mode can never
 // authorize traffic under another.
 func RemoteKey(host string, r config.Remote, allowlistDigest, imageManifestDigest []byte, pinnedCAs []*x509.Certificate) string {
@@ -132,6 +157,16 @@ func RemoteKey(host string, r config.Remote, allowlistDigest, imageManifestDiges
 	sort.Strings(statuses)
 	for _, s := range statuses {
 		field('x', []byte(s))
+	}
+	routes := slices.Clone(r.RouteDigests)
+	sort.Strings(routes)
+	for _, d := range routes {
+		field('d', []byte(d))
+	}
+	operatorKeys := slices.Clone(r.RouteOperatorKeys)
+	sort.Strings(operatorKeys)
+	for _, k := range operatorKeys {
+		field('k', []byte(k))
 	}
 	fps := make([]string, len(pinnedCAs))
 	for i, ca := range pinnedCAs {
