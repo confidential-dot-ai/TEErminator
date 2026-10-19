@@ -10,7 +10,10 @@ In particular it is meant to support the Confidential.ai stack and its confident
 `status` checks every remote live, with the same trust construction the proxy
 forwards over: `--mode attest-lb` remotes run the full attest-lb verification,
 unattested remotes are probed for reachability, and modes the proxy cannot
-enforce yet report `Failed`. Details (the verified measurement, workload name,
+enforce yet report `Failed`. An attest-lb verdict that passed but leaves a property
+unproven, such as a policy history nothing judged, reports `Partial` and names what is
+not proven; the proxy still forwards to it, and logs `partial` and `not_proven` on
+every attestation. Details (the verified measurement, workload name,
 trust mode, route digest and how it was checked, or the failure reason) are printed below the table, and results
 are persisted so `remote ls` shows the last checked status.
 
@@ -119,17 +122,21 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     the verified claims — the launch digest against the manifest's own MRTD included — so
     the manifest replaces `--measurements` rather than widening it: a second allowlist
     could only admit an image the manifest does not describe, and setting both is a
-    configuration error. `--expected-rtmr3 <hex>`
-    optionally pins RTMR[3] on top, and *only* on top:
-    RTMR[3] records events extended into a guest whose image the untrusted host selects,
-    so it requires `--image-manifest` and is a configuration error without one. Pin the
-    bare operator-key seed, the register before the node measures any policy. A node
-    that measures its allowlist policies extends RTMR[3] once per policy and lists them
-    in its bundle (`measured_policies`); TEErminator accepts the quote when the longest
-    prefix of that list that replays from the seed reaches the quoted register, and
-    reports that prefix in `check` and `status`. Nothing judges those policies yet, so
-    the verdict warns when any replayed. A malformed list, or one longer than 256
-    entries, fails closed. Because
+    configuration error. `--rtmr 1=<hex>,2=<hex>` (config key `rtmrs`) pins the
+    kernel and rootfs registers by hand instead; they exclude `--image-manifest`, and
+    both beside `--measurements` count as an image pin. RTMR[3] is pinned on top, and
+    *only* on top: it records events extended into a guest whose image the untrusted
+    host selects, so every spelling of it requires `--image-manifest`. Pin it as the
+    operator key the guest initrd hashed, `--operator-pkey <pem-file>` (config key
+    `operator_pubkey_path`; the seed is SHA-384(0x00*48 ‖ SHA-384(file bytes)), as
+    `c8s verify --operator-pkey` derives it), or as the bare seed with
+    `--expected-rtmr3 <hex>` or `--rtmr 3=<hex>`; name it once. A node that measures
+    its allowlist policies extends RTMR[3] once per policy and lists them in its bundle
+    (`measured_policies`); TEErminator accepts the quote when the longest prefix of that
+    list that replays from the seed reaches the quoted register, and reports that prefix,
+    the node's policy history, in `status`. A malformed list, or one longer than 256
+    entries, fails closed. Without a seed pin a listed history is not replayed, and the
+    verdict warns. See **Policy history** for how the history is judged. Because
     MRTD alone is
     not an image identity, a *deployment-class* TDX verdict without `--image-manifest` is
     a configuration error; with a specific-cluster CA pin it passes but the verdict
@@ -139,10 +146,50 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     component-wise minimum TCB floor (an all-zero floor gates nothing and is treated as
     no floor), and debug-launched guests are always rejected.
     Cross-platform pins fail closed: a TDX pin
-    (`--image-manifest`/`--expected-rtmr3`/`--tdx-tcb-status`) against SNP evidence is a
+    (`--image-manifest`/`--rtmr`/`--expected-rtmr3`/`--operator-pkey`/`--tdx-tcb-status`) against SNP evidence is a
     hard error naming the platform, as is `--min-tcb` against TDX evidence — never a
-    silently ignored option. All four, `--route-digest` and `--route-operator-key` require `--mode attest-lb`:
+    silently ignored option. Every pin in this list requires `--mode attest-lb`:
     on any other mode nothing would read them.
+  - **Policy history.** A replayed history proves which allowlist policies the node
+    enforced since boot, in order, not that any of them is acceptable. Choose how to
+    judge them; the two ways exclude each other, and both need an RTMR[3] seed:
+
+    | Flag (config key) | Accepts | Failure |
+    |---|---|---|
+    | `--pin-policy <sha256:hex or file>` (`pinned_policies`, repeatable) | Only these policies, for every history entry and for the policy the mesh leaf was issued under. A file is an allowlist document hashed exactly as read, the bytes `GET /allowlist` serves | `policy_history_not_pinned` |
+    | `--trust-operator --trust-operator-key <pem-file>` (`trust_operator`, `trust_operator_keys`) | Every history entry, and the policy the mesh leaf was issued under, whose document CDS stores with an operator write token signed under these keys | `policy_history_unsigned` |
+
+    Both fail with `policy_history_absent` when nothing replays: a node that does not
+    measure its policies proves nothing about them. `--trust-operator` fetches each
+    document from `/allowlist/objects/sha256/<hex>` at the front door, requires it to
+    hash to its digest (`allowlist_digest_mismatch` otherwise), and checks the token at
+    `<…>/signature` with the rules of c8s's `operatorauth.VerifyStored`: signature under
+    one of the keys, `htm` PUT, `htu` `/allowlist`, `pbh` over the bytes, and an
+    `exp`−`iat` window of at most five minutes. The bytes and the token authenticate
+    themselves, so any replica may serve them; each attester remembers the digests it
+    verified. Only a document uploaded whole with a signed `PUT /allowlist` carries a
+    token, so a per-workload edit yields a policy this check refuses until a signed
+    upload of the same document. The policy the mesh leaf was issued under is the one
+    its matched-workload stamp names. That stamp is CA-vouched, so the verdict stays
+    `Partial` unless the mesh CA is pinned (`certs add`, a specific-cluster verdict), and
+    a leaf without a stamp leaves it `Partial` too. With neither check, a non-empty
+    history is accepted and the verdict is `Partial`. Evidence that this check's nonce
+    does not bind cannot show a policy enforced since its quote and would leave a judged
+    verdict `Partial`; attest-lb evidence always binds it. `status` prints the check as
+    `policy history pinned`, `operator-signed` or `unchecked`.
+  - **Init data.** `--init-data <hex>` (config key `init_data_digest`) requires the
+    evidence to commit exactly this SHA-256 of the init-data document: SNP `HOST_DATA`,
+    TDX `MR_CONFIG_ID`, or vTPM PCR[8] on Azure.
+  - **Sandbox ID.** `--sandbox-id <id>` (config key `sandbox_id`) requires the committed
+    mesh leaf to carry this CRI pod sandbox ID (OID `1.3.6.1.4.1.66378.1.4`). Like the
+    workload stamp it is CA-vouched. `status` prints the ID whenever the leaf carries one,
+    and a malformed one fails the attestation even unpinned.
+  - **Pins of `c8s verify` a remote does not take.** `--allow-debug`: debug guests are
+    always rejected. `--served-policy-file`: it checks what a CDS target serves at
+    `/measurements`, which an attest-lb front door does not answer. `--image-policy-file`:
+    pin one image with `--image-manifest` and, for its anchor, `--operator-pkey`.
+    `--fetch-allowlists` and `--expected-report-data` are not pins; `allowlist fetch`
+    saves the document the leaf was issued under.
   - **TDX TCB status.** By default TDX evidence is verified offline: the quote signature
     and the PCK chain to the Intel root, with no TCB status. `--tdx-tcb-status <list>`
     names the Intel TCB statuses you accept, for example `UpToDate` or
@@ -188,6 +235,9 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     restart, and a tunnel forgets it when it restarts after an edit to its remote or to
     the trust store. `status` and `allowlist fetch` start each check with an empty
     floor, so they do not detect a rollback.
+    `--routes-floor <revision>:<digest>` (config key `route_floor`, requires
+    `--route-operator-key`) starts that floor at a manifest you accepted before, so a
+    restart does not forget it.
     The manifest must also route the remote URL's host, since the proxy sends it as
     `Host`, so the remote URL needs a DNS name the manifest routes, not an IP address.
     This check makes the remote depend on the publication: when it fails (404, any other
@@ -238,6 +288,16 @@ $ ./teerminator remote add 127.0.0.1:8084 https://<LB-IP>/ \
 # Or accept any route manifest the operator signed, published by the router.
 $ ./teerminator remote add 127.0.0.1:8085 https://app.example/ \
     --mode attest-lb --measurements <hex,...> --route-operator-key ./operator.pub
+
+# TDX: derive the RTMR[3] seed from the operator key and accept only these policies.
+$ ./teerminator remote add 127.0.0.1:8086 https://<LB-IP>/ \
+    --mode attest-lb --image-manifest ./image-manifest.json \
+    --operator-pkey ./operator.pub --pin-policy ./allowlist.json,sha256:<hex>
+
+# Or accept every policy the operator signed.
+$ ./teerminator remote add 127.0.0.1:8087 https://<LB-IP>/ \
+    --mode attest-lb --image-manifest ./image-manifest.json \
+    --operator-pkey ./operator.pub --trust-operator --trust-operator-key ./operator-keys.pem
 
 # Optional hardening: pin the mesh CA to upgrade the verdict to specific-cluster.
 $ ./teerminator certs add ./mesh-ca.pem
