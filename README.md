@@ -173,9 +173,7 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     its matched-workload stamp names. That stamp is CA-vouched, so the verdict stays
     `Partial` unless the mesh CA is pinned (`certs add`, a specific-cluster verdict), and
     a leaf without a stamp leaves it `Partial` too. With neither check, a non-empty
-    history is accepted and the verdict is `Partial`. Evidence that this check's nonce
-    does not bind cannot show a policy enforced since its quote and would leave a judged
-    verdict `Partial`; attest-lb evidence always binds it. `status` prints the check as
+    history is accepted and the verdict is `Partial`. `status` prints the check as
     `policy history pinned`, `operator-signed` or `unchecked`.
   - **Init data.** `--init-data <hex>` (config key `init_data_digest`) requires the
     evidence to commit exactly this SHA-256 of the init-data document: SNP `HOST_DATA`,
@@ -233,8 +231,9 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     a slow first attempt can leave no time for the retry. `status` (10 seconds by
     default) and `allowlist fetch` are also bounded by their own `--timeout`. The daemon forgets the floor on
     restart, and a tunnel forgets it when it restarts after an edit to its remote or to
-    the trust store. `status` and `allowlist fetch` start each check with an empty
-    floor, so they do not detect a rollback.
+    the trust store. `status` and `allowlist fetch` start each check at
+    `--routes-floor`, or an empty floor without it, so they detect a rollback only below
+    that configured floor.
     `--routes-floor <revision>:<digest>` (config key `route_floor`, requires
     `--route-operator-key`) starts that floor at a manifest you accepted before, so a
     restart does not forget it.

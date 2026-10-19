@@ -232,9 +232,17 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
 			}
 
+			rtmr3Stored, err := validateRTMR3Flag(expectedRTMR3)
+			if err != nil {
+				return err
+			}
+			trust := ""
+			if trustOperator {
+				trust = "true"
+			}
 			if err := validatePinModes(attestMode, []pinFlag{
 				{"--image-manifest", imageManifest},
-				{"--expected-rtmr3", expectedRTMR3},
+				{"--expected-rtmr3", rtmr3Stored},
 				{"--operator-pkey", operatorPkey},
 				{"--rtmr", strings.Join(rtmrs, ",")},
 				{"--init-data", initData},
@@ -245,7 +253,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				{"--route-operator-key", strings.Join(routeKeyFiles, ",")},
 				{"--routes-floor", routesFloor},
 				{"--pin-policy", strings.Join(pinPolicies, ",")},
-				{"--trust-operator", map[bool]string{true: "true"}[trustOperator]},
+				{"--trust-operator", trust},
 				{"--trust-operator-key", strings.Join(trustKeyFiles, ",")},
 			}); err != nil {
 				return err
@@ -275,7 +283,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			// the verifier so a config the CLI refuses to write is also a
 			// config the daemon refuses to run.
 			if err := verifier.ValidatePinCombination(config.Remote{
-				Measurements: measurements, ImageManifestPath: imageManifest, ExpectedRTMR3: expectedRTMR3,
+				Measurements: measurements, ImageManifestPath: imageManifest, ExpectedRTMR3: rtmr3Stored,
 				OperatorPubkeyPath: operatorPkey, RTMRs: rtmrs, InitDataDigest: initData, SandboxID: sandboxID,
 				RouteOperatorKeys: routeOperatorKeys, RouteFloor: routesFloor,
 				PinnedPolicies: pinPolicies, TrustOperator: trustOperator, TrustOperatorKeys: trustOperatorKeys,
@@ -296,10 +304,6 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				return err
 			}
 			manifestStored, err := validateImageManifestFlag(imageManifest)
-			if err != nil {
-				return err
-			}
-			rtmr3Stored, err := validateRTMR3Flag(expectedRTMR3)
 			if err != nil {
 				return err
 			}
@@ -379,8 +383,8 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringSliceVar(&rtmrs, "rtmr", nil, "TDX runtime register pins as <index>=<96 lowercase hex>, index 1, 2 or 3 (repeatable / comma-separated). RTMR[1] and RTMR[2] are the guest kernel and rootfs, so they exclude --image-manifest; pinning both beside --measurements counts as an image pin. RTMR[3] is another spelling of --expected-rtmr3 and requires --image-manifest. TDX evidence only")
 	f.StringVar(&initData, "init-data", "", "expected init-data digest: SHA-256 hex of the init-data document; the evidence must commit exactly this digest (SNP HOST_DATA, TDX MR_CONFIG_ID, PCR[8] on Azure)")
 	f.StringVar(&sandboxID, "sandbox-id", "", "CRI pod sandbox ID the committed mesh leaf must carry (OID 1.3.6.1.4.1.66378.1.4); CA-vouched, like --workload")
-	f.StringSliceVar(&pinPolicies, "pin-policy", nil, "accepted allowlist policies (repeatable / comma-separated), each a sha256:<hex> digest or the path of an allowlist document hashed exactly as read (the bytes GET /allowlist serves): every policy in the node's replayed history, and the one the mesh leaf was issued under, must be one of these. Requires an RTMR[3] seed (--operator-pkey or --expected-rtmr3); excludes --trust-operator")
-	f.BoolVar(&trustOperator, "trust-operator", false, "accept every policy in the node's replayed history, and the one the mesh leaf was issued under, only when CDS stores its document with a write token signed under --trust-operator-key: each one is fetched from /allowlist/objects/sha256/<hex>, re-hashed, and its token verified. Requires an RTMR[3] seed and --trust-operator-key; excludes --pin-policy")
+	f.StringSliceVar(&pinPolicies, "pin-policy", nil, "accepted allowlist policies (repeatable / comma-separated), each a sha256:<hex> digest or the path of an allowlist document hashed exactly as read (the bytes GET /allowlist serves): every policy in the node's replayed history, and the one the mesh leaf was issued under, must be one of these. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=); excludes --trust-operator")
+	f.BoolVar(&trustOperator, "trust-operator", false, "accept every policy in the node's replayed history, and the one the mesh leaf was issued under, only when CDS stores its document with a write token signed under --trust-operator-key: each one is fetched from /allowlist/objects/sha256/<hex>, re-hashed, and its token verified. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=) and --trust-operator-key; excludes --pin-policy")
 	f.StringArrayVar(&trustKeyFiles, "trust-operator-key", nil, "PEM file of ECDSA operator public keys --trust-operator accepts signatures from (repeatable). Requires --trust-operator; --route-operator-key does not feed it")
 	return cmd
 }

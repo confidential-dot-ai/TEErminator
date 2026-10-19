@@ -124,6 +124,7 @@ func TestAttestLBPolicyHistory(t *testing.T) {
 	}
 	node := newHistoryNode(t, otherAllowlistRaw, defaultAllowlistRaw)
 	leaf := policyDigest(defaultAllowlistRaw)
+	otherOnly := newHistoryNode(t, otherAllowlistRaw)
 	pinnedFile := filepath.Join(t.TempDir(), "allowlist.json")
 	if err := os.WriteFile(pinnedFile, otherAllowlistRaw, 0o600); err != nil {
 		t.Fatal(err)
@@ -153,12 +154,13 @@ func TestAttestLBPolicyHistory(t *testing.T) {
 		{name: "pinned without a mesh CA pin is partial", remote: pin(node.remote(t), node.history...), wantCheck: PolicyPinned, wantPartial: "CA-vouched"},
 		{name: "pinned with an unstamped leaf is partial", remote: pin(node.remote(t), node.history...), specific: true, noStamp: true, wantCheck: PolicyPinned, wantPartial: "no matched-workload stamp"},
 		{name: "history entry not pinned", remote: pin(node.remote(t), leaf), wantErr: "policy_history_not_pinned: the node enforced policy " + node.history[0]},
-		{name: "leaf policy not pinned", remote: pin(newHistoryNode(t, otherAllowlistRaw).remote(t), node.history[0]), rtmr3: newHistoryNode(t, otherAllowlistRaw).rtmr3, wantErr: "policy_history_not_pinned: the mesh leaf was issued under policy " + leaf},
+		{name: "leaf policy not pinned", remote: pin(otherOnly.remote(t), node.history[0]), rtmr3: otherOnly.rtmr3, wantErr: "policy_history_not_pinned: the mesh leaf was issued under policy " + leaf},
 		{name: "pinned against a node that does not measure", remote: pin(node.remote(t), node.history...), rtmr3: hex.EncodeToString(node.seed[:]), wantErr: "policy_history_absent"},
 		{name: "operator signed", remote: trust(node.remote(t), key), specific: true, signer: signer{node: node, key: key}, wantCheck: PolicyOperatorSigned},
 		{name: "operator signed without a mesh CA pin is partial", remote: trust(node.remote(t), key), signer: signer{node: node, key: key}, wantCheck: PolicyOperatorSigned, wantPartial: "CA-vouched"},
 		{name: "signed by another key", remote: trust(node.remote(t), key), signer: signer{node: node, key: other}, wantErr: "policy_history_unsigned"},
 		{name: "unsigned policy", remote: trust(node.remote(t), key), signer: signer{node: node, key: key, unsigned: strings.TrimPrefix(node.history[0], "sha256:")}, wantErr: "policy_history_unsigned: policy " + node.history[0] + " carries no operator signature"},
+		{name: "unsigned leaf policy outside the history", remote: trust(node.remote(t), key), rtmr3: otherOnly.rtmr3, specific: true, signer: signer{node: node, key: key, unsigned: strings.TrimPrefix(leaf, "sha256:")}, wantErr: "policy_history_unsigned: policy " + leaf},
 		{name: "served bytes do not hash to the digest", remote: trust(node.remote(t), key), signer: signer{node: node, key: key, tamper: strings.TrimPrefix(leaf, "sha256:")}, wantErr: "allowlist_digest_mismatch"},
 		{name: "operator trust against a node that does not measure", remote: trust(node.remote(t), key), rtmr3: hex.EncodeToString(node.seed[:]), signer: signer{node: node, key: key}, wantErr: "policy_history_absent"},
 	} {
@@ -197,21 +199,6 @@ func TestAttestLBPolicyHistory(t *testing.T) {
 				t.Errorf("Partial, NotProven = %t, %q, want partial naming %q", v.Partial, notProven, tc.wantPartial)
 			}
 		})
-	}
-}
-
-// TestJudgePolicyHistoryStale covers evidence this check's nonce does not
-// bind: a judged history is current only up to its quote.
-func TestJudgePolicyHistoryStale(t *testing.T) {
-	d := policyDigest(defaultAllowlistRaw)
-	v := &SessionVerdict{MeasuredPolicies: []string{d}, TrustMode: TrustSpecificCluster, Stamp: &MatchedWorkload{AllowlistDigest: make([]byte, 32)}}
-	copy(v.Stamp.AllowlistDigest, func() []byte { s := sha256.Sum256(defaultAllowlistRaw); return s[:] }())
-	e := &EndpointAttester{}
-	if err := e.judgePolicyHistory(context.Background(), v, historyPolicy{pinned: []string{d}}, false); err != nil {
-		t.Fatal(err)
-	}
-	if !v.Partial || !strings.Contains(strings.Join(v.NotProven, ";"), "nonce does not bind") {
-		t.Errorf("judgePolicyHistory(stale) Partial, NotProven = %t, %q, want partial for a stale history", v.Partial, v.NotProven)
 	}
 }
 

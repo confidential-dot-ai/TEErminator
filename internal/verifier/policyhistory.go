@@ -129,9 +129,8 @@ func (s *signedPolicies) add(digest string) {
 // and the policy the mesh leaf was issued under, against the remote's pinned
 // digests or operator keys. It fails the verdict when a policy is not
 // accepted or nothing replayed, and leaves it partial when the history goes
-// unjudged, the leaf's issuing policy is unknown or only CA-vouched, or the
-// evidence is not bound to this check's nonce (fresh false).
-func (e *EndpointAttester) judgePolicyHistory(ctx context.Context, v *SessionVerdict, h historyPolicy, fresh bool) error {
+// unjudged or the leaf's issuing policy is unknown or only CA-vouched.
+func (e *EndpointAttester) judgePolicyHistory(ctx context.Context, v *SessionVerdict, h historyPolicy) error {
 	history, pinned, keys := v.MeasuredPolicies, h.pinned, h.keys
 	if len(pinned) == 0 && len(keys) == 0 {
 		if len(history) > 0 {
@@ -174,9 +173,6 @@ func (e *EndpointAttester) judgePolicyHistory(ctx context.Context, v *SessionVer
 		v.demote(fmt.Sprintf("the policy the mesh leaf was issued under: the policy history is %s, but the leaf carries no matched-workload stamp, so its issuing policy was not checked", v.PolicyCheck))
 	case v.TrustMode != TrustSpecificCluster:
 		v.demote(fmt.Sprintf("the policy the mesh leaf was issued under: its matched-workload stamp is %s, but the stamp is CA-vouched and the mesh CA is not pinned (certs add)", v.PolicyCheck))
-	}
-	if !fresh {
-		v.demote(fmt.Sprintf("the node's current policy history: the history is %s up to the evidence's quote, which this check's nonce does not bind, so a policy enforced since is not shown", v.PolicyCheck))
 	}
 	return nil
 }

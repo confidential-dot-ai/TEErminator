@@ -148,6 +148,24 @@ func TestValidateRTMR3Flag(t *testing.T) {
 	}
 }
 
+// TestRemoteAddBlankRTMR3 checks that a whitespace-only --expected-rtmr3 is
+// judged as the empty value it is stored as, not as an RTMR[3] seed.
+func TestRemoteAddBlankRTMR3(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	manifest := filepath.Join(t.TempDir(), "manifest.json")
+	body := `{"mrtd":"` + strings.Repeat("1a", 48) + `","rtmr1":"` + strings.Repeat("2b", 48) + `","rtmr2":"` + strings.Repeat("3c", 48) + `"}`
+	if err := os.WriteFile(manifest, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := newRemoteAddCmd("teerm")
+	cmd.SetArgs([]string{"127.0.0.1:8080", "https://lb.example", "--mode", "attest-lb", "--image-manifest", manifest,
+		"--expected-rtmr3", "  ", "--pin-policy", "sha256:" + strings.Repeat("ab", 32)})
+	cmd.SilenceUsage = true
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "require an RTMR[3] seed") {
+		t.Errorf("remote add with a blank --expected-rtmr3 = %v, want the missing seed error", err)
+	}
+}
+
 // TestReadRouteOperatorKeys checks that --route-operator-key stores one PEM
 // block per key, read from every file, and refuses anything but public keys.
 func TestReadRouteOperatorKeys(t *testing.T) {

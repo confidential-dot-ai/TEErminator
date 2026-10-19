@@ -537,7 +537,7 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 		v.addWarning("TDX policy covers MRTD only — the guest kernel (RTMR[1]) and rootfs (RTMR[2]) are UNMEASURED by this policy; pin the full image tuple with `remote add --image-manifest`")
 	}
 	// The evidence binds this check's nonce, so the history is current.
-	if err := e.judgePolicyHistory(ctx, v, history, true); err != nil {
+	if err := e.judgePolicyHistory(ctx, v, history); err != nil {
 		return nil, fmt.Errorf("attest-lb: %w", err)
 	}
 	// Last, so a mismatch reports a digest from an otherwise trusted router.

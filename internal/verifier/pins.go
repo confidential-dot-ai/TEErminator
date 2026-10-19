@@ -99,7 +99,7 @@ func ValidatePinCombination(r config.Remote) error {
 		return errors.New("--trust-operator requires --trust-operator-key: the operator public keys whose signatures it accepts")
 	}
 	if (len(r.PinnedPolicies) > 0 || r.TrustOperator) && len(seeds) == 0 {
-		return errors.New("--pin-policy and --trust-operator require an RTMR[3] seed (--operator-pkey or --expected-rtmr3): the node's policy history counts only as far as it replays against RTMR[3] from that seed")
+		return errors.New("--pin-policy and --trust-operator require an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=): the node's policy history counts only as far as it replays against RTMR[3] from that seed")
 	}
 	if r.RouteFloor != "" {
 		if len(r.RouteOperatorKeys) == 0 {
