@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -53,6 +55,38 @@ func newRemoteCmd(name string) *cobra.Command {
 	remoteCmd.AddCommand(newRemoteRmCmd())
 	remoteCmd.AddCommand(newRemoteLsCmd())
 	return remoteCmd
+}
+
+// frontDoorEntry matches the name c8s gives the router entry it seeds: c8s-router-
+// and the first 12 hex digits of the entry's SHA-256.
+var frontDoorEntry = regexp.MustCompile(`^c8s-router-[0-9a-f]{12}$`)
+
+// frontDoorWorkload returns the policy's one front-door entry name, the
+// --workload pin when only --allowlist is given.
+func frontDoorWorkload(allowlistPath string) (string, error) {
+	raw, err := os.ReadFile(allowlistPath)
+	if err != nil {
+		return "", fmt.Errorf("reading --allowlist: %w", err)
+	}
+	doc, err := verifier.ParsePinnedAllowlist(raw)
+	if err != nil {
+		return "", fmt.Errorf("--allowlist %s: %w", allowlistPath, err)
+	}
+	var names []string
+	for name := range doc.Workloads {
+		if frontDoorEntry.MatchString(name) {
+			names = append(names, name)
+		}
+	}
+	switch len(names) {
+	case 1:
+		return names[0], nil
+	case 0:
+		return "", fmt.Errorf("--allowlist %s has no c8s-router-* front-door entry; pass --workload", allowlistPath)
+	default:
+		slices.Sort(names)
+		return "", fmt.Errorf("--allowlist %s has several front-door entries (%s); pass --workload", allowlistPath, strings.Join(names, ", "))
+	}
 }
 
 // validateWorkloadFlags checks the --workload/--allowlist pins at add time:
@@ -308,6 +342,12 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				return err
 			}
 
+			if workload == "" && allowlistPath != "" {
+				if workload, err = frontDoorWorkload(allowlistPath); err != nil {
+					return err
+				}
+				fmt.Printf("Note: pinning workload %q, the front-door entry of --allowlist.\n", workload)
+			}
 			allowlistStored, err := validateWorkloadFlags(workload, allowlistPath)
 			if err != nil {
 				return err
@@ -379,7 +419,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated; required for attest-lb unless --image-manifest is given (an empty measurement policy is a configuration error, and the two flags are mutually exclusive)")
 	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest-lb always uses the remote's origin)")
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
-	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb)")
+	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb). Defaults, with --allowlist, to the policy's one c8s-router-* front-door entry")
 	f.StringVar(&allowlistPath, "allowlist", "", "path to a pinned canonical-allowlist JSON file; hashed exactly as read against the stamp's digest, and the stamped name must resolve in it (attest-lb)")
 	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, nested under tdx as the confos build writes them or at the top level; published with the image build); all three registers are pinned exactly against this one manifest, so the guest kernel and rootfs are verified rather than only the firmware. Replaces --measurements rather than adding to it. TDX evidence only — with SNP evidence this is a policy error")
 	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 lowercase hex chars: the bare operator-key seed, the register before the node measures any policy. A node that measures its allowlist policies is accepted when the policy list in its bundle replays from this seed to the quoted register. This is a deployment property, NOT a cluster identity, and cannot replace an image pin, so it requires --image-manifest. TDX evidence only — with SNP evidence this is a policy error")
