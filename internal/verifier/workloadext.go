@@ -142,3 +142,32 @@ func matchedWorkloadFromCert(cert *x509.Certificate) (*MatchedWorkload, error) {
 	}
 	return found, nil
 }
+
+// oidSandboxID is the pod sandbox ID extension CDS stamps on a leaf whose
+// requester presented a sandbox token.
+var oidSandboxID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 66378, 1, 4}
+
+// sandboxIDFromCert reads the sandbox ID extension strictly, as c8s's
+// pkg/armtls does: an IA5String in the sandbox ID grammar, no trailing bytes.
+// x509 already refuses a certificate carrying it twice. It returns "" when
+// the certificate carries none.
+func sandboxIDFromCert(cert *x509.Certificate) (string, error) {
+	for _, ext := range cert.Extensions {
+		if !ext.Id.Equal(oidSandboxID) {
+			continue
+		}
+		var id string
+		rest, err := asn1.UnmarshalWithParams(ext.Value, &id, "ia5")
+		if err != nil {
+			return "", fmt.Errorf("unmarshal sandbox ID extension: %w", err)
+		}
+		if len(rest) > 0 {
+			return "", fmt.Errorf("%d trailing bytes after sandbox ID extension", len(rest))
+		}
+		if !sandboxIDPattern.MatchString(id) {
+			return "", fmt.Errorf("sandbox ID %q does not match %s", id, sandboxIDPattern)
+		}
+		return id, nil
+	}
+	return "", nil
+}

@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"sync"
 	"time"
 
@@ -257,25 +256,11 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 		}
 		// The cache key covers the endpoint mode and every policy pin, so a
 		// verdict cached under one policy can never authorize another.
-		var allowlistDigest []byte
-		if opts.Remote.AllowlistPath != "" {
-			raw, err := os.ReadFile(opts.Remote.AllowlistPath)
-			if err != nil {
-				return nil, fmt.Errorf("attest-lb: read pinned allowlist: %w", err)
-			}
-			sum := sha256.Sum256(raw)
-			allowlistDigest = sum[:]
+		files, err := verifier.PinnedFileDigests(opts.Remote)
+		if err != nil {
+			return nil, fmt.Errorf("attest-lb: %w", err)
 		}
-		var imageManifestDigest []byte
-		if opts.Remote.ImageManifestPath != "" {
-			raw, err := os.ReadFile(opts.Remote.ImageManifestPath)
-			if err != nil {
-				return nil, fmt.Errorf("attest-lb: read pinned image manifest: %w", err)
-			}
-			sum := sha256.Sum256(raw)
-			imageManifestDigest = sum[:]
-		}
-		remoteKey = verifier.RemoteKey(target.Host, opts.Remote, allowlistDigest, imageManifestDigest, pinnedCAs)
+		remoteKey = verifier.RemoteKey(target.Host, opts.Remote, files, pinnedCAs)
 		cache = verifier.NewSessionCache(opts.ReattestInterval)
 
 		// The first handshake captures the serving leaf before its attested mode
@@ -418,7 +403,8 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 			}
 		}
 		slog.Info("attestation verified", "mode", t.remote.Mode, "url", req.URL.String(),
-			"measurement", v.Measurement, "trust", v.TrustMode, "route_digest", v.RouteDigest, "route_check", v.RouteCheck, "route_revision", v.RouteRevision)
+			"measurement", v.Measurement, "trust", v.TrustMode, "route_digest", v.RouteDigest, "route_check", v.RouteCheck, "route_revision", v.RouteRevision,
+			"policy_check", v.PolicyCheck, "partial", v.Partial, "not_proven", v.NotProven)
 		leaf = v.LeafSHA256
 	}
 	if leaf == ([32]byte{}) {

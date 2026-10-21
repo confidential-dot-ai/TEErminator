@@ -387,3 +387,40 @@ func TestAttestLBFetchesPublicationAlongsideHandshake(t *testing.T) {
 		t.Error("the publication fetch waited for the attest-lb response")
 	}
 }
+
+func TestAttestLBConfiguredRouteFloor(t *testing.T) {
+	stubEvidence(t)
+	f := newLBFixture(t, fixtureOpts{})
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m13 := routeManifest(13, "app.example", "a")
+	d13 := sha256.Sum256(m13)
+	for _, tc := range []struct {
+		name     string
+		manifest []byte
+		wantErr  string
+	}{
+		{"the floor manifest", m13, ""},
+		{"lower revision", routeManifest(12, "app.example", "a"), "a router replica may not have applied revision 13 yet"},
+		{"same revision, other digest", routeManifest(13, "app.example", "b"), "equals the accepted one with a different digest"},
+		{"higher revision", routeManifest(14, "app.example", "a"), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := measuredRemote()
+			remote.RouteOperatorKeys = []string{operatorKeyPEM(t, key)}
+			remote.RouteFloor = fmt.Sprintf("13:%x", d13)
+			pub := &publisher{responses: []string{signRoutes(t, key, tc.manifest, tc.manifest)}}
+			ts := routedServer(t, f, tc.manifest, pub)
+			ea := newRoutedAttester(t, "https://app.example", func() string { return ts.Listener.Addr().String() }, remote)
+			_, err := ea.Attest(context.Background())
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("Attest() = %v, want success", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("Attest() = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}

@@ -100,48 +100,26 @@ func TestValidateImageManifestFlag(t *testing.T) {
 // nothing, so it is refused at add time rather than at some later verification
 // that never runs.
 func TestValidatePinModes(t *testing.T) {
-	const (
-		manifest = "/tmp/manifest.json"
-		rtmr3    = "deadbeef"
-		tcb      = "3,0,8,209"
-	)
-	tdxTCB := []string{"UpToDate"}
-	routes := []string{strings.Repeat("ab", 32)}
-	keys := []string{"operator.pub"}
-	for _, tc := range []struct {
-		name                 string
-		mode                 config.AttestMode
-		manifest, rtmr3, tcb string
-		tdxTCB, routes, keys []string
-		wantFlag             string
-	}{
-		{"attest-lb accepts every pin", config.AttestEndpoint, manifest, rtmr3, tcb, tdxTCB, routes, keys, ""},
-		{"no mode, no pins", config.AttestNone, "", "", "", nil, nil, nil, ""},
-		{"no mode rejects the image manifest", config.AttestNone, manifest, "", "", nil, nil, nil, "--image-manifest"},
-		{"no mode rejects the rtmr3 pin", config.AttestNone, "", rtmr3, "", nil, nil, nil, "--expected-rtmr3"},
-		{"no mode rejects the tcb floor", config.AttestNone, "", "", tcb, nil, nil, nil, "--min-tcb"},
-		{"no mode rejects the tdx tcb status", config.AttestNone, "", "", "", tdxTCB, nil, nil, "--tdx-tcb-status"},
-		{"cds-cert rejects the image manifest", config.AttestCDSCert, manifest, "", "", nil, nil, nil, "--image-manifest"},
-		{"cds-cert rejects the rtmr3 pin", config.AttestCDSCert, "", rtmr3, "", nil, nil, nil, "--expected-rtmr3"},
-		{"cds-cert rejects the tcb floor", config.AttestCDSCert, "", "", tcb, nil, nil, nil, "--min-tcb"},
-		{"cds-cert rejects the tdx tcb status", config.AttestCDSCert, "", "", "", tdxTCB, nil, nil, "--tdx-tcb-status"},
-		{"no mode rejects the route digest", config.AttestNone, "", "", "", nil, routes, nil, "--route-digest"},
-		{"cds-cert rejects the route digest", config.AttestCDSCert, "", "", "", nil, routes, nil, "--route-digest"},
-		{"no mode rejects the route operator key", config.AttestNone, "", "", "", nil, nil, keys, "--route-operator-key"},
-		{"cds-cert rejects the route operator key", config.AttestCDSCert, "", "", "", nil, nil, keys, "--route-operator-key"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validatePinModes(tc.mode, tc.manifest, tc.rtmr3, tc.tcb, tc.tdxTCB, tc.routes, tc.keys)
-			if tc.wantFlag == "" {
-				if err != nil {
-					t.Fatalf("validatePinModes = %v, want it accepted", err)
-				}
-				return
+	flags := []string{"--image-manifest", "--expected-rtmr3", "--operator-pkey", "--rtmr", "--init-data", "--sandbox-id",
+		"--min-tcb", "--tdx-tcb-status", "--route-digest", "--route-operator-key", "--routes-floor",
+		"--pin-policy", "--trust-operator", "--trust-operator-key"}
+	all := make([]pinFlag, len(flags))
+	for i, f := range flags {
+		all[i] = pinFlag{f, "x"}
+	}
+	if err := validatePinModes(config.AttestEndpoint, all); err != nil {
+		t.Fatalf("validatePinModes(attest-lb, every pin) = %v, want nil", err)
+	}
+	if err := validatePinModes(config.AttestNone, []pinFlag{{"--min-tcb", ""}}); err != nil {
+		t.Fatalf("validatePinModes(no mode, no pins) = %v, want nil", err)
+	}
+	for _, mode := range []config.AttestMode{config.AttestNone, config.AttestCDSCert} {
+		for _, f := range flags {
+			err := validatePinModes(mode, []pinFlag{{f, "x"}})
+			if err == nil || !strings.Contains(err.Error(), f) {
+				t.Errorf("validatePinModes(%q, %s) = %v, want an error naming %s", mode, f, err, f)
 			}
-			if err == nil || !strings.Contains(err.Error(), tc.wantFlag) {
-				t.Fatalf("validatePinModes = %v, want an error naming %s", err, tc.wantFlag)
-			}
-		})
+		}
 	}
 }
 
@@ -167,6 +145,24 @@ func TestValidateRTMR3Flag(t *testing.T) {
 		if _, err := validateRTMR3Flag(bad); err == nil {
 			t.Errorf("validateRTMR3Flag(%q) accepted", bad)
 		}
+	}
+}
+
+// TestRemoteAddBlankRTMR3 checks that a whitespace-only --expected-rtmr3 is
+// judged as the empty value it is stored as, not as an RTMR[3] seed.
+func TestRemoteAddBlankRTMR3(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	manifest := filepath.Join(t.TempDir(), "manifest.json")
+	body := `{"mrtd":"` + strings.Repeat("1a", 48) + `","rtmr1":"` + strings.Repeat("2b", 48) + `","rtmr2":"` + strings.Repeat("3c", 48) + `"}`
+	if err := os.WriteFile(manifest, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := newRemoteAddCmd("teerm")
+	cmd.SetArgs([]string{"127.0.0.1:8080", "https://lb.example", "--mode", "attest-lb", "--image-manifest", manifest,
+		"--expected-rtmr3", "  ", "--pin-policy", "sha256:" + strings.Repeat("ab", 32)})
+	cmd.SilenceUsage = true
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "require an RTMR[3] seed") {
+		t.Errorf("remote add with a blank --expected-rtmr3 = %v, want the missing seed error", err)
 	}
 }
 
@@ -202,16 +198,16 @@ func TestReadRouteOperatorKeys(t *testing.T) {
 	}
 	two := write("two.pub", pubs[0]+pubs[1])
 	one := write("one.pub", pubs[2])
-	got, err := readRouteOperatorKeys([]string{two, one})
+	got, err := readOperatorKeys("--route-operator-key", []string{two, one})
 	if err != nil {
-		t.Fatalf("readRouteOperatorKeys() = %v", err)
+		t.Fatalf("readOperatorKeys() = %v", err)
 	}
 	if strings.Join(got, "") != strings.Join(pubs, "") {
-		t.Errorf("readRouteOperatorKeys() = %q, want %q", got, pubs)
+		t.Errorf("readOperatorKeys() = %q, want %q", got, pubs)
 	}
 	for _, bad := range []string{write("private.pem", block("PRIVATE KEY", priv)), filepath.Join(dir, "missing.pub")} {
-		if _, err := readRouteOperatorKeys([]string{bad}); err == nil {
-			t.Errorf("readRouteOperatorKeys(%s) = nil, want error", filepath.Base(bad))
+		if _, err := readOperatorKeys("--route-operator-key", []string{bad}); err == nil {
+			t.Errorf("readOperatorKeys(%s) = nil, want error", filepath.Base(bad))
 		}
 	}
 }

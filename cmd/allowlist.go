@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
@@ -199,6 +200,9 @@ func printFetchSummary(out string, res *proxy.AllowlistFetch) {
 	}
 	if v.Warning != "" {
 		fmt.Printf("  WARNING: %s\n", v.Warning)
+	}
+	if v.Partial {
+		fmt.Printf("  PARTIAL: not proven: %s\n", strings.Join(v.NotProven, "; "))
 	}
 	fmt.Println("  This document is CA-vouched, not hardware-attested: the evidence binds the mesh leaf, the mesh CA vouches for the stamp in it, and the stamp names this digest.")
 }

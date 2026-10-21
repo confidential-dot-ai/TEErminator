@@ -156,9 +156,27 @@ type SessionVerdict struct {
 	// extend order. Empty when the register equals the seed or no seed is
 	// pinned.
 	MeasuredPolicies []string
+	// PolicyCheck is how MeasuredPolicies and the mesh leaf's issuing policy
+	// were judged: PolicyPinned, PolicyOperatorSigned, PolicyUnchecked, or
+	// empty when nothing replayed and no check is configured.
+	PolicyCheck string
+	// Partial reports a passing verdict that leaves the claims in NotProven
+	// unproven. The proxy still forwards; callers report it as partial, never
+	// as verified.
+	Partial   bool
+	NotProven []string
+	// SandboxID is the CRI pod sandbox ID CDS stamped on the mesh leaf, ""
+	// when it carries none. CA-vouched, like Stamp.
+	SandboxID string
 	// Warning is a policy gap in an otherwise passing verdict — the MRTD-only
 	// note for specific-cluster TDX remotes without an image pin.
 	Warning string
+}
+
+// demote marks the verdict partial and names the claim it does not prove.
+func (v *SessionVerdict) demote(notProven string) {
+	v.Partial = true
+	v.NotProven = append(v.NotProven, notProven)
 }
 
 // addWarning appends w to the verdict's warning, keeping any earlier one.
@@ -209,6 +227,9 @@ type EndpointAttester struct {
 	// routeFloor is the last published manifest this attester accepted.
 	// It lives as long as the attester, so a restart forgets it.
 	routeFloor routes.Floor
+	// signed caches the policy documents verified under the remote's
+	// trust_operator_keys.
+	signed signedPolicies
 }
 
 // NewEndpointAttester builds an endpoint attester.
@@ -228,13 +249,21 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 	// policy.
 	c := *client
 	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &EndpointAttester{
+	e := &EndpointAttester{
 		client:      &c,
 		attestURL:   u,
 		remote:      remote,
 		pinnedCAs:   pinnedCAs,
 		webPKIRoots: webPKIRoots,
-	}, nil
+	}
+	if remote.RouteFloor != "" {
+		revision, digest, err := ParseRouteFloor(remote.RouteFloor)
+		if err != nil {
+			return nil, fmt.Errorf("attest-lb: route_floor: %w", err)
+		}
+		e.routeFloor.Set(revision, digest)
+	}
+	return e, nil
 }
 
 // attestDeadline bounds a whole Attest call, both attempts and every fetch,
@@ -247,7 +276,7 @@ const attestDeadline = 60 * time.Second
 // leaf capture, bundle shape (version, nonce echo), served chain parsing and
 // committed-CA selection, identity-proof field equality, hardware evidence over
 // the recomputed transcript, proof of possession, mesh-leaf chain, serving-leaf
-// trust, measurement policy, workload policy, route check. With operator keys
+// trust, measurement policy, workload policy, policy history, route check. With operator keys
 // the route publication is fetched alongside the handshake and checked last;
 // a revision below the floor, or a digest no re-fetch reconciles, gets one
 // more attestation on new connections.
@@ -279,6 +308,10 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 		return nil, fmt.Errorf("attest-lb: %w", err)
 	}
 	routeKeys, err := routeCheck(e.remote)
+	if err != nil {
+		return nil, fmt.Errorf("attest-lb: configuration error: %w", err)
+	}
+	history, err := loadHistoryPolicy(e.remote)
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb: configuration error: %w", err)
 	}
@@ -460,6 +493,15 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 		return nil, fmt.Errorf("attest-lb: workload policy: %w", err)
 	}
 	v.Stamp = stamp
+	if v.SandboxID, err = sandboxIDFromCert(meshLeaf); err != nil {
+		return nil, fmt.Errorf("attest-lb: sandbox ID: %w", err)
+	}
+	if want := e.remote.SandboxID; want != "" && v.SandboxID != want {
+		if v.SandboxID == "" {
+			return nil, fmt.Errorf("attest-lb: sandbox ID pin %q set but the mesh leaf carries no sandbox ID", want)
+		}
+		return nil, fmt.Errorf("attest-lb: mesh leaf sandbox ID %q does not match the pinned %q", v.SandboxID, want)
+	}
 	if e.remote.WorkloadName != "" || e.remote.AllowlistPath != "" {
 		if err := e.checkWorkloadPolicy(stamp); err != nil {
 			return nil, fmt.Errorf("attest-lb: %w", err)
@@ -488,11 +530,15 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 	// "the full tuple was enforced": enforce above already failed the verdict
 	// closed unless the launch digest byte-equalled this manifest's MRTD, so a
 	// run that reaches here with a manifest matched all three registers.
-	if isTDXPlatform(platform) && pins.image == nil {
+	if isTDXPlatform(platform) && !pins.imagePinned() {
 		if v.TrustMode == TrustDeploymentClass {
 			return nil, fmt.Errorf("attest-lb: configuration error: deployment-class trust over TDX evidence needs an image pin — the measurement allowlist covers only MRTD, which measures the TDVF firmware, so the guest kernel and rootfs are unmeasured; pin the full MRTD+RTMR[1]+RTMR[2] tuple with `remote add --image-manifest`")
 		}
 		v.addWarning("TDX policy covers MRTD only — the guest kernel (RTMR[1]) and rootfs (RTMR[2]) are UNMEASURED by this policy; pin the full image tuple with `remote add --image-manifest`")
+	}
+	// The evidence binds this check's nonce, so the history is current.
+	if err := e.judgePolicyHistory(ctx, v, history); err != nil {
+		return nil, fmt.Errorf("attest-lb: %w", err)
 	}
 	// Last, so a mismatch reports a digest from an otherwise trusted router.
 	switch {
@@ -537,100 +583,14 @@ func isSNPPlatform(p teetypes.PlatformType) bool {
 	return false
 }
 
-// platformPins are the resolved platform-complete measurement pins of one
-// remote: the TDX image tuple (all three of MRTD, RTMR[1] and RTMR[2] compare
-// exactly against the verified claims), the optional TDX runtime-register pin
-// (RTMR[3], which only ever rides on top of an image tuple — see
-// ValidatePinCombination), the SNP TCB floor, and the accepted TDX TCB
-// statuses. Any pin set against evidence from a platform it cannot apply to is
-// a hard error.
-type platformPins struct {
-	image  *ImagePins
-	rtmr3  *[RegisterSize]byte
-	minTCB *teetypes.SnpTcb
-	// tdxTCBStatuses, when set, has the verifier fetch Intel collateral and
-	// accept only these TCB statuses.
-	tdxTCBStatuses []teetypes.TdxTcbStatus
-}
-
-// ValidatePinCombination enforces the two rules that relate a remote's TDX
-// pins to each other. They hold independently of any evidence, so both the
-// `remote add` flags and the stored config go through this one implementation
-// — a hand-edited config file must not reach a state the CLI refuses to write.
-//
-//   - An image manifest pins the launch digest exactly against its own MRTD, so
-//     a second, looser source of accepted launch digests is not a widening of
-//     the policy but a hole in it: an allowlist entry that is not the
-//     manifest's MRTD would admit a guest the manifest does not describe while
-//     its RTMR[1]/[2] stayed pinned to the manifest.
-//   - RTMR[3] records events extended into a guest whose image the untrusted
-//     host selects. Without an image pin that host can boot anything and
-//     reproduce the chain, so a lone RTMR[3] pin reads like a proof of identity
-//     — reported as an enforced register — while proving none.
-//
-// c8s applies both rules to `c8s verify` (internal/cmds/verify, buildPolicy).
-func ValidatePinCombination(measurements []string, imageManifestPath, expectedRTMR3 string) error {
-	if imageManifestPath != "" && len(measurements) > 0 {
-		return fmt.Errorf("--measurements and --image-manifest are mutually exclusive: the manifest pins MRTD, RTMR[1] and RTMR[2] exactly against this one build, so a separate launch-digest allowlist could only admit an image it does not describe")
-	}
-	if expectedRTMR3 != "" && imageManifestPath == "" {
-		return fmt.Errorf("--expected-rtmr3 requires --image-manifest: RTMR[3] records events extended into a guest whose image the untrusted host selects, so pinning it without pinning the image proves nothing about what is running")
-	}
-	return nil
-}
-
-// loadPlatformPins resolves a remote's platform pins; every failure is a
-// configuration error.
-func loadPlatformPins(r config.Remote) (platformPins, error) {
-	var pins platformPins
-	if err := ValidatePinCombination(r.Measurements, r.ImageManifestPath, r.ExpectedRTMR3); err != nil {
-		return platformPins{}, fmt.Errorf("configuration error: %w", err)
-	}
-	if r.ImageManifestPath != "" {
-		image, err := LoadImageManifest(r.ImageManifestPath)
-		if err != nil {
-			return platformPins{}, err
-		}
-		pins.image = &image
-	}
-	if r.ExpectedRTMR3 != "" {
-		reg, err := ParseRegisterHex(r.ExpectedRTMR3)
-		if err != nil {
-			return platformPins{}, fmt.Errorf("expected_rtmr3 %w", err)
-		}
-		pins.rtmr3 = &reg
-	}
-	// An all-zero floor is no floor: every SNP TCB component is >= 0, so it
-	// gates nothing, while a non-nil floor would reject all TDX evidence as a
-	// cross-platform pin. The CLI already drops it (parseMinTCBFlag); this
-	// repeats the rule for a hand-edited config file.
-	if r.MinTCB != nil && *r.MinTCB != (config.TCBFloor{}) {
-		pins.minTCB = &teetypes.SnpTcb{
-			Bootloader: r.MinTCB.Bootloader,
-			Tee:        r.MinTCB.TEE,
-			Snp:        r.MinTCB.SNP,
-			Microcode:  r.MinTCB.Microcode,
-		}
-	}
-	if r.StaticAllowlist || r.InitData != "" {
-		return platformPins{}, fmt.Errorf("configuration error: static_allowlist and init_data are no longer supported (c8s does not seal the allowlist into its mesh CA); remove the remote and add it again without them")
-	}
-	statuses, err := ParseTDXTCBStatuses(r.TDXTCBStatus)
-	if err != nil {
-		return platformPins{}, fmt.Errorf("configuration error: %w", err)
-	}
-	pins.tdxTCBStatuses = statuses
-	return pins, nil
-}
-
 // enforce applies the platform pins to the verified claims, recording what was
 // enforced in the verdict. It fails closed on any pin whose platform does not
 // match the evidence, on absent or malformed claims, and on any mismatch —
 // never an ignored option. measured is the bundle's measured-policy journal,
 // read only against an RTMR[3] pin.
 func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.VerificationResult, v *SessionVerdict, measured []string) error {
-	if (p.image != nil || p.rtmr3 != nil) && !isTDXPlatform(platform) {
-		return fmt.Errorf("a TDX pin (image manifest / expected RTMR[3]) is set but the evidence platform is %q: runtime measurement registers exist only on TDX, so this policy cannot be enforced against %q evidence", platform, platform)
+	if (p.image != nil || p.rtmr3 != nil || len(p.rtmrs) > 0) && !isTDXPlatform(platform) {
+		return fmt.Errorf("a TDX pin (image manifest / RTMR pin / RTMR[3] seed) is set but the evidence platform is %q: runtime measurement registers exist only on TDX, so this policy cannot be enforced against %q evidence", platform, platform)
 	}
 	if p.minTCB != nil && !isSNPPlatform(platform) {
 		return fmt.Errorf("an SNP TCB floor (min_tcb) is set but the evidence platform is %q: the four-component TCB exists only on SEV-SNP, so this policy cannot be enforced against %q evidence", platform, platform)
@@ -667,6 +627,21 @@ func (p platformPins) enforce(platform teetypes.PlatformType, res *teetypes.Veri
 		if err := check(2, "guest rootfs", p.image.RTMR2[:]); err != nil {
 			return err
 		}
+	}
+	for idx, meaning := range []string{1: "guest kernel", 2: "guest rootfs"} {
+		if want, ok := p.rtmrs[idx]; ok {
+			if err := check(idx, meaning, want[:]); err != nil {
+				return err
+			}
+		}
+	}
+	// attestation-go compared the binding; requiring its report keeps the
+	// verdict fail-closed if the parameter is ever not applied.
+	if p.initData != nil && (res.InitDataMatch == nil || !*res.InitDataMatch) {
+		return fmt.Errorf("cannot enforce the init-data pin: the verifier reported no init-data match")
+	}
+	if p.rtmr3 == nil && len(measured) > 0 {
+		v.addWarning(fmt.Sprintf("the evidence lists %d measured policies, but no RTMR[3] seed is pinned (operator_pubkey_path or expected_rtmr3), so they were not replayed or judged", len(measured)))
 	}
 	if p.rtmr3 != nil {
 		if len(measured) == 0 {
@@ -725,7 +700,6 @@ func replayRTMR3(res *teetypes.VerificationResult, seed [RegisterSize]byte, meas
 		if bytes.Equal(got, reg[:]) {
 			if n > 0 {
 				v.MeasuredPolicies = slices.Clone(measured[:n])
-				v.addWarning(fmt.Sprintf("replayed %d measured policies, none judged", n))
 			}
 			return reg, nil
 		}
@@ -1044,8 +1018,9 @@ func verifyEndpointEvidence(b attestationBundle, expectedReportData []byte, pins
 		return nil, fmt.Errorf("attest-lb: re-encode evidence: %w", err)
 	}
 	res, err := teeverify.VerifyWithOptions(raw, teetypes.VerifyParams{
-		ExpectedReportData: expectedReportData,
-		MinTCB:             pins.minTCB,
+		ExpectedReportData:   expectedReportData,
+		ExpectedInitDataHash: pins.initData,
+		MinTCB:               pins.minTCB,
 	}, verifierOptions(pins))
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb (%s): %w", b.Platform, err)

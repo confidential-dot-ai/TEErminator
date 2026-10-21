@@ -17,14 +17,16 @@ type CheckResult struct {
 	// Detail explains the status: measurement, workload, trust mode, the
 	// stamped allowlist version (a claim, labelled as one), and any enforced
 	// platform pins (TDX runtime registers, SNP TCB floor) or policy warnings
-	// for StatusVerified, the failure reason for StatusFailed.
+	// for StatusVerified, plus what is not proven for StatusPartial, the
+	// failure reason for StatusFailed.
 	Detail string
 }
 
 // CheckRemote actively determines the remote's trust status right now, using
 // the same trust construction the proxy forwards over:
 //   - AttestEndpoint: run the full attest-lb verification; Verified on
-//     success, Failed otherwise.
+//     success, Partial when it passed but left a property unproven (such
+//     as an unjudged policy history), Failed otherwise.
 //   - AttestNone: probe the remote over its validated TLS; Untrusted when
 //     reachable (nothing attests the workload), Failed when not.
 //   - anything else (cds-cert, unknown modes): Failed — the proxy blocks
@@ -66,40 +68,7 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
 		}
-		workload := v.WorkloadName
-		if workload == "" {
-			workload = "unnamed"
-		}
-		detail := fmt.Sprintf("measurement %s, workload %s, trust %s (%s)",
-			v.Measurement, workload, v.TrustMode, v.Profile)
-		// The version counter is what the deployment CLAIMS, read off the
-		// stamp; nothing here checked a document against it. Say so, and name
-		// the command that does check one, so the claim is not read as a fact.
-		if v.AllowlistVersion != "" {
-			detail += fmt.Sprintf(", allowlist version %s (claimed by the stamp — `allowlist fetch %s` checks the document behind it)",
-				v.AllowlistVersion, r.Local)
-		}
-		if len(v.RTMRsPinned) > 0 {
-			detail += ", rtmrs pinned " + strings.Join(v.RTMRsPinned, " ")
-		}
-		if len(v.MeasuredPolicies) > 0 {
-			detail += ", measured policies " + strings.Join(v.MeasuredPolicies, " ")
-		}
-		if v.TCBFloor != "" {
-			detail += ", tcb floor " + v.TCBFloor
-		}
-		if v.TDXTCBStatus != "" {
-			detail += ", tdx tcb status " + v.TDXTCBStatus
-		}
-		detail += fmt.Sprintf(", route digest %s (%s", v.RouteDigest, v.RouteCheck)
-		if v.RouteRevision != 0 {
-			detail += fmt.Sprintf(", revision %d", v.RouteRevision)
-		}
-		detail += ")"
-		if v.Warning != "" {
-			detail += " — WARNING: " + v.Warning
-		}
-		return CheckResult{config.StatusVerified, detail}
+		return verdictResult(v, r.Local)
 	case config.AttestNone:
 		tlsCfg, err := upstreamTLSConfig(target, r, extraCAs)
 		if err != nil {
@@ -123,4 +92,52 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		return CheckResult{config.StatusFailed,
 			fmt.Sprintf("attestation mode %q is not implemented: the proxy blocks all traffic for this remote", r.Mode)}
 	}
+}
+
+// verdictResult reports a passing attest-lb verdict: Partial when it leaves a
+// property unproven, Verified otherwise. local names the remote in the hint.
+func verdictResult(v *verifier.SessionVerdict, local string) CheckResult {
+	workload := v.WorkloadName
+	if workload == "" {
+		workload = "unnamed"
+	}
+	detail := fmt.Sprintf("measurement %s, workload %s, trust %s (%s)",
+		v.Measurement, workload, v.TrustMode, v.Profile)
+	// The version counter is what the deployment CLAIMS, read off the
+	// stamp; nothing here checked a document against it. Say so, and name
+	// the command that does check one, so the claim is not read as a fact.
+	if v.AllowlistVersion != "" {
+		detail += fmt.Sprintf(", allowlist version %s (claimed by the stamp — `allowlist fetch %s` checks the document behind it)",
+			v.AllowlistVersion, local)
+	}
+	if len(v.RTMRsPinned) > 0 {
+		detail += ", rtmrs pinned " + strings.Join(v.RTMRsPinned, " ")
+	}
+	if len(v.MeasuredPolicies) > 0 {
+		detail += ", measured policies " + strings.Join(v.MeasuredPolicies, " ")
+	}
+	if v.PolicyCheck != "" {
+		detail += ", policy history " + v.PolicyCheck
+	}
+	if v.SandboxID != "" {
+		detail += ", sandbox " + v.SandboxID
+	}
+	if v.TCBFloor != "" {
+		detail += ", tcb floor " + v.TCBFloor
+	}
+	if v.TDXTCBStatus != "" {
+		detail += ", tdx tcb status " + v.TDXTCBStatus
+	}
+	detail += fmt.Sprintf(", route digest %s (%s", v.RouteDigest, v.RouteCheck)
+	if v.RouteRevision != 0 {
+		detail += fmt.Sprintf(", revision %d", v.RouteRevision)
+	}
+	detail += ")"
+	if v.Warning != "" {
+		detail += " — WARNING: " + v.Warning
+	}
+	if v.Partial {
+		return CheckResult{config.StatusPartial, detail + " — NOT PROVEN: " + strings.Join(v.NotProven, "; ")}
+	}
+	return CheckResult{config.StatusVerified, detail}
 }
