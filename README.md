@@ -248,7 +248,11 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     proxy refuses traffic for that remote until the re-attestation interval (one
     minute) has passed. Route changes on several replicas can cause such a window.
     `--route-digest` and `--route-operator-key` are mutually exclusive. With
-    neither, `status` reports the digest as `unverified`.
+    neither, `--operator-pkey` is also the route operator key when the remote URL has a
+    DNS name: on a c8s server node the RTMR[3] launch key must equal the key the router
+    verifies its manifest under, so one file pins both. Pass `--route-operator-key`
+    when the router runs on a node launched with another key. With none of the three,
+    `status` reports the digest as `unverified`.
     The field changes the attest-lb layout under the same `c8s/attest-lb/v1` binding
     identifier, so this version and a router that predates route-bound evidence do not
     interoperate in either direction.

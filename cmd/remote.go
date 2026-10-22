@@ -298,6 +298,15 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			if err := verifier.ValidateRouteDigests(routeDigests); err != nil {
 				return fmt.Errorf("--route-digest: %w", err)
 			}
+			// On a c8s server node the RTMR[3] launch key must equal the key
+			// the router verifies its route manifest under (c8s launchconfig),
+			// so --operator-pkey also checks the route signature by default.
+			if operatorPkey != "" && len(routeDigests) == 0 && len(routeKeyFiles) == 0 {
+				if u, err := url.Parse(remoteURL); err == nil && net.ParseIP(u.Hostname()) == nil {
+					routeKeyFiles = []string{operatorPkey}
+					fmt.Println("Note: --operator-pkey also verifies the published route manifest (no --route-digest or --route-operator-key given).")
+				}
+			}
 			routeOperatorKeys, err := readOperatorKeys("--route-operator-key", routeKeyFiles)
 			if err != nil {
 				return err
