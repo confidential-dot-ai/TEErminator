@@ -33,6 +33,25 @@ $ ./teerminator remote add localhost:12345 https://example.com/v2/
 $ cat SECRETTOKEN | ./teerminator remote auth localhost:12345 -
 ```
 
+A remote can take its pins from a signed GitHub release instead of local files:
+
+```
+$ ./teerminator remote add 127.0.0.1:8080 https://api.confidential.ai/ --mode attest-lb \
+    --release https://github.com/confidential-dot-ai/confidential-inference/releases/tag/v0.15.15 \
+    --tdx-tcb-status UpToDate
+```
+
+`--release` downloads `release-bundle.json` and verifies it against
+`release-bundle.sigstore.json` with the Sigstore public-good instance: the certificate
+must come from a GitHub Actions workflow of that repository, run at that tag, and the
+signature must be in the transparency log. It then downloads the assets the bundle names
+(`allowlist`, and `operatorKey` when present), checks each SHA-256 against the bundle,
+and stores the files under the config directory, in `releases/<owner>/<repo>/<tag>/`.
+The bundle is the `--image-manifest`, the allowlist is the `--allowlist` (with the
+front-door `--workload` derived from it), and the operator key is the `--operator-pkey`.
+A release without an `operatorKey` leaves RTMR[3] and the routes unpinned unless you add
+`--expected-rtmr3` or `--route-operator-key`.
+
 Remotes are deleted with `remote rm`, by local address or by the index printed by `remote ls`:
 
 ```
