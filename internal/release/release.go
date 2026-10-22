@@ -194,7 +194,7 @@ func (f *Fetcher) get(ctx context.Context, src Source, name string) ([]byte, err
 	if err != nil {
 		return nil, fmt.Errorf("fetching %s: %w", name, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetching %s: %s", u, resp.Status)
 	}
