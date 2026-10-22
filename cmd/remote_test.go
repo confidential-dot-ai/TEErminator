@@ -211,3 +211,57 @@ func TestReadRouteOperatorKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestRemoteAddOperatorPkeyVerifiesRoutes checks that --operator-pkey becomes
+// the route operator key for a DNS remote with no other route check.
+func TestRemoteAddOperatorPkeyVerifiesRoutes(t *testing.T) {
+	dir := t.TempDir()
+	manifest := filepath.Join(dir, "manifest.json")
+	body := `{"mrtd":"` + strings.Repeat("1a", 48) + `","rtmr1":"` + strings.Repeat("2b", 48) + `","rtmr2":"` + strings.Repeat("3c", 48) + `"}`
+	if err := os.WriteFile(manifest, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&k.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+	keyFile := filepath.Join(dir, "operator.pub")
+	if err := os.WriteFile(keyFile, []byte(pub), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		remote string
+		extra  []string
+		want   []string
+	}{
+		{"DNS remote", "https://api.example.com/", nil, []string{pub}},
+		{"IP remote", "https://192.0.2.1/", nil, nil},
+		{"explicit route digest", "https://api.example.com/", []string{"--route-digest", strings.Repeat("ab", 32)}, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			cmd := newRemoteAddCmd("teerm")
+			cmd.SetArgs(append([]string{"127.0.0.1:8080", tc.remote, "--mode", "attest-lb",
+				"--image-manifest", manifest, "--operator-pkey", keyFile}, tc.extra...))
+			cmd.SilenceUsage = true
+			if err := cmd.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Remotes[0].RouteOperatorKeys; strings.Join(got, "") != strings.Join(tc.want, "") {
+				t.Errorf("route_operator_keys = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
