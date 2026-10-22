@@ -1,0 +1,84 @@
+{
+  "allowlist": {
+    "path": "release/allowlist.json",
+    "sha256": "sha256:8de45cdb8f1242d714bb0de35b2f4aceb7eba93b3537219cb20fa029d10eb58d"
+  },
+  "c8s": {
+    "release": "v0.59.1",
+    "sourceCommit": "4c916ecea7221e506988ff9e37725a314a64b562"
+  },
+  "chart": {
+    "archiveSha256": "sha256:c74fc159bc7d0403bfcc8597724e117edcf4a41381d325074f4b615be2251bdb",
+    "name": "confidential-inference",
+    "reference": "ghcr.io/confidential-dot-ai/confidential-inference/charts/confidential-inference:0.15.15",
+    "sha256": "sha256:967a136d53ec975a9626471e8928aab93bfbf21806f6b6dd862e48ff2300ac98",
+    "version": "0.1.0"
+  },
+  "imagePublication": {
+    "artifact": "image-publication-manifest.json",
+    "baseRef": "v0.15.14-staging",
+    "baseRefCommit": "b39668ebe86df1421d3a4944be714ba77b9f7161",
+    "images": {
+      "ghcr.io/confidential-dot-ai/confidential-inference/gateway": "sha256:3be8f7a02c0b41470456999e51905e705c534ee32e8983549e666bb31e87418c",
+      "ghcr.io/confidential-dot-ai/confidential-inference/maintenance-gateway": "sha256:b6352517ce3cc29b3bbdf76754bb123370bcd5ccbf6dfbef9244d861c9ab1abb"
+    },
+    "manifestSha256": "sha256:93b385390200a154812aee6d1707fe1303efb24f90a93cb665da1a43f8047677",
+    "sourceCommit": "f555f44f01be5940cad99c81c7c18ecb4edb4c59"
+  },
+  "images": {
+    "c8sOperator": "ghcr.io/confidential-dot-ai/c8s-operator@sha256:593dea857bfdb2512af5dcfbbec34b10c08de66bbd67f7d33d23a1f8581429b5",
+    "gateway": "ghcr.io/confidential-dot-ai/confidential-inference/gateway@sha256:3be8f7a02c0b41470456999e51905e705c534ee32e8983549e666bb31e87418c",
+    "kubeStateMetrics": "registry.k8s.io/kube-state-metrics/kube-state-metrics@sha256:44cfc22900bf545fb9a073adea2132b80558b7e9b6a6f687a8f23b4d7fc438c9",
+    "logCollector": "ghcr.io/confidential-dot-ai/confidential-inference/log-collector@sha256:a64a7f515267e6552ffc9e6a9f4679a0e977a8ccd9c7649074af73752af22718",
+    "metricsCollector": "docker.io/prom/prometheus@sha256:8672a850efe2f9874702406c8318704edb363587f8c2ca88586b4c8fdb5cea24",
+    "rolloutClient": "ghcr.io/confidential-dot-ai/confidential-inference/rollout-client@sha256:6017ed206c67fca08d720dfafbe7f10ad4916441cdb49402e69d05b9b98b22a1",
+    "sglang": "ghcr.io/confidential-dot-ai/confidential-inference/sglang@sha256:1244f1cf550c656889d5c80f9c9388ba4bd54bac00e3af394cdddd03e01edc68",
+    "sglangRouter": "ghcr.io/confidential-dot-ai/confidential-inference/sglang-router@sha256:328c42e8b54b29dc0574c5d21fbf85704fb77e75c12cd394080b0d5ae0e4c4de",
+    "sglangWorker": "ghcr.io/confidential-dot-ai/confidential-inference/sglang@sha256:1244f1cf550c656889d5c80f9c9388ba4bd54bac00e3af394cdddd03e01edc68"
+  },
+  "model": {
+    "byteManifestSha256": "cd9eecd89a3d31dedd7b707158e86ebeab241c68d55e9661d3efa508015a697c",
+    "repository": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "revision": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb"
+  },
+  "mrtd": "9309eaae9c151e766de0f97b1d1aaeb76b8c8c366080803943fb566521c8f0cf00a142d8b7b0683ed1d42c5a27198ba1",
+  "nodeImage": {
+    "manifestSha256": "sha256:83605d4415a75985c6eb2a347360419166ecb80f3ee54c84c5276323d6ed57c9",
+    "reference": "ghcr.io/confidential-dot-ai/node-guest-base@sha256:2073fef8adf5c6bf217d5003b3ff56d233abc1df16d5682b6b8fa2fbc1f28da1"
+  },
+  "profileValues": [
+    {
+      "asset": "profile-values-release-values.yaml",
+      "path": "release/values.yaml",
+      "sha256": "sha256:f0f072e4ff24ebdcb4a10892dcfc5b8cb3fab5eda359cf6ba4cc68d42299b7cc"
+    }
+  ],
+  "publicHostnames": [
+    "api.confidential.ai",
+    "candidate.api.confidential.ai"
+  ],
+  "release": {
+    "environment": "production",
+    "name": "v0.15.15"
+  },
+  "releaseTrust": {
+    "policyPath": "releases/trust/release-signing-policy.json",
+    "policySha256": "sha256:8fac498dce2d17c44f191498a352556950c71b9f252e28bb6dbe421462f08a98",
+    "signatureType": "sigstore-keyless"
+  },
+  "releaseValues": {
+    "path": "release/release-values.yaml",
+    "sha256": "sha256:555a3e0f396e7451f5c459de66a37cde0ef1876c2095a3f065b14210782f6e80"
+  },
+  "rtmr1": "0e2febd1f16c7818973ee6b5d84c7e3a54c5b2cd298d39073881be95fb7237ec1f8a88d262b0da0874133c5d74aef65a",
+  "rtmr2": "f452ccd152bc49b92fa595c1ca3dd592fe3f8c02e7a25f820315105bb4b36e12fac2ac718ac0d1788f6df0102c5020fa",
+  "schema": "confidential.ai/release-manifest/v1",
+  "source": {
+    "commit": "f555f44f01be5940cad99c81c7c18ecb4edb4c59",
+    "repository": "https://github.com/confidential-dot-ai/confidential-inference"
+  },
+  "sourceLock": {
+    "path": "contracts/c8s-admission-source-lock.json",
+    "sha256": "sha256:3b929640333730f5dd698f674ca08b6db6ab8f03b986fd6f3f2c6d2c7d28293a"
+  }
+}
