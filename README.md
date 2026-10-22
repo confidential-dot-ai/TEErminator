@@ -107,7 +107,10 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   - **Workload pin.** `--workload <name>` requires the committed mesh leaf to carry a
     matched-workload stamp (OID `1.3.6.1.4.1.66378.1.5`) naming `<name>`;
     `--allowlist <file>` additionally requires the stamp's digest to equal the SHA-256 of
-    the exact file bytes and the stamped name to resolve in the document. The stamp is
+    the exact file bytes and the stamped name to resolve in the document. Without
+    `--workload`, `remote add` pins the policy's front-door entry, the one entry named
+    `c8s-router-<12 hex>` as the c8s chart seeds it, and fails when there is none or more
+    than one. The stamp is
     CA-vouched (`ca-vouched` profile in the verdict) — the mesh CA signature, not the
     hardware evidence, vouches for it. `allowlist fetch` obtains that file from the
     cluster itself (see below); the stamp's allowlist **version** counter, which `status`
