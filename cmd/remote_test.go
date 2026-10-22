@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 )
 
 func TestDefaultServerName(t *testing.T) {
@@ -209,5 +210,34 @@ func TestReadRouteOperatorKeys(t *testing.T) {
 		if _, err := readOperatorKeys("--route-operator-key", []string{bad}); err == nil {
 			t.Errorf("readOperatorKeys(%s) = nil, want error", filepath.Base(bad))
 		}
+	}
+}
+
+func TestFrontDoorWorkload(t *testing.T) {
+	tests := []struct {
+		name, workloads, want, wantErr string
+	}{
+		{"one front door", `"api":{},"c8s-router-fb21f5cac23c":{}`, "c8s-router-fb21f5cac23c", ""},
+		{"none", `"api":{},"c8s-router-nginx":{}`, "", "no c8s-router-* front-door entry"},
+		{"ambiguous", `"c8s-router-000000000001":{},"c8s-router-000000000002":{}`, "", "c8s-router-000000000001, c8s-router-000000000002"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "allowlist.json")
+			doc := `{"schema":"` + verifier.AllowlistSchema + `","workloads":{` + tc.workloads + `}}`
+			if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := frontDoorWorkload(path)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("frontDoorWorkload = (%q, %v), want an error containing %q", got, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("frontDoorWorkload = (%q, %v), want %q", got, err, tc.want)
+			}
+		})
 	}
 }
