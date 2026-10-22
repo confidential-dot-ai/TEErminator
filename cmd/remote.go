@@ -2,19 +2,25 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/release"
 	"github.com/confidential-dot-ai/TEErminator/internal/routes"
 	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
@@ -53,6 +59,38 @@ func newRemoteCmd(name string) *cobra.Command {
 	remoteCmd.AddCommand(newRemoteRmCmd())
 	remoteCmd.AddCommand(newRemoteLsCmd())
 	return remoteCmd
+}
+
+// frontDoorEntry matches the name c8s gives the router entry it seeds: c8s-router-
+// and the first 12 hex digits of the entry's SHA-256.
+var frontDoorEntry = regexp.MustCompile(`^c8s-router-[0-9a-f]{12}$`)
+
+// frontDoorWorkload returns the policy's one front-door entry name, the
+// --workload pin when only --allowlist is given.
+func frontDoorWorkload(allowlistPath string) (string, error) {
+	raw, err := os.ReadFile(allowlistPath)
+	if err != nil {
+		return "", fmt.Errorf("reading --allowlist: %w", err)
+	}
+	doc, err := verifier.ParsePinnedAllowlist(raw)
+	if err != nil {
+		return "", fmt.Errorf("--allowlist %s: %w", allowlistPath, err)
+	}
+	var names []string
+	for name := range doc.Workloads {
+		if frontDoorEntry.MatchString(name) {
+			names = append(names, name)
+		}
+	}
+	switch len(names) {
+	case 1:
+		return names[0], nil
+	case 0:
+		return "", fmt.Errorf("--allowlist %s has no c8s-router-* front-door entry; pass --workload", allowlistPath)
+	default:
+		slices.Sort(names)
+		return "", fmt.Errorf("--allowlist %s has several front-door entries (%s); pass --workload", allowlistPath, strings.Join(names, ", "))
+	}
 }
 
 // validateWorkloadFlags checks the --workload/--allowlist pins at add time:
@@ -214,6 +252,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 		pinPolicies   []string
 		trustOperator bool
 		trustKeyFiles []string
+		releaseURL    string
 	)
 
 	cmd := &cobra.Command{
@@ -230,6 +269,16 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			}
 			if normalized {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
+			}
+			if releaseURL != "" {
+				if imageManifest != "" || allowlistPath != "" || operatorPkey != "" || len(measurements) > 0 {
+					return fmt.Errorf("--release supplies --image-manifest, --allowlist and --operator-pkey; do not pass them or --measurements with it")
+				}
+				pins, err := fetchRelease(cmd.Context(), releaseURL)
+				if err != nil {
+					return err
+				}
+				imageManifest, allowlistPath, operatorPkey = pins.ImageManifest, pins.Allowlist, pins.OperatorKey
 			}
 
 			rtmr3Stored, err := validateRTMR3Flag(expectedRTMR3)
@@ -263,6 +312,15 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			}
 			if err := verifier.ValidateRouteDigests(routeDigests); err != nil {
 				return fmt.Errorf("--route-digest: %w", err)
+			}
+			// On a c8s server node the RTMR[3] launch key must equal the key
+			// the router verifies its route manifest under (c8s launchconfig),
+			// so --operator-pkey also checks the route signature by default.
+			if operatorPkey != "" && len(routeDigests) == 0 && len(routeKeyFiles) == 0 {
+				if u, err := url.Parse(remoteURL); err == nil && net.ParseIP(u.Hostname()) == nil {
+					routeKeyFiles = []string{operatorPkey}
+					fmt.Println("Note: --operator-pkey also verifies the published route manifest (no --route-digest or --route-operator-key given).")
+				}
 			}
 			routeOperatorKeys, err := readOperatorKeys("--route-operator-key", routeKeyFiles)
 			if err != nil {
@@ -299,6 +357,12 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				return err
 			}
 
+			if workload == "" && allowlistPath != "" {
+				if workload, err = frontDoorWorkload(allowlistPath); err != nil {
+					return err
+				}
+				fmt.Printf("Note: pinning workload %q, the front-door entry of --allowlist.\n", workload)
+			}
 			allowlistStored, err := validateWorkloadFlags(workload, allowlistPath)
 			if err != nil {
 				return err
@@ -370,7 +434,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated; required for attest-lb unless --image-manifest is given (an empty measurement policy is a configuration error, and the two flags are mutually exclusive)")
 	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest-lb always uses the remote's origin)")
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
-	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb)")
+	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb). Defaults, with --allowlist, to the policy's one c8s-router-* front-door entry")
 	f.StringVar(&allowlistPath, "allowlist", "", "path to a pinned canonical-allowlist JSON file; hashed exactly as read against the stamp's digest, and the stamped name must resolve in it (attest-lb)")
 	f.StringVar(&imageManifest, "image-manifest", "", "build-artifact manifest of the expected TDX guest image (mrtd, rtmr1, rtmr2, each 96 lowercase hex chars, nested under tdx as the confos build writes them or at the top level; published with the image build); all three registers are pinned exactly against this one manifest, so the guest kernel and rootfs are verified rather than only the firmware. Replaces --measurements rather than adding to it. TDX evidence only — with SNP evidence this is a policy error")
 	f.StringVar(&expectedRTMR3, "expected-rtmr3", "", "expected TDX RTMR[3] as 96 lowercase hex chars: the bare operator-key seed, the register before the node measures any policy. A node that measures its allowlist policies is accepted when the policy list in its bundle replays from this seed to the quoted register. This is a deployment property, NOT a cluster identity, and cannot replace an image pin, so it requires --image-manifest. TDX evidence only — with SNP evidence this is a policy error")
@@ -385,8 +449,32 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringVar(&sandboxID, "sandbox-id", "", "CRI pod sandbox ID the committed mesh leaf must carry (OID 1.3.6.1.4.1.66378.1.4); CA-vouched, like --workload")
 	f.StringSliceVar(&pinPolicies, "pin-policy", nil, "accepted allowlist policies (repeatable / comma-separated), each a sha256:<hex> digest or the path of an allowlist document hashed exactly as read (the bytes GET /allowlist serves): every policy in the node's replayed history, and the one the mesh leaf was issued under, must be one of these. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=); excludes --trust-operator")
 	f.BoolVar(&trustOperator, "trust-operator", false, "accept every policy in the node's replayed history, and the one the mesh leaf was issued under, only when CDS stores its document with a write token signed under --trust-operator-key: each one is fetched from /allowlist/objects/sha256/<hex>, re-hashed, and its token verified. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=) and --trust-operator-key; excludes --pin-policy")
+	f.StringVar(&releaseURL, "release", "", "GitHub release (https://github.com/<owner>/<repo>/releases/tag/<tag>) to take the pins from: verifies its release-bundle.json against release-bundle.sigstore.json (Sigstore public good; signed by a GitHub Actions workflow of that repository at that tag), downloads the allowlist and operator key it names, checks their SHA-256, and uses them as --image-manifest, --allowlist (with the derived --workload) and --operator-pkey. Excludes those flags and --measurements")
 	f.StringArrayVar(&trustKeyFiles, "trust-operator-key", nil, "PEM file of ECDSA operator public keys --trust-operator accepts signatures from (repeatable). Requires --trust-operator; --route-operator-key does not feed it")
 	return cmd
+}
+
+// fetchRelease verifies a GitHub release's signed pins and stores them under
+// the config directory, one directory per release.
+func fetchRelease(ctx context.Context, rawURL string) (*release.Pins, error) {
+	src, err := release.ParseURL(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("--release: %w", err)
+	}
+	cfgPath, err := config.Path()
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(filepath.Dir(cfgPath), "releases", src.Owner, src.Repo, src.Tag)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	f := &release.Fetcher{Client: http.DefaultClient}
+	pins, err := f.Fetch(ctx, src, dir)
+	if err != nil {
+		return nil, fmt.Errorf("--release: %w", err)
+	}
+	fmt.Printf("Verified release %s; pins stored in %s.\n", src, dir)
+	return pins, nil
 }
 
 // validateOperatorPkeyFlag checks --operator-pkey holds one P-256 PEM public

@@ -33,6 +33,25 @@ $ ./teerminator remote add localhost:12345 https://example.com/v2/
 $ cat SECRETTOKEN | ./teerminator remote auth localhost:12345 -
 ```
 
+A remote can take its pins from a signed GitHub release instead of local files:
+
+```
+$ ./teerminator remote add 127.0.0.1:8080 https://api.confidential.ai/ --mode attest-lb \
+    --release https://github.com/confidential-dot-ai/confidential-inference/releases/tag/v0.15.15 \
+    --tdx-tcb-status UpToDate
+```
+
+`--release` downloads `release-bundle.json` and verifies it against
+`release-bundle.sigstore.json` with the Sigstore public-good instance: the certificate
+must come from a GitHub Actions workflow of that repository, run at that tag, and the
+signature must be in the transparency log. It then downloads the assets the bundle names
+(`allowlist`, and `operatorKey` when present), checks each SHA-256 against the bundle,
+and stores the files under the config directory, in `releases/<owner>/<repo>/<tag>/`.
+The bundle is the `--image-manifest`, the allowlist is the `--allowlist` (with the
+front-door `--workload` derived from it), and the operator key is the `--operator-pkey`.
+A release without an `operatorKey` leaves RTMR[3] and the routes unpinned unless you add
+`--expected-rtmr3` or `--route-operator-key`.
+
 Remotes are deleted with `remote rm`, by local address or by the index printed by `remote ls`:
 
 ```
@@ -106,7 +125,10 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   - **Workload pin.** `--workload <name>` requires the committed mesh leaf to carry a
     matched-workload stamp (OID `1.3.6.1.4.1.66378.1.5`) naming `<name>`;
     `--allowlist <file>` additionally requires the stamp's digest to equal the SHA-256 of
-    the exact file bytes and the stamped name to resolve in the document. The stamp is
+    the exact file bytes and the stamped name to resolve in the document. Without
+    `--workload`, `remote add` pins the policy's front-door entry, the one entry named
+    `c8s-router-<12 hex>` as the c8s chart seeds it, and fails when there is none or more
+    than one. The stamp is
     CA-vouched (`ca-vouched` profile in the verdict) — the mesh CA signature, not the
     hardware evidence, vouches for it. `allowlist fetch` obtains that file from the
     cluster itself (see below); the stamp's allowlist **version** counter, which `status`
@@ -244,7 +266,11 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     proxy refuses traffic for that remote until the re-attestation interval (one
     minute) has passed. Route changes on several replicas can cause such a window.
     `--route-digest` and `--route-operator-key` are mutually exclusive. With
-    neither, `status` reports the digest as `unverified`.
+    neither, `--operator-pkey` is also the route operator key when the remote URL has a
+    DNS name: on a c8s server node the RTMR[3] launch key must equal the key the router
+    verifies its manifest under, so one file pins both. Pass `--route-operator-key`
+    when the router runs on a node launched with another key. With none of the three,
+    `status` reports the digest as `unverified`.
     The field changes the attest-lb layout under the same `c8s/attest-lb/v1` binding
     identifier, so this version and a router that predates route-bound evidence do not
     interoperate in either direction.
