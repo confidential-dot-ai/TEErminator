@@ -166,6 +166,35 @@ func TestRemoteAddBlankRTMR3(t *testing.T) {
 	}
 }
 
+// TestRemoteAddMeasurementsLength checks that a --measurements entry that is
+// not a SHA-384 digest is refused at add time rather than at first attest.
+func TestRemoteAddMeasurementsLength(t *testing.T) {
+	for _, tc := range []struct {
+		name, entry, wantErr string
+	}{
+		{"sha-384", strings.Repeat("ab", 48), ""},
+		{"short", "deadbeef", "--measurements entry"},
+		{"long", strings.Repeat("ab", 64), "--measurements entry"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			cmd := newRemoteAddCmd("teerm")
+			cmd.SetArgs([]string{"127.0.0.1:8080", "https://lb.example", "--mode", "attest-lb", "--measurements", tc.entry})
+			cmd.SilenceUsage = true
+			err := cmd.Execute()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("remote add --measurements %s = %v, want it accepted", tc.entry, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("remote add --measurements %s = %v, want an error containing %q", tc.entry, err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestReadRouteOperatorKeys checks that --route-operator-key stores one PEM
 // block per key, read from every file, and refuses anything but public keys.
 func TestReadRouteOperatorKeys(t *testing.T) {

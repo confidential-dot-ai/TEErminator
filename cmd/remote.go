@@ -261,6 +261,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			if len(routeDigests) > 0 && len(routeKeyFiles) > 0 {
 				return fmt.Errorf("--route-digest and --route-operator-key are mutually exclusive: each is a complete route check; pass one")
 			}
+			if err := verifier.ValidateMeasurements(measurements); err != nil {
+				return err
+			}
 			if err := verifier.ValidateRouteDigests(routeDigests); err != nil {
 				return fmt.Errorf("--route-digest: %w", err)
 			}
@@ -367,7 +370,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 
 	f := cmd.Flags()
 	f.StringVar(&mode, "mode", "", "attestation mode: attest-lb (per-handshake attestation binding the exact serving leaf, over ordinary TLS), cds-cert (CDS-cert pinning, not yet implemented), or empty to disable")
-	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (hex), comma-separated; required for attest-lb unless --image-manifest is given (an empty measurement policy is a configuration error, and the two flags are mutually exclusive)")
+	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (SHA-384, 96 hex chars each), comma-separated; required for attest-lb unless --image-manifest is given (an empty measurement policy is a configuration error, and the two flags are mutually exclusive)")
 	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest-lb always uses the remote's origin)")
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
 	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb)")
