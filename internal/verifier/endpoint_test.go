@@ -380,9 +380,16 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 	return ts
 }
 
+// launchDigestHex expands seed to a deterministic SHA-384 hex launch digest.
+func launchDigestHex(seed string) string {
+	d := sha512.Sum384([]byte(seed))
+	return hex.EncodeToString(d[:])
+}
+
 // stubClaims parameterizes the evidence stub's verified result; the zero value
-// yields launch digest "a1" with no platform-specific claims. The result's
-// Platform always echoes the bundle's tag, as the real verifier does.
+// yields launch digest launchDigestHex("a1") with no platform-specific claims.
+// The result's Platform always echoes the bundle's tag, as the real verifier
+// does.
 type stubClaims struct {
 	launchDigest string
 	platformData map[string]any
@@ -410,7 +417,7 @@ func stubEvidence(t *testing.T) {
 func stubEvidenceClaims(t *testing.T, sc stubClaims) *stubCalls {
 	t.Helper()
 	if sc.launchDigest == "" {
-		sc.launchDigest = "a1"
+		sc.launchDigest = launchDigestHex("a1")
 	}
 	calls := &stubCalls{}
 	orig := verifyEvidence
@@ -471,9 +478,9 @@ func newLBAttester(t *testing.T, ts *httptest.Server, remote config.Remote, pinn
 }
 
 // measuredRemote is the minimal valid attest-lb policy; the uppercase digest
-// exercises the case-insensitive membership check against the stub's "a1".
+// exercises the case-insensitive membership check against the stub's digest.
 func measuredRemote() config.Remote {
-	return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"A1"}}
+	return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{strings.ToUpper(launchDigestHex("a1"))}}
 }
 
 // TestAttestLBRequestShape pins what goes ON THE WIRE, which the rest of these
@@ -544,7 +551,7 @@ func TestAttestLBHappyPath(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if v.Measurement != "a1" {
+		if v.Measurement != launchDigestHex("a1") {
 			t.Errorf("Measurement = %q", v.Measurement)
 		}
 		if v.TrustMode != TrustDeploymentClass {
@@ -869,7 +876,7 @@ func TestAttestLBRejectsMeasurementNotInAllowlist(t *testing.T) {
 	stubEvidence(t)
 	f := newLBFixture(t, fixtureOpts{})
 	ts := f.newServer(t, bundleSpec{})
-	remote := config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"deadbeef"}}
+	remote := config.Remote{Mode: config.AttestEndpoint, Measurements: []string{launchDigestHex("deadbeef")}}
 	ea := newLBAttester(t, ts, remote, nil)
 	_, err := ea.Attest(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "not in the allowlist") {
@@ -882,20 +889,24 @@ func TestAttestLBRejectsMeasurementNotInAllowlist(t *testing.T) {
 // `--measurements ""` yields one empty entry, which is not empty as a list and
 // would string-match a platform whose LaunchDigest claim came back empty.
 func TestCheckMeasurementValidatesHex(t *testing.T) {
+	aa, cc := launchDigestHex("aa"), launchDigestHex("cc")
 	for _, tc := range []struct {
 		name        string
 		measurement string
 		allowed     []string
 		wantErr     string
 	}{
-		{"match", "aabb", []string{"AABB"}, ""},
-		{"no match", "aabb", []string{"ccdd"}, "not in the allowlist"},
-		{"empty allowlist", "aabb", nil, "empty measurement policy"},
-		{"empty allowlist entry", "aabb", []string{""}, "not a non-empty hex launch digest"},
-		{"non-hex allowlist entry", "aabb", []string{"zz"}, "not a non-empty hex launch digest"},
-		{"empty claim against an empty entry", "", []string{""}, "not a non-empty hex launch digest"},
-		{"empty claim", "", []string{"aabb"}, "launch_digest is missing or malformed"},
-		{"non-hex claim", "not-a-digest", []string{"aabb"}, "launch_digest is missing or malformed"},
+		{"match", aa, []string{strings.ToUpper(aa)}, ""},
+		{"no match", aa, []string{cc}, "not in the allowlist"},
+		{"empty allowlist", aa, nil, "empty measurement policy"},
+		{"empty allowlist entry", aa, []string{""}, "configuration error"},
+		{"non-hex allowlist entry", aa, []string{"zz"}, "configuration error"},
+		{"short allowlist entry", aa, []string{"deadbeef"}, "configuration error"},
+		{"long allowlist entry", aa, []string{aa + "00"}, "configuration error"},
+		{"empty claim against an empty entry", "", []string{""}, "configuration error"},
+		{"empty claim", "", []string{aa}, "launch_digest is missing or malformed"},
+		{"non-hex claim", "not-a-digest", []string{aa}, "launch_digest is missing or malformed"},
+		{"short claim", "aabb", []string{aa}, "launch_digest is missing or malformed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := checkMeasurement(tc.measurement, tc.allowed)
@@ -928,7 +939,7 @@ func TestAttestLBWorkloadPolicy(t *testing.T) {
 	attest := func(t *testing.T, f *lbFixture, remote config.Remote) (*SessionVerdict, error) {
 		t.Helper()
 		remote.Mode = config.AttestEndpoint
-		remote.Measurements = []string{"a1"}
+		remote.Measurements = []string{launchDigestHex("a1")}
 		ts := f.newServer(t, bundleSpec{})
 		ea := newLBAttester(t, ts, remote, nil)
 		return ea.Attest(context.Background())
@@ -1296,7 +1307,7 @@ func snpStubTCB() teetypes.TcbInfo {
 func TestAttestLBMinTCB(t *testing.T) {
 	floor := &config.TCBFloor{Bootloader: 3, TEE: 0, SNP: 8, Microcode: 209}
 	remote := func() config.Remote {
-		return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"a1"}, MinTCB: floor}
+		return config.Remote{Mode: config.AttestEndpoint, Measurements: []string{launchDigestHex("a1")}, MinTCB: floor}
 	}
 
 	t.Run("floor reaches the verifier engine and passes on the claims", func(t *testing.T) {
@@ -1604,7 +1615,7 @@ func TestAttestLBTDXTCBStatus(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			claims := tdxStubClaims()
 			if tt.platform == "snp" {
-				claims = stubClaims{launchDigest: "a1"}
+				claims = stubClaims{launchDigest: launchDigestHex("a1")}
 			}
 			claims.tcbStatus = tt.reported
 			calls := stubEvidenceClaims(t, claims)
@@ -1614,7 +1625,7 @@ func TestAttestLBTDXTCBStatus(t *testing.T) {
 			if tt.platform == "tdx" {
 				remote.ImageManifestPath = pinManifest(t)
 			} else {
-				remote.Measurements = []string{"a1"}
+				remote.Measurements = []string{launchDigestHex("a1")}
 			}
 			v, err := newLBAttester(t, ts, remote, nil).Attest(context.Background())
 			if tt.wantErr != "" {
