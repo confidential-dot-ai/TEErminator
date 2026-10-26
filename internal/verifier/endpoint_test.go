@@ -1687,3 +1687,14 @@ func TestParseTDXTCBStatuses(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateMeasurementsNormalizes(t *testing.T) {
+	raw := " " + strings.ToUpper(launchDigestHex("seed")) + " "
+	got, err := ValidateMeasurements([]string{raw})
+	if err != nil {
+		t.Fatalf("ValidateMeasurements(%q) = %v, want nil", raw, err)
+	}
+	if want := []string{launchDigestHex("seed")}; !slices.Equal(got, want) {
+		t.Fatalf("ValidateMeasurements(%q) = %q, want %q", raw, got, want)
+	}
+}

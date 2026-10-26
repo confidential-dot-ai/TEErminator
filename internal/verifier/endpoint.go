@@ -1085,14 +1085,17 @@ func parseMeasurement(entry string) ([]byte, error) {
 	return b, nil
 }
 
-// ValidateMeasurements checks every launch-digest allowlist entry's syntax.
-func ValidateMeasurements(entries []string) error {
+// ValidateMeasurements checks every launch-digest allowlist entry's syntax
+// and returns the entries in stored form: trimmed and lowercase.
+func ValidateMeasurements(entries []string) ([]string, error) {
+	out := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if _, err := parseMeasurement(e); err != nil {
-			return err
+			return nil, err
 		}
+		out = append(out, strings.ToLower(strings.TrimSpace(e)))
 	}
-	return nil
+	return out, nil
 }
 
 // checkMeasurement enforces the remote's launch-digest allowlist. In attest-lb
