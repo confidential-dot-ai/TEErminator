@@ -57,6 +57,8 @@ func (p platformPins) imagePinned() bool {
 //   - An image manifest pins the launch digest exactly against its own MRTD,
 //     and RTMR[1]/[2] with it, so neither a launch-digest allowlist nor a
 //     by-hand RTMR[1]/[2] pin may sit beside it.
+//   - Without a manifest, every allowlist entry is a SHA-384 launch digest,
+//     and an attest-lb remote needs at least one.
 //   - RTMR[3] records events extended into a guest whose image the untrusted
 //     host selects, so its seed — expected_rtmr3, operator_pubkey_path or
 //     rtmrs 3= — is named once and requires an image manifest.
@@ -65,6 +67,14 @@ func (p platformPins) imagePinned() bool {
 func ValidatePinCombination(r config.Remote) error {
 	if r.ImageManifestPath != "" && len(r.Measurements) > 0 {
 		return errors.New("--measurements and --image-manifest are mutually exclusive: the manifest pins MRTD, RTMR[1] and RTMR[2] exactly against this one build, so a separate launch-digest allowlist could only admit an image it does not describe")
+	}
+	if r.ImageManifestPath == "" {
+		if r.Mode == config.AttestEndpoint && len(r.Measurements) == 0 {
+			return errors.New("--measurements or --image-manifest is required in mode attest-lb: an empty measurement policy pins nothing about what the front door runs")
+		}
+		if _, err := ValidateMeasurements(r.Measurements); err != nil {
+			return err
+		}
 	}
 	manual, err := refvalues.ParseRegisterPins(r.RTMRs)
 	if err != nil {

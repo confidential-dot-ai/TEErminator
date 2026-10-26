@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -55,8 +57,9 @@ func TestAttestationFailureDoesNotReadPromptBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	digest := sha512.Sum384([]byte("a1"))
 	tr, err := newH3Transport(target, Options{
-		Remote: config.Remote{Mode: config.AttestEndpoint},
+		Remote: config.Remote{Mode: config.AttestEndpoint, Measurements: []string{hex.EncodeToString(digest[:])}},
 	})
 	if err != nil {
 		t.Fatalf("newH3Transport: %v", err)
