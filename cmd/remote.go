@@ -283,11 +283,6 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			// How the pins relate to each other is one rule set, shared with
 			// the verifier so a config the CLI refuses to write is also a
 			// config the daemon refuses to run.
-			if len(measurements) > 0 {
-				if measurements, err = verifier.ValidateMeasurements(measurements); err != nil {
-					return err
-				}
-			}
 			if err := verifier.ValidatePinCombination(config.Remote{
 				Mode: attestMode, Measurements: measurements, ImageManifestPath: imageManifest, ExpectedRTMR3: rtmr3Stored,
 				OperatorPubkeyPath: operatorPkey, RTMRs: rtmrs, InitDataDigest: initData, SandboxID: sandboxID,
@@ -295,6 +290,12 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				PinnedPolicies: pinPolicies, TrustOperator: trustOperator, TrustOperatorKeys: trustOperatorKeys,
 			}); err != nil {
 				return err
+			}
+			if len(measurements) > 0 {
+				// Validated above; stored trimmed and lowercase.
+				if measurements, err = verifier.ValidateMeasurements(measurements); err != nil {
+					return err
+				}
 			}
 			operatorPkeyStored, err := validateOperatorPkeyFlag(operatorPkey)
 			if err != nil {

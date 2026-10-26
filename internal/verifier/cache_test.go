@@ -128,7 +128,8 @@ func TestExpiredServedLeafForcesReverify(t *testing.T) {
 func TestRemoteKey(t *testing.T) {
 	ca := mintCA(t, "key-test-ca")
 	otherCA := mintCA(t, "other-key-test-ca")
-	base := config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"B2", "a1"}}
+	a1, b2 := launchDigestHex("a1"), launchDigestHex("b2")
+	base := config.Remote{Mode: config.AttestEndpoint, Measurements: []string{strings.ToUpper(b2), a1}}
 
 	k := RemoteKey("lb.example:443", base, nil, nil)
 	if !strings.HasPrefix(k, "lb.example:443|attest-lb|") {
@@ -138,9 +139,9 @@ func TestRemoteKey(t *testing.T) {
 		t.Fatal("key is not deterministic")
 	}
 	canon := base
-	canon.Measurements = []string{"A1", "b2"}
+	canon.Measurements = []string{" " + strings.ToUpper(a1) + " ", b2}
 	if k != RemoteKey("lb.example:443", canon, nil, nil) {
-		t.Fatal("key must be invariant under measurement order and case")
+		t.Fatal("key must be invariant under measurement order, case and whitespace")
 	}
 
 	variants := map[string]string{
