@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"bytes"
+	"crypto/sha512"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -132,11 +134,12 @@ func TestAllowlistFetchWritesNothingWhenTheCheckCannotPass(t *testing.T) {
 
 	cfgDir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", cfgDir)
+	digest := sha512.Sum384([]byte("a1"))
 	writeConfig(t, config.Config{Remotes: []config.Remote{{
 		Local:        "127.0.0.1:8080",
 		Remote:       ts.URL,
 		Mode:         config.AttestEndpoint,
-		Measurements: []string{"a1"},
+		Measurements: []string{hex.EncodeToString(digest[:])},
 	}}})
 
 	outDir := t.TempDir()
@@ -146,8 +149,8 @@ func TestAllowlistFetchWritesNothingWhenTheCheckCannotPass(t *testing.T) {
 	cmd.SetErr(io.Discard)
 	cmd.SetArgs([]string{"fetch", "127.0.0.1:8080", "-o", out, "--timeout", "5s"})
 
-	if err := cmd.Execute(); err == nil {
-		t.Fatal("want a non-zero exit: nothing attested the served document")
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "required binding identifier") {
+		t.Fatalf("allowlist fetch = %v, want an attestation failure: nothing attested the served document", err)
 	}
 	assertOnly(t, outDir)
 }

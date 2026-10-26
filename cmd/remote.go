@@ -241,6 +241,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				trust = "true"
 			}
 			if err := validatePinModes(attestMode, []pinFlag{
+				{"--measurements", strings.Join(measurements, ",")},
 				{"--image-manifest", imageManifest},
 				{"--expected-rtmr3", rtmr3Stored},
 				{"--operator-pkey", operatorPkey},
@@ -260,9 +261,6 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			}
 			if len(routeDigests) > 0 && len(routeKeyFiles) > 0 {
 				return fmt.Errorf("--route-digest and --route-operator-key are mutually exclusive: each is a complete route check; pass one")
-			}
-			if err := verifier.ValidateMeasurements(measurements); err != nil {
-				return err
 			}
 			if err := verifier.ValidateRouteDigests(routeDigests); err != nil {
 				return fmt.Errorf("--route-digest: %w", err)
@@ -286,7 +284,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			// the verifier so a config the CLI refuses to write is also a
 			// config the daemon refuses to run.
 			if err := verifier.ValidatePinCombination(config.Remote{
-				Measurements: measurements, ImageManifestPath: imageManifest, ExpectedRTMR3: rtmr3Stored,
+				Mode: attestMode, Measurements: measurements, ImageManifestPath: imageManifest, ExpectedRTMR3: rtmr3Stored,
 				OperatorPubkeyPath: operatorPkey, RTMRs: rtmrs, InitDataDigest: initData, SandboxID: sandboxID,
 				RouteOperatorKeys: routeOperatorKeys, RouteFloor: routesFloor,
 				PinnedPolicies: pinPolicies, TrustOperator: trustOperator, TrustOperatorKeys: trustOperatorKeys,

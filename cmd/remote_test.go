@@ -100,7 +100,7 @@ func TestValidateImageManifestFlag(t *testing.T) {
 // nothing, so it is refused at add time rather than at some later verification
 // that never runs.
 func TestValidatePinModes(t *testing.T) {
-	flags := []string{"--image-manifest", "--expected-rtmr3", "--operator-pkey", "--rtmr", "--init-data", "--sandbox-id",
+	flags := []string{"--measurements", "--image-manifest", "--expected-rtmr3", "--operator-pkey", "--rtmr", "--init-data", "--sandbox-id",
 		"--min-tcb", "--tdx-tcb-status", "--route-digest", "--route-operator-key", "--routes-floor",
 		"--pin-policy", "--trust-operator", "--trust-operator-key"}
 	all := make([]pinFlag, len(flags))
@@ -175,6 +175,8 @@ func TestRemoteAddMeasurementsLength(t *testing.T) {
 		{"sha-384", strings.Repeat("ab", 48), ""},
 		{"short", "deadbeef", "--measurements entry"},
 		{"long", strings.Repeat("ab", 64), "--measurements entry"},
+		{"empty", "", "requires --measurements or --image-manifest"},
+		{"blank", " ", "--measurements entry"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
