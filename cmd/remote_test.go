@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -173,9 +174,10 @@ func TestRemoteAddMeasurementsLength(t *testing.T) {
 		name, entry, wantErr string
 	}{
 		{"sha-384", strings.Repeat("ab", 48), ""},
+		{"raw", " " + strings.Repeat("AB", 48) + " ", ""},
 		{"short", "deadbeef", "--measurements entry"},
 		{"long", strings.Repeat("ab", 64), "--measurements entry"},
-		{"empty", "", "requires --measurements or --image-manifest"},
+		{"empty", "", "--measurements or --image-manifest is required"},
 		{"blank", " ", "--measurements entry"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -187,6 +189,13 @@ func TestRemoteAddMeasurementsLength(t *testing.T) {
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("remote add --measurements %s = %v, want it accepted", tc.entry, err)
+				}
+				cfg, err := config.Load()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := []string{strings.Repeat("ab", 48)}; !slices.Equal(cfg.Remotes[0].Measurements, want) {
+					t.Fatalf("stored measurements = %q, want %q", cfg.Remotes[0].Measurements, want)
 				}
 				return
 			}

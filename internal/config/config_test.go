@@ -4,8 +4,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha512"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
@@ -97,7 +99,7 @@ func TestLoadAcceptsEveryWrittenKey(t *testing.T) {
 		Remotes: []Remote{{
 			Local: "127.0.0.1:8080", Remote: "https://lb.example/", Auth: AuthToken, Status: StatusVerified,
 			Token: "t", Mode: AttestEndpoint, DiscoveryURL: "https://d", ServerName: "s",
-			Measurements: []string{"a1"}, WorkloadName: "api", AllowlistPath: "/a", ImageManifestPath: "/i",
+			Measurements: []string{hex.EncodeToString(sha384("a1"))}, WorkloadName: "api", AllowlistPath: "/a", ImageManifestPath: "/i",
 			ExpectedRTMR3: "r", MinTCB: &TCBFloor{Bootloader: 1}, TDXTCBStatus: []string{"UpToDate"},
 			RouteDigests: []string{"ab"}, RouteOperatorKeys: []string{"k"},
 			RouteFloor: "1:ab", OperatorPubkeyPath: "/o", RTMRs: []string{"1=ab"}, InitDataDigest: "cd", SandboxID: "sb",
@@ -289,4 +291,9 @@ func TestLoadMigratesCertFingerprints(t *testing.T) {
 	if got := cfg.FindCerts("broken"); len(got) != 1 {
 		t.Errorf("FindCerts(broken) = %d certs, want 1", len(got))
 	}
+}
+
+func sha384(seed string) []byte {
+	sum := sha512.Sum384([]byte(seed))
+	return sum[:]
 }

@@ -70,7 +70,7 @@ func ValidatePinCombination(r config.Remote) error {
 	}
 	if r.ImageManifestPath == "" {
 		if r.Mode == config.AttestEndpoint && len(r.Measurements) == 0 {
-			return errors.New("attest-lb requires --measurements or --image-manifest: an empty measurement policy pins nothing about what the front door runs")
+			return errors.New("--measurements or --image-manifest is required in mode attest-lb: an empty measurement policy pins nothing about what the front door runs")
 		}
 		if _, err := ValidateMeasurements(r.Measurements); err != nil {
 			return err

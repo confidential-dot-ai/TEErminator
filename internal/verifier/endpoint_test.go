@@ -1263,7 +1263,7 @@ func TestValidatePinCombination(t *testing.T) {
 		{"manifest carries the operator key", config.Remote{ImageManifestPath: manifest, OperatorPubkeyPath: "/k.pub"}, ""},
 		{"manifest carries rtmr 3=", config.Remote{ImageManifestPath: manifest, RTMRs: []string{"3=" + reg}}, ""},
 		{"short allowlist entry", config.Remote{Measurements: []string{"deadbeef"}}, "--measurements entry"},
-		{"attest-lb without a launch-digest pin", config.Remote{Mode: config.AttestEndpoint}, "requires --measurements or --image-manifest"},
+		{"attest-lb without a launch-digest pin", config.Remote{Mode: config.AttestEndpoint}, "--measurements or --image-manifest is required"},
 		{"attest-lb with an allowlist", config.Remote{Mode: config.AttestEndpoint, Measurements: []string{mrtdHex}}, ""},
 		{"attest-lb with a manifest", config.Remote{Mode: config.AttestEndpoint, ImageManifestPath: manifest}, ""},
 		{"allowlist beside a manifest", config.Remote{Measurements: []string{mrtdHex}, ImageManifestPath: manifest}, "mutually exclusive"},
