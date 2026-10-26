@@ -292,7 +292,8 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				return err
 			}
 			if len(measurements) > 0 {
-				// Validated above; stored trimmed and lowercase.
+				// Store the canonical form; ValidatePinCombination has already
+				// rejected bad entries, so this cannot fail.
 				if measurements, err = verifier.ValidateMeasurements(measurements); err != nil {
 					return err
 				}
