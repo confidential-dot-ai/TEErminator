@@ -2,11 +2,13 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,8 +17,10 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/release"
 	"github.com/confidential-dot-ai/TEErminator/internal/routes"
 	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
@@ -248,6 +252,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 		pinPolicies   []string
 		trustOperator bool
 		trustKeyFiles []string
+		releaseURL    string
 	)
 
 	cmd := &cobra.Command{
@@ -264,6 +269,16 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			}
 			if normalized {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
+			}
+			if releaseURL != "" {
+				if imageManifest != "" || allowlistPath != "" || operatorPkey != "" || len(measurements) > 0 {
+					return fmt.Errorf("--release supplies --image-manifest, --allowlist and --operator-pkey; do not pass them or --measurements with it")
+				}
+				pins, err := fetchRelease(cmd.Context(), releaseURL)
+				if err != nil {
+					return err
+				}
+				imageManifest, allowlistPath, operatorPkey = pins.ImageManifest, pins.Allowlist, pins.OperatorKey
 			}
 
 			rtmr3Stored, err := validateRTMR3Flag(expectedRTMR3)
@@ -434,8 +449,32 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringVar(&sandboxID, "sandbox-id", "", "CRI pod sandbox ID the committed mesh leaf must carry (OID 1.3.6.1.4.1.66378.1.4); CA-vouched, like --workload")
 	f.StringSliceVar(&pinPolicies, "pin-policy", nil, "accepted allowlist policies (repeatable / comma-separated), each a sha256:<hex> digest or the path of an allowlist document hashed exactly as read (the bytes GET /allowlist serves): every policy in the node's replayed history, and the one the mesh leaf was issued under, must be one of these. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=); excludes --trust-operator")
 	f.BoolVar(&trustOperator, "trust-operator", false, "accept every policy in the node's replayed history, and the one the mesh leaf was issued under, only when CDS stores its document with a write token signed under --trust-operator-key: each one is fetched from /allowlist/objects/sha256/<hex>, re-hashed, and its token verified. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=) and --trust-operator-key; excludes --pin-policy")
+	f.StringVar(&releaseURL, "release", "", "GitHub release (https://github.com/<owner>/<repo>/releases/tag/<tag>) to take the pins from: verifies its release-bundle.json against release-bundle.sigstore.json (Sigstore public good; signed by a GitHub Actions workflow of that repository at that tag), downloads the allowlist and operator key it names, checks their SHA-256, and uses them as --image-manifest, --allowlist (with the derived --workload) and --operator-pkey. Excludes those flags and --measurements")
 	f.StringArrayVar(&trustKeyFiles, "trust-operator-key", nil, "PEM file of ECDSA operator public keys --trust-operator accepts signatures from (repeatable). Requires --trust-operator; --route-operator-key does not feed it")
 	return cmd
+}
+
+// fetchRelease verifies a GitHub release's signed pins and stores them under
+// the config directory, one directory per release.
+func fetchRelease(ctx context.Context, rawURL string) (*release.Pins, error) {
+	src, err := release.ParseURL(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("--release: %w", err)
+	}
+	cfgPath, err := config.Path()
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(filepath.Dir(cfgPath), "releases", src.Owner, src.Repo, src.Tag)
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	f := &release.Fetcher{Client: http.DefaultClient}
+	pins, err := f.Fetch(ctx, src, dir)
+	if err != nil {
+		return nil, fmt.Errorf("--release: %w", err)
+	}
+	fmt.Printf("Verified release %s; pins stored in %s.\n", src, dir)
+	return pins, nil
 }
 
 // validateOperatorPkeyFlag checks --operator-pkey holds one P-256 PEM public
