@@ -81,16 +81,22 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   possession over the same transcript; that the mesh leaf chains to the committed mesh
   CA; and that the serving leaf follows the attested mode's trust rule. In `cds` mode it
   chains to the mesh CA. In `acme` mode it passes WebPKI chain and hostname validation.
-  The verdict is then **pinned to the exact
-  serving-leaf DER** (not just its key): a substituted certificate — even one reusing the
-  attested key — refuses the handshake and forces re-attestation. The daemon reuses a
-  passing verdict for one minute, and never past the serving leaf's expiry: new upstream
-  connections in that window are admitted only if they present the same leaf, and the
-  first request after it re-attests. A failed attestation is kept for the same minute.
-  Each attestation runs on a connection of its own to the remote, which must be
-  `https`. When the router names another serving leaf than that connection presents,
-  because it renewed the leaf after the TLS handshake, the attestation runs once more
-  on a new connection.
+  The daemon runs this on **every connection it opens** to the remote (`https` and
+  HTTP/1.1 only, at most 16 taking new requests at a time) before the connection
+  carries a request, so each
+  verdict covers the exact serving-leaf DER of its own connection, and the router binds
+  that connection to the route digest and its own allowlist digest the evidence carried.
+  When the router applies another route manifest, or renews its leaf under another
+  allowlist, it refuses the next request on a bound connection with `503`
+  `route_digest_changed` or `router_digest_changed` (`binding_expired` once the binding
+  idles out). TEErminator returns that response unchanged, since the request was not
+  forwarded, and new requests open newly attested connections. New requests also stop
+  using connections a minute after they opened, or when a serving leaf they attested
+  expires if that is sooner; a request in flight finishes where it is. A failed
+  verification is kept for the same minute and refuses every request; a router that
+  cannot attest right now (429, 5xx, unreachable) is not kept. When the router names
+  another serving leaf than the connection presents, because it renewed the leaf after
+  the TLS handshake, the attestation runs once more on a new connection.
 
   Key properties:
   - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is
@@ -213,8 +219,8 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     reformatted copy or the signed envelope gives a digest that never matches. To
     change routes without failing, add the new digest to `route_digests` in the config
     file (the daemon reloads it; `remote add` sets pins only on a new remote), apply the
-    new manifest, wait for every router replica, then remove the old digest. The digest is an admission-time snapshot: a manifest applied after the
-    handshake routes later requests without new evidence until the next attestation.
+    new manifest, wait for every router replica, then remove the old digest. A manifest the router applies later routes no request on a connection
+    attested under another: the router refuses it and TEErminator attests a new one.
   - **Route operator keys.** Instead of digests, `--route-operator-key <pem-file>`
     (repeatable; config key `route_operator_keys`, which stores the PEM keys themselves)
     pins the ECDSA public keys the operator signs route manifests with. With each

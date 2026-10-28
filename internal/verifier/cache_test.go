@@ -10,44 +10,22 @@ import (
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
 )
 
-func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
+func TestFailureMemoKeepsAFailureForItsTTL(t *testing.T) {
 	now := time.Unix(1000, 0)
-	c := NewSessionCache(time.Minute)
+	c := NewFailureMemo(time.Minute)
 	c.now = func() time.Time { return now }
 
-	if _, fresh, _ := c.FreshSession("host"); fresh {
-		t.Fatal("expected no verdict before first RecordPass")
+	if err := c.Failed("host"); err != nil {
+		t.Fatalf("Failed() = %v before any attestation", err)
 	}
-
-	spki := [32]byte{4, 2}
-	c.RecordPass("host", c.Now(), spki, now.Add(time.Hour))
-	if got, fresh, ok := c.FreshSession("host"); !fresh || !ok || got != spki {
-		t.Fatal("expected fresh+ok pinned verdict right after RecordPass")
-	}
-
-	// 30s later: still within the 60s TTL -> reused.
+	c.RecordFailure("host", c.Now(), errors.New("boom"))
 	now = now.Add(30 * time.Second)
-	if _, fresh, ok := c.FreshSession("host"); !fresh || !ok {
-		t.Fatal("expected verdict still fresh at 30s")
+	if err := c.Failed("host"); !failedWith(err, "boom") {
+		t.Fatalf("Failed() at 30s = %v, want boom", err)
 	}
-
-	// 90s after RecordPass: expired -> must re-attest.
-	now = now.Add(60 * time.Second)
-	if _, fresh, _ := c.FreshSession("host"); fresh {
-		t.Fatal("expected verdict to expire past TTL")
-	}
-}
-
-func TestSessionCacheRemembersFailure(t *testing.T) {
-	c := NewSessionCache(time.Minute)
-	c.RecordFailure("bad", c.Now(), errors.New("boom"))
-	_, fresh, ok := c.FreshSession("bad")
-	if !fresh || ok {
-		t.Fatalf("expected fresh failure verdict, got fresh=%v ok=%v", fresh, ok)
-	}
-	c.Invalidate("bad")
-	if _, fresh, _ := c.FreshSession("bad"); fresh {
-		t.Fatal("expected Invalidate to clear the verdict")
+	now = now.Add(31 * time.Second)
+	if err := c.Failed("host"); err != nil {
+		t.Fatalf("Failed() past the TTL = %v, want nil", err)
 	}
 }
 
@@ -56,70 +34,37 @@ func TestSessionCacheRemembersFailure(t *testing.T) {
 func TestRecordKeepsLatestAttempt(t *testing.T) {
 	now := time.Unix(1000, 0)
 	earlier, later := now.Add(-time.Second), now
-	leaf := [32]byte{1}
 	for _, tc := range []struct {
-		name   string
-		record func(c *SessionCache)
-		wantOK bool
+		name       string
+		record     func(c *FailureMemo)
+		wantFailed bool
 	}{
-		{"failure that began before the pass", func(c *SessionCache) {
-			c.RecordPass("host", later, leaf, now.Add(time.Hour))
+		{"failure that began before the pass", func(c *FailureMemo) {
+			_ = c.RecordPass("host", later)
 			c.RecordFailure("host", earlier, errors.New("boom"))
+		}, false},
+		{"failure that began after the pass", func(c *FailureMemo) {
+			_ = c.RecordPass("host", earlier)
+			c.RecordFailure("host", later, errors.New("boom"))
 		}, true},
-		{"failure that began after the pass", func(c *SessionCache) {
-			c.RecordPass("host", earlier, leaf, now.Add(time.Hour))
+		{"pass that began before the failure", func(c *FailureMemo) {
 			c.RecordFailure("host", later, errors.New("boom"))
-		}, false},
-		{"pass that began before the failure", func(c *SessionCache) {
-			c.RecordFailure("host", later, errors.New("boom"))
-			c.RecordPass("host", earlier, leaf, now.Add(time.Hour))
-		}, false},
-		{"pass that began after the failure", func(c *SessionCache) {
+			_ = c.RecordPass("host", earlier)
+		}, true},
+		{"pass that began after the failure", func(c *FailureMemo) {
 			c.RecordFailure("host", earlier, errors.New("boom"))
-			c.RecordPass("host", later, leaf, now.Add(time.Hour))
-		}, true},
+			_ = c.RecordPass("host", later)
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := NewSessionCache(time.Minute)
+			c := NewFailureMemo(time.Minute)
 			c.now = func() time.Time { return now }
 			tc.record(c)
-			if _, fresh, ok := c.FreshSession("host"); !fresh || ok != tc.wantOK {
-				t.Errorf("FreshSession() = fresh %v, ok %v; want fresh, ok %v", fresh, ok, tc.wantOK)
+			failed := c.Failed("host") != nil
+			if failed != tc.wantFailed {
+				t.Errorf("Failed() != nil is %v, want %v", failed, tc.wantFailed)
 			}
 		})
-	}
-}
-
-// TestExpiredServedLeafForcesReverify pins the second freshness bound: a
-// verdict is scoped to one serving leaf, so it stops being reusable when that
-// certificate expires even if the re-attest interval has not elapsed. The
-// interval is caller-settable with no ceiling (StartOptions.ReattestInterval),
-// while c8s caps a stamped leaf at 6h, so without this bound a generous
-// interval would keep both the verdict and the handshake pin derived from it
-// alive past the certificate's own lifetime.
-func TestExpiredServedLeafForcesReverify(t *testing.T) {
-	now := time.Unix(1000, 0)
-	c := NewSessionCache(time.Hour)
-	c.now = func() time.Time { return now }
-
-	leaf := [32]byte{7}
-	c.RecordPass("host", c.Now(), leaf, now.Add(10*time.Second))
-	if _, fresh, ok := c.FreshSession("host"); !fresh || !ok {
-		t.Fatal("verdict should be fresh inside both the TTL and the leaf validity")
-	}
-
-	// Past the leaf's NotAfter but well inside the one-hour TTL.
-	now = now.Add(11 * time.Second)
-	if _, fresh, _ := c.FreshSession("host"); fresh {
-		t.Fatal("a verdict must not outlive the serving leaf it is scoped to")
-	}
-
-	// The TTL still binds independently: a long-lived leaf does not extend it.
-	now = time.Unix(2000, 0)
-	c.RecordPass("host", c.Now(), leaf, now.Add(24*time.Hour))
-	now = now.Add(time.Hour + time.Second)
-	if _, fresh, _ := c.FreshSession("host"); fresh {
-		t.Fatal("a long-lived leaf must not extend the re-attest interval")
 	}
 }
 

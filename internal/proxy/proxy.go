@@ -9,7 +9,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"log"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -30,8 +29,9 @@ type Options struct {
 	// other tunnel, so TEErminator can front multiple attested backends at once
 	// with a different attestation method per backend.
 	Remote config.Remote
-	// ReattestInterval is how long a successful verdict is reused before the next
-	// request re-attests. Zero means re-verify on every request.
+	// ReattestInterval is how long new requests reuse attested connections
+	// before attesting new ones, and how long a failed verification is kept.
+	// Zero attests a connection per request.
 	ReattestInterval time.Duration
 	// ExtraCAs are additional trust anchors (from `certs add`) appended to the
 	// system roots when validating the upstream TLS certificate. This is what
@@ -44,7 +44,7 @@ type Options struct {
 type Tunnel struct {
 	addr      string
 	server    *http.Server
-	transport *h3Transport
+	transport forwarder
 	cancel    context.CancelFunc
 	done      chan struct{}
 }
@@ -79,7 +79,7 @@ func StartWithOptions(ctx context.Context, localAddr, remoteURL string, opts Opt
 		localAddr = parsed.Host
 	}
 
-	transport, err := newH3Transport(target, opts)
+	transport, err := newForwarder(target, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -148,35 +148,52 @@ func (t *Tunnel) Stop() error {
 	return t.transport.Close()
 }
 
-// h3Transport tries HTTP/3 (QUIC) first and falls back to standard HTTPS/HTTP.
-// A per-host cache remembers hosts where HTTP/3 failed so that subsequent
-// requests skip the QUIC attempt and go directly through the fallback.
-// attester is the per-handshake attestation the transport gates on; tests
-// replace it to control timing.
-type attester interface {
-	Attest(ctx context.Context) (*verifier.SessionVerdict, error)
+// forwarder carries a tunnel's requests to its remote under the remote's
+// attestation mode.
+type forwarder interface {
+	http.RoundTripper
+	Close() error
 }
 
+// newForwarder returns the forwarder for opts.Remote.Mode.
+func newForwarder(target *url.URL, opts Options) (forwarder, error) {
+	switch opts.Remote.Mode {
+	case config.AttestNone:
+		return newH3Transport(target, opts)
+	case config.AttestEndpoint:
+		return newAttestedForwarder(target, opts)
+	case config.AttestCDSCert:
+		return refusingForwarder{mode: opts.Remote.Mode}, nil
+	default:
+		return nil, fmt.Errorf("unknown attestation mode %q", opts.Remote.Mode)
+	}
+}
+
+// refusingForwarder fails closed for a recognised but unimplemented mode:
+// every request is refused without reaching the unverified backend.
+type refusingForwarder struct {
+	mode config.AttestMode
+}
+
+func (f refusingForwarder) RoundTrip(req *http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("attestation mode %q for %s: %w (use the c8s-verify-js browser client for this flow today)",
+		f.mode, req.URL.Host, verifier.ErrNotImplemented)
+}
+
+func (refusingForwarder) Close() error {
+	return nil
+}
+
+// h3Transport forwards without attestation. It tries HTTP/3 (QUIC) first and
+// falls back to standard HTTPS/HTTP. A per-host cache remembers hosts where
+// HTTP/3 failed so that subsequent requests skip the QUIC attempt and go
+// directly through the fallback.
 type h3Transport struct {
 	h3       *http3.Transport
 	fallback *http.Transport
 
-	// attestation enforcement (per-remote, independent of other tunnels)
-	remote    config.Remote
-	ea        attester // attest-lb mode: active per-handshake attester
-	blocked   error    // set for recognised-but-unimplemented modes: fail closed without forwarding
-	cache     *verifier.SessionCache
-	remoteKey string
-
 	mu   sync.RWMutex
 	noH3 map[string]bool
-
-	// pinnedMu guards pinned, the per-leaf forwarding transports built by
-	// transportFor. Keying the connection pool by pin is what makes the
-	// handshake check answerable from the request alone: a pooled connection
-	// can only ever be reused by a request that decided on the same leaf.
-	pinnedMu sync.Mutex
-	pinned   map[[32]byte]*http.Transport
 }
 
 // upstreamTLSConfig builds the TLS client config used to validate an upstream:
@@ -233,64 +250,6 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	var (
-		ea        attester
-		blocked   error
-		cache     *verifier.SessionCache
-		remoteKey = target.Host
-	)
-	// Attested traffic forwards over the fallback transport, so that is where
-	// the handshake-time leaf pin lives: refusing a mismatched leaf during the
-	// handshake means no request bytes (body, bearer token) are ever written
-	// to an endpoint other than the attested one.
-	fallbackTLS := tlsCfg.Clone()
-
-	switch opts.Remote.Mode {
-	case config.AttestNone:
-		// No attestation: plain forwarding over WebPKI/system-pool trust.
-	case config.AttestEndpoint:
-		pinnedCAs, err := parseExtraCAs(opts.ExtraCAs)
-		if err != nil {
-			return nil, err
-		}
-		// The cache key covers the endpoint mode and every policy pin, so a
-		// verdict cached under one policy can never authorize another.
-		files, err := verifier.PinnedFileDigests(opts.Remote)
-		if err != nil {
-			return nil, fmt.Errorf("attest-lb: %w", err)
-		}
-		remoteKey = verifier.RemoteKey(target.Host, opts.Remote, files, pinnedCAs)
-		cache = verifier.NewSessionCache(opts.ReattestInterval)
-
-		// The first handshake captures the serving leaf before its attested mode
-		// is known. No application bytes flow before verification. The verifier
-		// then requires a mesh-CA chain in cds mode, or WebPKI name and chain
-		// validation in acme mode, and binds the exact serving-leaf DER into
-		// fresh hardware evidence (roundTripEndpoint).
-		// Forwarding handshakes additionally carry the decided leaf pin
-		// (transportFor). WebPKI/system-pool verification stays in force for
-		// every mode not gated by an attest-lb verdict.
-		attestTLS := &tls.Config{
-			ServerName:         tlsCfg.ServerName,
-			RootCAs:            tlsCfg.RootCAs,
-			InsecureSkipVerify: true, // replaced by the attest-lb hardware binding above
-		}
-		fallbackTLS = attestTLS.Clone()
-
-		ea, err = verifier.NewEndpointAttester(target, attestTLS, opts.Remote, pinnedCAs)
-		if err != nil {
-			return nil, err
-		}
-	case config.AttestCDSCert:
-		// Recognised but not yet implemented: block every request rather than
-		// forwarding it to an unverified backend.
-		blocked = fmt.Errorf("%w: %s (use the c8s-verify-js browser client for this flow today)",
-			verifier.ErrNotImplemented, opts.Remote.Mode)
-	default:
-		return nil, fmt.Errorf("unknown attestation mode %q", opts.Remote.Mode)
-	}
-
 	return &h3Transport{
 		h3: &http3.Transport{
 			TLSClientConfig: tlsCfg,
@@ -300,18 +259,12 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 			QUICConfig: &quic.Config{HandshakeIdleTimeout: 2 * time.Second},
 		},
 		fallback: &http.Transport{
-			TLSClientConfig:   fallbackTLS,
+			TLSClientConfig:   tlsCfg.Clone(),
 			ForceAttemptHTTP2: true,
 			MaxIdleConns:      100,
 			IdleConnTimeout:   90 * time.Second,
 		},
-		remote:    opts.Remote,
-		ea:        ea,
-		blocked:   blocked,
-		cache:     cache,
-		remoteKey: remoteKey,
-		noH3:      make(map[string]bool),
-		pinned:    make(map[[32]byte]*http.Transport),
+		noH3: make(map[string]bool),
 	}, nil
 }
 
@@ -319,29 +272,8 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 // standard HTTP/1.1 or HTTP/2. Connection-level failures (such as a QUIC
 // handshake rejection) occur before any request body is consumed, so the
 // original request can safely be forwarded via the fallback transport.
-//
-// Attestation handling is driven entirely by this remote's configured Mode:
-//   - AttestNone: forward without attestation.
-//   - AttestEndpoint: attest the session against the remote's
-//     attestation endpoint before forwarding, and pin traffic to the attested
-//     TLS leaf.
-//   - any recognised-but-unimplemented mode: fail closed without ever
-//     forwarding the request to the unverified backend.
 func (t *h3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Host
-
-	if t.ea != nil {
-		return t.roundTripEndpoint(req, host)
-	}
-	if t.blocked != nil {
-		return nil, fmt.Errorf("attestation mode %q for %s: %w", t.remote.Mode, host, t.blocked)
-	}
-	return t.do(req, host)
-}
-
-// do performs the actual HTTP/3-then-fallback round trip without any attestation
-// handling.
-func (t *h3Transport) do(req *http.Request, host string) (*http.Response, error) {
 	t.mu.RLock()
 	skip := t.noH3[host]
 	t.mu.RUnlock()
@@ -365,105 +297,13 @@ func (t *h3Transport) do(req *http.Request, host string) (*http.Response, error)
 	return resp, err
 }
 
-// roundTripEndpoint is the AttestEndpoint path: attest the session against the
-// LB's /.well-known/c8s/attest-lb endpoint, then forward over the attested
-// upstream TLS. The verdict is scoped to the exact attested serving leaf:
-// forwarded traffic must run on a connection presenting the same certificate
-// DER, otherwise the session re-attests.
-func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.Response, error) {
-	leaf, fresh, ok := t.cache.FreshSession(t.remoteKey)
-	if fresh && !ok {
-		return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
+// Close releases resources held by the H3 and fallback transports.
+func (t *h3Transport) Close() error {
+	if err := t.h3.Close(); err != nil {
+		return err
 	}
-	if !fresh {
-		started := t.cache.Now()
-		v, err := t.ea.Attest(req.Context())
-		if err != nil {
-			// A cancelled client request says nothing about the remote.
-			if req.Context().Err() == nil {
-				t.cache.RecordFailure(t.remoteKey, started, err)
-			}
-			slog.Warn("attestation verification failed; refusing to forward",
-				"mode", t.remote.Mode, "url", req.URL.String(), "error", err)
-			return nil, fmt.Errorf("attestation verification failed for %s: %w", host, err)
-		}
-		if !t.cache.RecordPass(t.remoteKey, started, v.LeafSHA256, v.LeafNotAfter) {
-			// A later attestation failed: refuse. A later pass leaves this
-			// verified leaf usable.
-			if _, fresh, ok := t.cache.FreshSession(t.remoteKey); fresh && !ok {
-				return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
-			}
-		}
-		slog.Info("attestation verified", "mode", t.remote.Mode, "url", req.URL.String(),
-			"measurement", v.Measurement, "trust", v.TrustMode, "route_digest", v.RouteDigest, "route_check", v.RouteCheck, "route_revision", v.RouteRevision,
-			"policy_check", v.PolicyCheck, "partial", v.Partial, "not_proven", v.NotProven)
-		leaf = v.LeafSHA256
-	}
-	if leaf == ([32]byte{}) {
-		// Unreachable via either branch above, and deliberately fatal rather
-		// than defensive: forwarding without a decided pin is the one thing
-		// this path must never do.
-		return nil, fmt.Errorf("attestation binding for %s: no attested leaf to pin the forwarding handshake to", host)
-	}
-
-	// Forward over a transport pinned to THIS request's decided leaf (HTTP/1.1
-	// or H2, so resp.TLS reliably carries the peer leaf; attested sessions do
-	// not use HTTP/3). The pin travels with the transport rather than being
-	// re-read from the cache during the handshake, so a concurrent Invalidate
-	// or TTL expiry cannot turn this request's handshake permissive between the
-	// FreshSession read above and the dial below.
-	resp, err := t.transportFor(leaf).RoundTrip(req)
-	if err != nil || resp == nil {
-		return resp, err
-	}
-
-	// Pin: the serving connection must present the exact attested leaf. A
-	// swapped or rotated upstream leaf forces re-attestation rather than silent
-	// reuse. New connections are already refused at handshake time
-	// (pinnedLeafVerifier); this response-time check is the belt to that
-	// braces.
-	if !sessionLeafMatches(resp, leaf) {
-		_ = resp.Body.Close()
-		t.cache.Invalidate(t.remoteKey)
-		t.dropPinned(leaf)
-		slog.Warn("upstream TLS leaf changed since attestation; dropping response",
-			"mode", t.remote.Mode, "url", req.URL.String())
-		return nil, fmt.Errorf("attestation binding broken for %s: upstream TLS leaf changed (re-attest required)", host)
-	}
-	return resp, nil
-}
-
-// transportFor returns the forwarding transport for one attested leaf,
-// building it on first use by cloning the base fallback transport (so the
-// remote's SNI, timeouts and any operator trust anchors carry over) and
-// replacing its handshake check with a pin on exactly that leaf. Transports are
-// kept per leaf so a pooled connection is only ever reused by a request that
-// decided on the same certificate.
-func (t *h3Transport) transportFor(leaf [32]byte) *http.Transport {
-	t.pinnedMu.Lock()
-	defer t.pinnedMu.Unlock()
-	if tr, ok := t.pinned[leaf]; ok {
-		return tr
-	}
-	tr := t.fallback.Clone()
-	if tr.TLSClientConfig == nil {
-		tr.TLSClientConfig = &tls.Config{}
-	}
-	tr.TLSClientConfig.VerifyConnection = pinnedLeafVerifier(leaf)
-	t.pinned[leaf] = tr
-	return tr
-}
-
-// dropPinned retires the transport for a leaf that is no longer attested,
-// closing its pooled connections so nothing survives the invalidation.
-func (t *h3Transport) dropPinned(leaf [32]byte) {
-	t.pinnedMu.Lock()
-	tr, ok := t.pinned[leaf]
-	delete(t.pinned, leaf)
-	t.pinnedMu.Unlock()
-	if ok {
-		tr.CloseIdleConnections()
-	}
+	t.fallback.CloseIdleConnections()
+	return nil
 }
 
 // pinnedLeafVerifier is the handshake-time check for one decided leaf: every
@@ -484,29 +324,4 @@ func pinnedLeafVerifier(leaf [32]byte) func(tls.ConnectionState) error {
 		}
 		return nil
 	}
-}
-
-// sessionLeafMatches reports whether the response's TLS peer leaf DER equals
-// the attested one (constant-time).
-func sessionLeafMatches(resp *http.Response, want [32]byte) bool {
-	if resp.TLS == nil || len(resp.TLS.PeerCertificates) == 0 {
-		return false
-	}
-	got := sha256.Sum256(resp.TLS.PeerCertificates[0].Raw)
-	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
-}
-
-// Close releases resources held by the H3, fallback and per-leaf transports.
-func (t *h3Transport) Close() error {
-	t.pinnedMu.Lock()
-	for leaf, tr := range t.pinned {
-		tr.CloseIdleConnections()
-		delete(t.pinned, leaf)
-	}
-	t.pinnedMu.Unlock()
-	if err := t.h3.Close(); err != nil {
-		return err
-	}
-	t.fallback.CloseIdleConnections()
-	return nil
 }

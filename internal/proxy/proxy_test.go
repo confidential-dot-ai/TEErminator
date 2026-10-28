@@ -10,7 +10,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -24,7 +23,6 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
-	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 )
 
 // startTunnel is a test helper that creates a tunnel pointing at backend and
@@ -493,21 +491,26 @@ func TestH3TransportPlainHTTPSkipsQUIC(t *testing.T) {
 	}
 }
 
-// newTrustingTransport builds an h3Transport for backend with the given options,
-// trusting the test server's self-signed certificate on the fallback path.
-func newTrustingTransport(t *testing.T, backend *httptest.Server, opts Options) *h3Transport {
+// newTrustingForwarder builds backend's forwarder under mode, trusting the
+// test server's certificate.
+func newTrustingForwarder(t *testing.T, backend *httptest.Server, mode config.AttestMode) forwarder {
 	t.Helper()
 	target, err := url.Parse(backend.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr, err := newH3Transport(target, opts)
+	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: backend.Certificate().Raw})
+	fw, err := newForwarder(target, Options{
+		Remote:   config.Remote{Mode: mode},
+		ExtraCAs: []config.Cert{{CommonName: "test-backend", PEM: string(leafPEM)}},
+	})
 	if err != nil {
-		t.Fatalf("newH3Transport: %v", err)
+		t.Fatalf("newForwarder: %v", err)
 	}
-	tr.fallback.TLSClientConfig = backend.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
-	t.Cleanup(func() { _ = tr.Close() })
-	return tr
+	t.Cleanup(func() {
+		_ = fw.Close()
+	})
+	return fw
 }
 
 // TestPerRemoteAttestationMethods verifies each tunnel enforces its own remote's
@@ -537,7 +540,7 @@ func TestPerRemoteAttestationMethods(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			hits.Store(0)
-			tr := newTrustingTransport(t, backend, Options{Remote: config.Remote{Mode: tc.mode}})
+			tr := newTrustingForwarder(t, backend, tc.mode)
 			req, _ := http.NewRequest("GET", backend.URL, nil)
 			resp, err := tr.RoundTrip(req)
 			if resp != nil {
@@ -561,7 +564,7 @@ func TestPerRemoteAttestationMethods(t *testing.T) {
 // silently forwarding unverified.
 func TestUnknownAttestationModeRejected(t *testing.T) {
 	target, _ := url.Parse("https://example.com")
-	if _, err := newH3Transport(target, Options{Remote: config.Remote{Mode: "bogus-mode"}}); err == nil {
+	if _, err := newForwarder(target, Options{Remote: config.Remote{Mode: "bogus-mode"}}); err == nil {
 		t.Fatal("expected an error for an unrecognised attestation mode")
 	}
 }
@@ -740,248 +743,5 @@ func TestPinnedLeafVerifier(t *testing.T) {
 	// "any certificate".
 	if err := pinnedLeafVerifier([32]byte{})(state(other)); err == nil {
 		t.Fatal("zero pin: want handshake refused, got nil")
-	}
-}
-
-// TestForwardingPinSurvivesCacheInvalidation is the regression for the
-// fail-open race: the forwarding handshake used to re-read the shared verdict
-// cache instead of using the pin its caller had already decided on, and
-// returned nil — admitting ANY certificate — whenever that read came back
-// stale. A concurrent request failing its response-time check
-// (cache.Invalidate) or a TTL expiry at the boundary was enough to hit it,
-// after which the bearer token and request body were written to an
-// unattested peer.
-//
-// Reproduced deterministically here by invalidating the cache between the
-// decision and the dial: the transport is built for backend A's leaf and then
-// pointed at impostor B with the verdict already gone.
-func TestForwardingPinSurvivesCacheInvalidation(t *testing.T) {
-	attested := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "attested-ok")
-	}))
-	defer attested.Close()
-
-	// httptest serves one shared certificate to every TLS server it starts, so
-	// the impostor is given its own — otherwise it would present the very leaf
-	// under test and prove nothing.
-	impostorPEM, impostorKeyPEM := selfSignedCert(t, "impostor.example")
-	impostorCert, err := tls.X509KeyPair(impostorPEM, impostorKeyPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var impostorHits atomic.Int32
-	impostor := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		impostorHits.Add(1)
-		fmt.Fprint(w, "impostor-ok")
-	}))
-	impostor.TLS = &tls.Config{Certificates: []tls.Certificate{impostorCert}}
-	impostor.StartTLS()
-	defer impostor.Close()
-
-	target, err := url.Parse(impostor.URL) // the proxy is pointed at the impostor
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr, err := newH3Transport(target, Options{
-		Remote:           config.Remote{Mode: config.AttestEndpoint},
-		ReattestInterval: time.Minute,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tr.Close() }()
-
-	pin := leafHashOf(attested.Certificate())
-	tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), pin, time.Now().Add(time.Hour))
-	forwarding := tr.transportFor(pin)
-
-	// The race: the verdict vanishes after the caller decided on it and before
-	// the handshake runs.
-	tr.cache.Invalidate(tr.remoteKey)
-
-	req, _ := http.NewRequest("GET", impostor.URL, nil)
-	req.Header.Set("Authorization", "Bearer secret")
-	resp, err := forwarding.RoundTrip(req)
-	if resp != nil {
-		_ = resp.Body.Close()
-	}
-	if err == nil {
-		t.Fatal("request forwarded to an unattested peer after the verdict was invalidated")
-	}
-	if !strings.Contains(err.Error(), "does not match the attested leaf") {
-		t.Fatalf("want the handshake pin error, got %v", err)
-	}
-	if got := impostorHits.Load(); got != 0 {
-		t.Fatalf("%d request(s) reached the unattested backend; want 0", got)
-	}
-}
-
-// TestHandshakePinBlocksBeforeSend covers the leak-one-request gap: with a
-// fresh verdict pinning a leaf that is NOT the upstream's, the request must be
-// refused during the TLS handshake — zero bytes reach the backend — while a
-// verdict pinning the upstream's actual leaf forwards normally over the same
-// transport construction.
-func TestHandshakePinBlocksBeforeSend(t *testing.T) {
-	var hits atomic.Int32
-	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		fmt.Fprint(w, "attested-ok")
-	}))
-	defer backend.Close()
-
-	leafPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: backend.Certificate().Raw})
-	target, err := url.Parse(backend.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	opts := Options{
-		Remote:           config.Remote{Mode: config.AttestEndpoint},
-		ExtraCAs:         []config.Cert{{CommonName: "test-backend", PEM: string(leafPEM)}},
-		ReattestInterval: time.Minute,
-	}
-
-	roundTrip := func(pin [32]byte) (string, error) {
-		tr, err := newH3Transport(target, opts)
-		if err != nil {
-			t.Fatalf("newH3Transport: %v", err)
-		}
-		defer func() { _ = tr.Close() }()
-		// Seed a fresh passing verdict directly so the round trip skips the
-		// attester and exercises only the handshake-time pin.
-		tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), pin, time.Now().Add(time.Hour))
-		req, _ := http.NewRequest("GET", backend.URL, nil)
-		resp, err := tr.RoundTrip(req)
-		if err != nil {
-			return "", err
-		}
-		defer func() { _ = resp.Body.Close() }()
-		body, _ := io.ReadAll(resp.Body)
-		return string(body), nil
-	}
-
-	// Pin a leaf the upstream does not hold: the handshake must be refused and
-	// the request must never reach the backend.
-	if _, err := roundTrip([32]byte{0xde, 0xad}); err == nil {
-		t.Fatal("mismatched pin: want a handshake error, got a forwarded response")
-	} else if !strings.Contains(err.Error(), "does not match the attested leaf") {
-		t.Fatalf("mismatched pin: want the handshake pin error, got %v", err)
-	}
-	if got := hits.Load(); got != 0 {
-		t.Fatalf("mismatched pin: %d request(s) reached the backend; want 0", got)
-	}
-
-	// Pin the upstream's actual leaf: forwards normally.
-	body, err := roundTrip(leafHashOf(backend.Certificate()))
-	if err != nil {
-		t.Fatalf("matching pin: %v", err)
-	}
-	if body != "attested-ok" {
-		t.Fatalf("matching pin: body = %q, want attested-ok", body)
-	}
-	if got := hits.Load(); got != 1 {
-		t.Fatalf("matching pin: backend hits = %d, want 1", got)
-	}
-}
-
-// blockingAttester returns verdict once release is closed, or the request's
-// context error if that comes first. It closes entered when called.
-type blockingAttester struct {
-	entered, release chan struct{}
-	verdict          *verifier.SessionVerdict
-}
-
-func (a *blockingAttester) Attest(ctx context.Context) (*verifier.SessionVerdict, error) {
-	close(a.entered)
-	select {
-	case <-a.release:
-		return a.verdict, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-// TestAttestationVerdictOrdering checks how roundTripEndpoint records a
-// verdict that races another: a pass superseded by a failure recorded from a
-// later attestation is refused, and a cancelled request records nothing.
-func TestAttestationVerdictOrdering(t *testing.T) {
-	var hits atomic.Int32
-	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		fmt.Fprint(w, "ok")
-	}))
-	defer backend.Close()
-	target, err := url.Parse(backend.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert := backend.Certificate()
-
-	for _, tc := range []struct {
-		name string
-		// during runs while Attest blocks; it returns whether to release it.
-		during    func(tr *h3Transport, cancel context.CancelFunc) bool
-		wantErr   string
-		wantFresh bool // a verdict is cached afterwards
-	}{
-		{
-			name: "pass superseded by a later failure",
-			during: func(tr *h3Transport, _ context.CancelFunc) bool {
-				tr.cache.RecordFailure(tr.remoteKey, tr.cache.Now().Add(time.Second), errors.New("later attestation failed"))
-				return true
-			},
-			wantErr:   "attestation previously failed",
-			wantFresh: true,
-		},
-		{
-			name: "cancelled request",
-			during: func(_ *h3Transport, cancel context.CancelFunc) bool {
-				cancel()
-				return false
-			},
-			wantErr: "context canceled",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			hits.Store(0)
-			tr, err := newH3Transport(target, Options{
-				Remote:           config.Remote{Mode: config.AttestEndpoint},
-				ReattestInterval: time.Minute,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = tr.Close() }()
-			stub := &blockingAttester{
-				entered: make(chan struct{}),
-				release: make(chan struct{}),
-				verdict: &verifier.SessionVerdict{LeafSHA256: leafHashOf(cert), LeafNotAfter: cert.NotAfter},
-			}
-			tr.ea = stub
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			req, _ := http.NewRequestWithContext(ctx, "GET", backend.URL, nil)
-			done := make(chan error, 1)
-			go func() {
-				resp, err := tr.RoundTrip(req)
-				if resp != nil {
-					_ = resp.Body.Close()
-				}
-				done <- err
-			}()
-			<-stub.entered
-			if tc.during(tr, cancel) {
-				close(stub.release)
-			}
-			if err := <-done; err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("RoundTrip() = %v, want an error containing %q", err, tc.wantErr)
-			}
-			if n := hits.Load(); n != 0 {
-				t.Errorf("backend received %d requests, want 0", n)
-			}
-			if _, fresh, _ := tr.cache.FreshSession(tr.remoteKey); fresh != tc.wantFresh {
-				t.Errorf("FreshSession() fresh = %v, want %v", fresh, tc.wantFresh)
-			}
-		})
 	}
 }
