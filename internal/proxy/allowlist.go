@@ -102,10 +102,7 @@ func attemptAllowlistFetch(ctx context.Context, r config.Remote, extraCAs []conf
 	}
 	attestTLS := webPKITLS.Clone()
 	attestTLS.InsecureSkipVerify = true // trust is checked after the mode is attested
-	attestTr := &http.Transport{TLSClientConfig: attestTLS}
-	defer attestTr.CloseIdleConnections()
-
-	ea, err := verifier.NewEndpointAttester(origin, &http.Client{Transport: attestTr}, r, pinnedCAs, webPKITLS.RootCAs)
+	ea, err := verifier.NewEndpointAttester(target, attestTLS, r, pinnedCAs)
 	if err != nil {
 		return nil, err
 	}

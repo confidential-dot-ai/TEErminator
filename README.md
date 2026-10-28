@@ -87,6 +87,10 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   passing verdict for one minute, and never past the serving leaf's expiry: new upstream
   connections in that window are admitted only if they present the same leaf, and the
   first request after it re-attests. A failed attestation is kept for the same minute.
+  Each attestation runs on a connection of its own to the remote, which must be
+  `https`. When the router names another serving leaf than that connection presents,
+  because it renewed the leaf after the TLS handshake, the attestation runs once more
+  on a new connection.
 
   Key properties:
   - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is

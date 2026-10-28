@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,6 +38,17 @@ import (
 // ErrNotImplemented is returned for attestation modes that are defined but not
 // yet wired up; the proxy fails closed on them instead of forwarding.
 var ErrNotImplemented = errors.New("attestation flow not implemented")
+
+// ErrUnavailable marks an attest-lb exchange that returned no bundle to judge:
+// the request failed, or the router answered 429 or 5xx. It is no verdict on
+// the router.
+var ErrUnavailable = errors.New("attest-lb unavailable")
+
+// routerCannotAttestNow reports whether an attest-lb status asks the client to
+// retry later: rate limited, or busy, renewing or without evidence for now.
+func routerCannotAttestNow(status int) bool {
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
 
 // Endpoint attestation (config.AttestEndpoint, "attest-lb") is the ordinary-TLS
 // native-client protocol: after each new TLS handshake and before releasing
@@ -206,19 +218,26 @@ type attestationBundle struct {
 	FrontDoorMode string          `json:"front_door_mode"`
 	IdentityProof identityProof   `json:"identity_proof"`
 	RouteDigest   string          `json:"route_digest"`
+	// ServingLeafSHA256 names the serving leaf the router bound, unpadded
+	// base64url. Only the evidence authenticates it.
+	ServingLeafSHA256 string `json:"serving_leaf_sha256"`
 	// MeasuredPolicies is the node's journal of policy digests extended into
 	// RTMR[3]. It is outside the transcript: only its replay authenticates it.
 	MeasuredPolicies []string `json:"measured_policies"`
 }
 
-// EndpointAttester implements the attest-lb mode. baseURL is the LB origin
-// (scheme://host); client must be the transport whose observed TLS state the
-// proxy forwards over, so the serving leaf bound into the evidence is the one
-// application traffic rides. pinnedCAs are the operator's `certs add`
-// certificates: they are OPTIONAL hardening — the mesh CA is derived from the
-// hardware-committed response either way — and only upgrade the verdict to
-// specific-cluster when one of them byte-equals the committed CA.
+// EndpointAttester implements the attest-lb mode against target's origin
+// (https only). Every attestation runs on a connection of its own, dialed
+// with tlsConfig, whose RootCAs are the WebPKI roots of acme mode, and each
+// verdict covers the serving leaf of its own connection. pinnedCAs are the
+// operator's `certs add` certificates: they are OPTIONAL hardening — the mesh
+// CA is derived from the hardware-committed response either way — and only
+// upgrade the verdict to specific-cluster when one of them byte-equals the
+// committed CA.
 type EndpointAttester struct {
+	dial func(context.Context) (*tls.Conn, error)
+	// client fetches the route publication and policy documents over
+	// connections of its own.
 	client      *http.Client
 	attestURL   *url.URL
 	remote      config.Remote
@@ -233,29 +252,18 @@ type EndpointAttester struct {
 }
 
 // NewEndpointAttester builds an endpoint attester.
-func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remote, pinnedCAs []*x509.Certificate, webPKIRoots *x509.CertPool) (*EndpointAttester, error) {
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return nil, fmt.Errorf("attest-lb: parse base URL: %w", err)
+func NewEndpointAttester(target *url.URL, tlsConfig *tls.Config, remote config.Remote, pinnedCAs []*x509.Certificate) (*EndpointAttester, error) {
+	if target.Scheme != "https" {
+		return nil, fmt.Errorf("attest-lb: the remote URL must be https, got %q", target.Scheme)
 	}
-	u.Path = wellKnownAttestLB
-	u.RawQuery = ""
-	// The leaf the attester observes must be the leaf traffic rides, so the
-	// fetch is not allowed to move: an on-path attacker who terminates it with
-	// any certificate could otherwise redirect to the genuine LB, and the
-	// client would attest — and pin — a host it was never configured to reach.
-	// A redirect is surfaced as its own non-200 response instead. The client is
-	// copied rather than mutated so a caller's shared client keeps its own
-	// policy.
-	c := *client
-	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	e := &EndpointAttester{
-		client:      &c,
-		attestURL:   u,
+		dial:        tlsDialer(target, tlsConfig),
+		attestURL:   &url.URL{Scheme: target.Scheme, Host: target.Host, Path: wellKnownAttestLB},
 		remote:      remote,
 		pinnedCAs:   pinnedCAs,
-		webPKIRoots: webPKIRoots,
+		webPKIRoots: tlsConfig.RootCAs,
 	}
+	e.client = e.redirectRefusingClient()
 	if remote.RouteFloor != "" {
 		revision, digest, err := ParseRouteFloor(remote.RouteFloor)
 		if err != nil {
@@ -266,38 +274,108 @@ func NewEndpointAttester(baseURL string, client *http.Client, remote config.Remo
 	return e, nil
 }
 
-// attestDeadline bounds a whole Attest call, both attempts and every fetch,
-// shared between them: twice the proxy's 30 s per-request timeout. A caller's
-// shorter context deadline still applies.
-const attestDeadline = 60 * time.Second
-
-// Attest runs the per-handshake attest-lb verification and returns the verdict,
-// or an error (fail closed). The checks run strictly in this order: serving
-// leaf capture, bundle shape (version, nonce echo), served chain parsing and
-// committed-CA selection, identity-proof field equality, hardware evidence over
-// the recomputed transcript, proof of possession, mesh-leaf chain, serving-leaf
-// trust, measurement policy, workload policy, policy history, route check. With operator keys
-// the route publication is fetched alongside the handshake and checked last;
-// a revision below the floor, or a digest no re-fetch reconciles, gets one
-// more attestation on new connections.
-func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) {
-	ctx, cancel := context.WithTimeout(ctx, attestDeadline)
-	defer cancel()
-	v, err := e.attest(ctx)
-	if errors.Is(err, routes.ErrRollback) || errors.Is(err, errRouteMismatch) {
-		// A revision below the floor, or a handshake and publication that
-		// disagree, most likely means a replica that has not applied the
-		// newest manifest yet. New connections may reach one that has.
-		e.client.CloseIdleConnections()
-		first := err
-		if v, err = e.attest(ctx); err != nil {
-			return nil, fmt.Errorf("%w; after attesting again on new connections: %w", first, err)
-		}
+// redirectRefusingClient fetches over connections from e.dial and surfaces a
+// redirect as its own response: an on-path attacker who terminates a fetch
+// with any certificate could otherwise redirect it to a host the remote was
+// never configured to reach.
+func (e *EndpointAttester) redirectRefusingClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return e.dial(ctx)
+			},
+			IdleConnTimeout: 90 * time.Second,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
-	return v, err
 }
 
-func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) {
+// attestDeadline bounds a whole Dial or Attest call, both attempts and every
+// fetch, shared between them: twice the proxy's 30 s per-request timeout. A
+// caller's shorter context deadline still applies.
+const attestDeadline = 60 * time.Second
+
+// Dial opens a connection and runs attest-lb on it, so the router binds that
+// connection and the verdict covers the serving leaf it presents; the caller
+// owns the connection. A failure anotherConnectionMayPass gets one more
+// attempt on a new connection.
+//
+// The checks run strictly in this order: serving leaf capture, bundle shape
+// (version, nonce echo), served chain parsing and committed-CA selection,
+// identity-proof field equality, hardware evidence over the recomputed
+// transcript, proof of possession, mesh-leaf chain, serving-leaf trust,
+// measurement policy, workload policy, policy history, route check. With
+// operator keys the route publication is fetched alongside the handshake and
+// checked last.
+func (e *EndpointAttester) Dial(ctx context.Context) (*tls.Conn, *SessionVerdict, error) {
+	ctx, cancel := context.WithTimeout(ctx, attestDeadline)
+	defer cancel()
+	conn, v, err := e.dialAttested(ctx)
+	if !anotherConnectionMayPass(err) {
+		return conn, v, err
+	}
+	// The publication may have come from the same replica.
+	e.client.CloseIdleConnections()
+	first := err
+	if conn, v, err = e.dialAttested(ctx); err != nil {
+		return nil, nil, fmt.Errorf("%w; after attesting again on new connections: %w", first, err)
+	}
+	return conn, v, nil
+}
+
+// errServingLeafRenewed: the router names another serving leaf than the
+// connection presents, as when it renews the leaf after the TLS handshake.
+var errServingLeafRenewed = errors.New("the router names another serving leaf than this connection presents")
+
+// notingRenewedLeaf adds errServingLeafRenewed to the evidence failure err
+// when the bundle names another serving leaf than servingLeaf. The name is
+// unauthenticated, so it decides only whether to try a new connection.
+func notingRenewedLeaf(err error, bundle attestationBundle, servingLeaf *x509.Certificate) error {
+	if !namesAnotherServingLeaf(bundle, servingLeaf) {
+		return err
+	}
+	return fmt.Errorf("%w (%w)", err, errServingLeafRenewed)
+}
+
+// namesAnotherServingLeaf reports whether the bundle names a serving leaf
+// other than servingLeaf.
+func namesAnotherServingLeaf(bundle attestationBundle, servingLeaf *x509.Certificate) bool {
+	return bundle.ServingLeafSHA256 != "" && bundle.ServingLeafSHA256 != leafDigest(servingLeaf)
+}
+
+// anotherConnectionMayPass reports whether err came from router state a new
+// connection need not meet: a replica that has not applied the newest
+// manifest, or a serving leaf renewed after the handshake.
+func anotherConnectionMayPass(err error) bool {
+	return errors.Is(err, routes.ErrRollback) || errors.Is(err, errRouteMismatch) || errors.Is(err, errServingLeafRenewed)
+}
+
+// Attest is Dial on a connection it then closes.
+func (e *EndpointAttester) Attest(ctx context.Context) (*SessionVerdict, error) {
+	conn, v, err := e.Dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.Close()
+	return v, nil
+}
+
+func (e *EndpointAttester) dialAttested(ctx context.Context) (*tls.Conn, *SessionVerdict, error) {
+	conn, err := e.dial(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: dial: %w", ErrUnavailable, err)
+	}
+	v, err := e.attestConn(ctx, conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return conn, v, nil
+}
+
+func (e *EndpointAttester) attest(ctx context.Context, send func(*http.Request) (*http.Response, error)) (*SessionVerdict, error) {
 	// Platform pins are resolved before any network round trip: a malformed
 	// image manifest, RTMR[3] pin, or TCB floor is a configuration error. The
 	// manifest is re-read per attestation so an updated file takes effect (the
@@ -337,9 +415,9 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb: build request: %w", err)
 	}
-	resp, err := e.client.Do(req)
+	resp, err := send(req)
 	if err != nil {
-		return nil, fmt.Errorf("attest-lb: fetch attestation: %w", err)
+		return nil, fmt.Errorf("%w: fetch attestation: %w", ErrUnavailable, err)
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -348,6 +426,9 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 	}()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if routerCannotAttestNow(resp.StatusCode) {
+			return nil, fmt.Errorf("%w: attestation endpoint returned %d: %s", ErrUnavailable, resp.StatusCode, body)
+		}
 		return nil, fmt.Errorf("attest-lb: attestation endpoint returned %d: %s", resp.StatusCode, body)
 	}
 
@@ -413,7 +494,7 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 	reportData := attestLBReportData(bundle.FrontDoorMode, nonce, servingLeaf.Raw, meshLeaf.Raw, committedCA.Raw, routeDigest[:])
 	res, err := verifyEvidence(bundle, reportData[:], pins)
 	if err != nil {
-		return nil, err
+		return nil, notingRenewedLeaf(err, bundle, servingLeaf)
 	}
 	measurement := res.Claims.LaunchDigest
 	// The platform the policies dispatch on is the VERIFIED result's tag — the
@@ -1065,6 +1146,12 @@ func checkVerificationResult(res *teetypes.VerificationResult, platform string) 
 		return fmt.Errorf("attest-lb (%s): evidence does not bind the attest-lb transcript (report_data mismatch)", platform)
 	}
 	return nil
+}
+
+// leafDigest is SHA-256 of cert's DER, unpadded base64url.
+func leafDigest(cert *x509.Certificate) string {
+	sum := sha256.Sum256(cert.Raw)
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 // servingLeafFromTLS returns the exact peer leaf certificate of the connection.

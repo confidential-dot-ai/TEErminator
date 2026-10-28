@@ -278,15 +278,7 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 		}
 		fallbackTLS = attestTLS.Clone()
 
-		// The attester fetches the bundle itself, over a transport built with
-		// the same trust construction the proxy forwards over, so the leaf it
-		// observes (and the evidence binds) is the one traffic rides.
-		attestClient := &http.Client{
-			Transport: &http.Transport{TLSClientConfig: attestTLS.Clone()},
-			Timeout:   30 * time.Second,
-		}
-		baseURL := target.Scheme + "://" + target.Host
-		ea, err = verifier.NewEndpointAttester(baseURL, attestClient, opts.Remote, pinnedCAs, tlsCfg.RootCAs)
+		ea, err = verifier.NewEndpointAttester(target, attestTLS, opts.Remote, pinnedCAs)
 		if err != nil {
 			return nil, err
 		}
