@@ -57,10 +57,7 @@ func CheckRemote(ctx context.Context, r config.Remote, extraCAs []config.Cert) C
 		}
 		attestTLS := webPKITLS.Clone()
 		attestTLS.InsecureSkipVerify = true // trust is checked after the mode is attested
-		tr := &http.Transport{TLSClientConfig: attestTLS}
-		defer tr.CloseIdleConnections()
-		client := &http.Client{Transport: tr}
-		ea, err := verifier.NewEndpointAttester(origin, client, r, pinnedCAs, webPKITLS.RootCAs)
+		ea, err := verifier.NewEndpointAttester(target, attestTLS, r, pinnedCAs)
 		if err != nil {
 			return CheckResult{config.StatusFailed, err.Error()}
 		}

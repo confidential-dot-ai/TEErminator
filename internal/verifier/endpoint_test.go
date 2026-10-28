@@ -258,7 +258,25 @@ type bundleSpec struct {
 // serving leaf the evidence commits to.
 func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 	t.Helper()
-	handler := func(w http.ResponseWriter, r *http.Request) {
+	return f.serve(t, f.handler(spec))
+}
+
+// serve runs handler over TLS with the fixture's serving certificate.
+func (f *lbFixture) serve(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewUnstartedServer(handler)
+	ts.TLS = &tls.Config{Certificates: []tls.Certificate{{
+		Certificate: [][]byte{f.serving.cert.Raw},
+		PrivateKey:  f.serving.key,
+	}}}
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// handler answers as the fixture LB described by spec.
+func (f *lbFixture) handler(spec bundleSpec) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if spec.observe != nil {
 			spec.observe(r)
 		}
@@ -370,14 +388,6 @@ func (f *lbFixture) newServer(t *testing.T, spec bundleSpec) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(body)
 	}
-	ts := httptest.NewUnstartedServer(http.HandlerFunc(handler))
-	ts.TLS = &tls.Config{Certificates: []tls.Certificate{{
-		Certificate: [][]byte{f.serving.cert.Raw},
-		PrivateKey:  f.serving.key,
-	}}}
-	ts.StartTLS()
-	t.Cleanup(ts.Close)
-	return ts
 }
 
 // stubClaims parameterizes the evidence stub's verified result; the zero value
@@ -460,14 +470,26 @@ func initDataMatch(pin, committed []byte) *bool {
 // entirely to the attest-lb verification of the observed leaf.
 func newLBAttester(t *testing.T, ts *httptest.Server, remote config.Remote, pinnedCAs []*x509.Certificate) *EndpointAttester {
 	t.Helper()
-	client := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-	}
-	ea, err := NewEndpointAttester(ts.URL, client, remote, pinnedCAs, nil)
+	ea, err := NewEndpointAttester(mustParseURL(t, ts.URL), insecureTLS(nil), remote, pinnedCAs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return ea
+}
+
+// insecureTLS trusts any certificate in the handshake, where the attester,
+// not the handshake, judges the serving leaf; roots serve acme mode.
+func insecureTLS(roots *x509.CertPool) *tls.Config {
+	return &tls.Config{InsecureSkipVerify: true, RootCAs: roots}
+}
+
+func mustParseURL(t *testing.T, rawURL string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }
 
 // measuredRemote is the minimal valid attest-lb policy; the uppercase digest
@@ -498,10 +520,7 @@ func TestAttestLBRequestShape(t *testing.T) {
 		got = &u
 	}})
 
-	client := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-	}
-	ea, err := NewEndpointAttester(ts.URL+"/api/v1?pq=false&binding=c8s-verify/v1", client, measuredRemote(), nil, nil)
+	ea, err := NewEndpointAttester(mustParseURL(t, ts.URL+"/api/v1?pq=false&binding=c8s-verify/v1"), insecureTLS(nil), measuredRemote(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,10 +614,9 @@ func TestAttestLBAcmeFrontDoor(t *testing.T) {
 	ts := f.newServer(t, bundleSpec{frontDoorMode: frontDoorModeACME})
 	remote := measuredRemote()
 	remote.ServerName = "serving-leaf"
-	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	roots := x509.NewCertPool()
 	roots.AddCert(webPKICA.cert)
-	ea, err := NewEndpointAttester(ts.URL, client, remote, nil, roots)
+	ea, err := NewEndpointAttester(mustParseURL(t, ts.URL), insecureTLS(roots), remote, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,10 +632,9 @@ func TestAttestLBAcmeRejectsUntrustedServingCertificate(t *testing.T) {
 	ts := f.newServer(t, bundleSpec{frontDoorMode: frontDoorModeACME})
 	remote := measuredRemote()
 	remote.ServerName = "serving-leaf"
-	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	wrongRoots := x509.NewCertPool()
 	wrongRoots.AddCert(mintCA(t, "wrong-root").cert)
-	ea, err := NewEndpointAttester(ts.URL, client, remote, nil, wrongRoots)
+	ea, err := NewEndpointAttester(mustParseURL(t, ts.URL), insecureTLS(wrongRoots), remote, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,10 +650,9 @@ func TestAttestLBAcmeRejectsWrongServerName(t *testing.T) {
 	ts := f.newServer(t, bundleSpec{frontDoorMode: frontDoorModeACME})
 	remote := measuredRemote()
 	remote.ServerName = "wrong.example"
-	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	roots := x509.NewCertPool()
 	roots.AddCert(webPKICA.cert)
-	ea, err := NewEndpointAttester(ts.URL, client, remote, nil, roots)
+	ea, err := NewEndpointAttester(mustParseURL(t, ts.URL), insecureTLS(roots), remote, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1532,8 +1548,7 @@ func TestAttestLBDoesNotFollowRedirects(t *testing.T) {
 	}))
 	t.Cleanup(redirector.Close)
 
-	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	ea, err := NewEndpointAttester(redirector.URL, client, measuredRemote(), nil, nil)
+	ea, err := NewEndpointAttester(mustParseURL(t, redirector.URL), insecureTLS(nil), measuredRemote(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1550,8 +1565,7 @@ func TestAttestLBNon200(t *testing.T) {
 		http.Error(w, "boom", http.StatusBadGateway)
 	}))
 	t.Cleanup(ts.Close)
-	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	ea, err := NewEndpointAttester(ts.URL, client, measuredRemote(), nil, nil)
+	ea, err := NewEndpointAttester(mustParseURL(t, ts.URL), insecureTLS(nil), measuredRemote(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

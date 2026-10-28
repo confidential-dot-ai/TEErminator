@@ -100,17 +100,23 @@ func (p *publisher) serve(w http.ResponseWriter, _ *http.Request) {
 // name a manifest routes.
 func newRoutedAttester(t *testing.T, baseURL string, addr func() string, remote config.Remote) *EndpointAttester {
 	t.Helper()
-	client := &http.Client{Transport: &http.Transport{
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
-		DisableKeepAlives: true,
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, network, addr())
-		},
-	}}
-	ea, err := NewEndpointAttester(baseURL, client, remote, nil, nil)
+	dial := func(ctx context.Context) (*tls.Conn, error) {
+		raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr())
+		if err != nil {
+			return nil, err
+		}
+		conn := tls.Client(raw, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}})
+		if err := conn.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		return conn, nil
+	}
+	ea, err := NewEndpointAttester(mustParseURL(t, baseURL), insecureTLS(nil), remote, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	ea.dial = dial
 	return ea
 }
 
