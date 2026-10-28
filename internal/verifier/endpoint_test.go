@@ -1574,23 +1574,6 @@ func TestAttestLBNon200(t *testing.T) {
 	}
 }
 
-func TestSessionCachePinning(t *testing.T) {
-	c := NewSessionCache(time.Minute)
-	if _, fresh, _ := c.FreshSession("r"); fresh {
-		t.Fatal("empty cache should not be fresh")
-	}
-	want := [32]byte{1, 2, 3}
-	c.RecordPass("r", c.Now(), want, time.Now().Add(time.Hour))
-	leaf, fresh, ok := c.FreshSession("r")
-	if !fresh || !ok || leaf != want {
-		t.Fatalf("FreshSession = (%x, %v, %v), want (%x, true, true)", leaf, fresh, ok, want)
-	}
-	c.Invalidate("r")
-	if _, fresh, _ := c.FreshSession("r"); fresh {
-		t.Fatal("invalidated entry should not be fresh")
-	}
-}
-
 func TestAttestLBTDXTCBStatus(t *testing.T) {
 	accepted := []string{"UpToDate", "SWHardeningNeeded"}
 	reported := func(s teetypes.TdxTcbStatus) *teetypes.DcapVerificationStatus {

@@ -55,11 +55,11 @@ func TestAttestationFailureDoesNotReadPromptBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr, err := newH3Transport(target, Options{
+	tr, err := newForwarder(target, Options{
 		Remote: config.Remote{Mode: config.AttestEndpoint},
 	})
 	if err != nil {
-		t.Fatalf("newH3Transport: %v", err)
+		t.Fatalf("newForwarder: %v", err)
 	}
 	defer func() { _ = tr.Close() }()
 

@@ -129,8 +129,8 @@ type SessionVerdict struct {
 	LeafSHA256 [32]byte
 	// LeafNotAfter is the serving leaf's expiry. A verdict says nothing past
 	// it — the certificate it is scoped to has stopped being valid — so the
-	// verdict cache bounds reuse at min(ReattestInterval, LeafNotAfter) rather
-	// than at the caller-settable interval alone.
+	// proxy stops sending new requests on its connection by then, whatever
+	// the caller-settable interval.
 	LeafNotAfter time.Time
 	// RTMRsPinned lists the TDX runtime measurement registers this verdict
 	// enforced, as "<index>:<hex>". On TDX the launch-digest allowlist covers
@@ -378,9 +378,7 @@ func (e *EndpointAttester) dialAttested(ctx context.Context) (*tls.Conn, *Sessio
 func (e *EndpointAttester) attest(ctx context.Context, send func(*http.Request) (*http.Response, error)) (*SessionVerdict, error) {
 	// Platform pins are resolved before any network round trip: a malformed
 	// image manifest, RTMR[3] pin, or TCB floor is a configuration error. The
-	// manifest is re-read per attestation so an updated file takes effect (the
-	// verdict-cache key hashes its content, so a change also invalidates any
-	// cached verdict).
+	// manifest is re-read per attestation so an updated file takes effect.
 	pins, err := loadPlatformPins(e.remote)
 	if err != nil {
 		return nil, fmt.Errorf("attest-lb: %w", err)
