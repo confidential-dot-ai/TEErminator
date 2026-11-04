@@ -167,7 +167,7 @@ func RemoteKey(host string, r config.Remote, files map[string][]byte, pinnedCAs 
 
 	meas := make([]string, len(r.Measurements))
 	for i, m := range r.Measurements {
-		meas[i] = strings.ToLower(m)
+		meas[i] = strings.ToLower(strings.TrimSpace(m))
 	}
 	sorted('m', meas)
 	field('w', []byte(r.WorkloadName))

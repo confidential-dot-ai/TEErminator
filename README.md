@@ -100,7 +100,8 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     ("that particular cluster, not a genuine clone").
   - **Measurements are mandatory.** An empty `--measurements` allowlist is a
     configuration error in this mode, never a permissive default — as is an entry that
-    is not a launch digest, so `--measurements ""` cannot stand in for a policy.
+    is not a SHA-384 launch digest (96 hex chars), so `--measurements ""` cannot stand
+    in for a policy.
     `--image-manifest` is the other way to pin the launch digest, and supplies it in
     full; the two flags are mutually exclusive.
   - **Workload pin.** `--workload <name>` requires the committed mesh leaf to carry a
