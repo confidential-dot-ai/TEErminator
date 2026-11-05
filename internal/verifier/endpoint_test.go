@@ -563,6 +563,12 @@ func TestAttestLBHappyPath(t *testing.T) {
 		if want := sha256.Sum256(f.serving.cert.Raw); v.LeafSHA256 != want {
 			t.Errorf("LeafSHA256 does not pin the exact serving-leaf DER")
 		}
+		if want := sha256.Sum256(f.mesh.cert.Raw); v.MeshLeafSHA256 != want {
+			t.Errorf("MeshLeafSHA256 does not pin the exact mesh-leaf DER")
+		}
+		if !v.MeshLeafNotAfter.Equal(f.mesh.cert.NotAfter) {
+			t.Errorf("MeshLeafNotAfter = %v, want %v", v.MeshLeafNotAfter, f.mesh.cert.NotAfter)
+		}
 		if v.WorkloadName != "" || v.AllowlistVersion != "" {
 			t.Errorf("unpinned verdict carries workload fields: %+v", v)
 		}
@@ -1580,11 +1586,11 @@ func TestSessionCachePinning(t *testing.T) {
 	if _, fresh, _ := c.FreshSession("r"); fresh {
 		t.Fatal("empty cache should not be fresh")
 	}
-	want := [32]byte{1, 2, 3}
+	want := SessionPin{Leaf: [32]byte{1, 2, 3}, MeshLeaf: [32]byte{4, 5, 6}}
 	c.RecordPass("r", c.Now(), want, time.Now().Add(time.Hour))
-	leaf, fresh, ok := c.FreshSession("r")
-	if !fresh || !ok || leaf != want {
-		t.Fatalf("FreshSession = (%x, %v, %v), want (%x, true, true)", leaf, fresh, ok, want)
+	pin, fresh, ok := c.FreshSession("r")
+	if !fresh || !ok || pin != want {
+		t.Fatalf("FreshSession = (%+v, %v, %v), want (%+v, true, true)", pin, fresh, ok, want)
 	}
 	c.Invalidate("r")
 	if _, fresh, _ := c.FreshSession("r"); fresh {

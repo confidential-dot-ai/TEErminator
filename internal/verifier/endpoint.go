@@ -120,6 +120,14 @@ type SessionVerdict struct {
 	// verdict cache bounds reuse at min(ReattestInterval, LeafNotAfter) rather
 	// than at the caller-settable interval alone.
 	LeafNotAfter time.Time
+	// MeshLeafSHA256 is the SHA-256 of the attested mesh-leaf DER, the
+	// certificate whose matched-workload stamp the verdict read. In acme
+	// front-door mode it is not the serving leaf: the router renews it (with a
+	// new stamp) when the allowlist changes while the serving leaf stays, so
+	// the proxy compares it on every new upstream connection.
+	MeshLeafSHA256 [32]byte
+	// MeshLeafNotAfter is the mesh leaf's expiry.
+	MeshLeafNotAfter time.Time
 	// RTMRsPinned lists the TDX runtime measurement registers this verdict
 	// enforced, as "<index>:<hex>". On TDX the launch-digest allowlist covers
 	// only MRTD (the TDVF firmware): without RTMR[1]/[2] the guest kernel and
@@ -467,13 +475,15 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 	}
 
 	v := &SessionVerdict{
-		Measurement:  measurement,
-		Platform:     string(platform),
-		TrustMode:    TrustDeploymentClass,
-		Profile:      ProfileCAVouched,
-		LeafSHA256:   sha256.Sum256(servingLeaf.Raw),
-		LeafNotAfter: servingLeaf.NotAfter,
-		RouteDigest:  bundle.RouteDigest,
+		Measurement:      measurement,
+		Platform:         string(platform),
+		TrustMode:        TrustDeploymentClass,
+		Profile:          ProfileCAVouched,
+		LeafSHA256:       sha256.Sum256(servingLeaf.Raw),
+		LeafNotAfter:     servingLeaf.NotAfter,
+		MeshLeafSHA256:   meshLeafSum,
+		MeshLeafNotAfter: meshLeaf.NotAfter,
+		RouteDigest:      bundle.RouteDigest,
 	}
 
 	// (i') Platform-complete pins: TDX runtime registers and the SNP TCB floor

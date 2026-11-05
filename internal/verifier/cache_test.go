@@ -20,8 +20,8 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 	}
 
 	spki := [32]byte{4, 2}
-	c.RecordPass("host", c.Now(), spki, now.Add(time.Hour))
-	if got, fresh, ok := c.FreshSession("host"); !fresh || !ok || got != spki {
+	c.RecordPass("host", c.Now(), SessionPin{Leaf: spki}, now.Add(time.Hour))
+	if got, fresh, ok := c.FreshSession("host"); !fresh || !ok || got.Leaf != spki {
 		t.Fatal("expected fresh+ok pinned verdict right after RecordPass")
 	}
 
@@ -63,20 +63,20 @@ func TestRecordKeepsLatestAttempt(t *testing.T) {
 		wantOK bool
 	}{
 		{"failure that began before the pass", func(c *SessionCache) {
-			c.RecordPass("host", later, leaf, now.Add(time.Hour))
+			c.RecordPass("host", later, SessionPin{Leaf: leaf}, now.Add(time.Hour))
 			c.RecordFailure("host", earlier, errors.New("boom"))
 		}, true},
 		{"failure that began after the pass", func(c *SessionCache) {
-			c.RecordPass("host", earlier, leaf, now.Add(time.Hour))
+			c.RecordPass("host", earlier, SessionPin{Leaf: leaf}, now.Add(time.Hour))
 			c.RecordFailure("host", later, errors.New("boom"))
 		}, false},
 		{"pass that began before the failure", func(c *SessionCache) {
 			c.RecordFailure("host", later, errors.New("boom"))
-			c.RecordPass("host", earlier, leaf, now.Add(time.Hour))
+			c.RecordPass("host", earlier, SessionPin{Leaf: leaf}, now.Add(time.Hour))
 		}, false},
 		{"pass that began after the failure", func(c *SessionCache) {
 			c.RecordFailure("host", earlier, errors.New("boom"))
-			c.RecordPass("host", later, leaf, now.Add(time.Hour))
+			c.RecordPass("host", later, SessionPin{Leaf: leaf}, now.Add(time.Hour))
 		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,7 +103,7 @@ func TestExpiredServedLeafForcesReverify(t *testing.T) {
 	c.now = func() time.Time { return now }
 
 	leaf := [32]byte{7}
-	c.RecordPass("host", c.Now(), leaf, now.Add(10*time.Second))
+	c.RecordPass("host", c.Now(), SessionPin{Leaf: leaf}, now.Add(10*time.Second))
 	if _, fresh, ok := c.FreshSession("host"); !fresh || !ok {
 		t.Fatal("verdict should be fresh inside both the TTL and the leaf validity")
 	}
@@ -116,7 +116,7 @@ func TestExpiredServedLeafForcesReverify(t *testing.T) {
 
 	// The TTL still binds independently: a long-lived leaf does not extend it.
 	now = time.Unix(2000, 0)
-	c.RecordPass("host", c.Now(), leaf, now.Add(24*time.Hour))
+	c.RecordPass("host", c.Now(), SessionPin{Leaf: leaf}, now.Add(24*time.Hour))
 	now = now.Add(time.Hour + time.Second)
 	if _, fresh, _ := c.FreshSession("host"); fresh {
 		t.Fatal("a long-lived leaf must not extend the re-attest interval")

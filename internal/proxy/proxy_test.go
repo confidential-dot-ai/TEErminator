@@ -792,8 +792,8 @@ func TestForwardingPinSurvivesCacheInvalidation(t *testing.T) {
 	defer func() { _ = tr.Close() }()
 
 	pin := leafHashOf(attested.Certificate())
-	tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), pin, time.Now().Add(time.Hour))
-	forwarding := tr.transportFor(pin)
+	tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), verifier.SessionPin{Leaf: pin}, time.Now().Add(time.Hour))
+	forwarding := tr.transportFor(verifier.SessionPin{Leaf: pin})
 
 	// The race: the verdict vanishes after the caller decided on it and before
 	// the handshake runs.
@@ -848,7 +848,7 @@ func TestHandshakePinBlocksBeforeSend(t *testing.T) {
 		defer func() { _ = tr.Close() }()
 		// Seed a fresh passing verdict directly so the round trip skips the
 		// attester and exercises only the handshake-time pin.
-		tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), pin, time.Now().Add(time.Hour))
+		tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), verifier.SessionPin{Leaf: pin}, time.Now().Add(time.Hour))
 		req, _ := http.NewRequest("GET", backend.URL, nil)
 		resp, err := tr.RoundTrip(req)
 		if err != nil {

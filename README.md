@@ -84,9 +84,26 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   The verdict is then **pinned to the exact
   serving-leaf DER** (not just its key): a substituted certificate — even one reusing the
   attested key — refuses the handshake and forces re-attestation. The daemon reuses a
-  passing verdict for one minute, and never past the serving leaf's expiry: new upstream
-  connections in that window are admitted only if they present the same leaf, and the
-  first request after it re-attests. A failed attestation is kept for the same minute.
+  passing verdict for one minute, and never past the expiry of the serving leaf or the
+  mesh leaf: new upstream connections in that window are admitted only if they present
+  the same leaf, and the first request after it re-attests. A failed attestation is kept
+  for the same minute.
+
+  In `acme` mode the serving leaf is not the mesh leaf, so the verdict is also pinned to
+  the mesh leaf, which carries the matched-workload stamp. An allowlist upload renews the
+  mesh leaf but not the serving leaf. Before each new upstream connection, TEErminator
+  gets the router's current mesh leaf from `/.well-known/cds-cert.pem` (the c8s chart's
+  `router.discovery.cdsCertPath` default) over a separate connection pinned to the
+  attested serving leaf, and compares the SHA-256 of its first PEM block with the attested
+  mesh leaf. If they differ, nothing is sent: the verdict is dropped, the session
+  re-attests, and the request is sent under the new verdict (a request whose body was
+  already read is refused instead). If the mesh leaf cannot be read (an error status, no
+  PEM certificate, a TLS or network error), the request is refused and the verdict is
+  dropped. A request on an open keep-alive connection is checked the same way before it is
+  sent when the last check is more than 5 seconds old, with one fetch per verdict at a time
+  shared by concurrent requests. So a new request is sent under an old stamp for at most
+  about 5 seconds after the router starts to serve its renewed mesh leaf. In `cds` mode
+  the router serves its mesh leaf, so the serving-leaf pin covers it and there is no fetch.
 
   Key properties:
   - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is

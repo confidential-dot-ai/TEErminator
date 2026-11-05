@@ -25,7 +25,10 @@ import (
 // "longer-lived TLS sessions need not attest every request" refinement: a
 // cached verdict is only reused while the connection still presents the exact
 // attested leaf (the transport's handshake and response-time pins); a leaf
-// change invalidates it and forces re-attestation.
+// change invalidates it and forces re-attestation. In acme front-door mode the
+// verdict is also pinned to the router's mesh leaf, which carries the
+// matched-workload stamp: the proxy compares it on every new upstream
+// connection (SessionPin.MeshLeaf).
 type SessionCache struct {
 	ttl   time.Duration
 	now   func() time.Time
@@ -39,10 +42,30 @@ type verdict struct {
 	started time.Time
 	verifAt time.Time
 	err     error
-	leaf    [32]byte // SHA-256 of the attested serving-leaf DER the session is pinned to
-	// notAfter is that leaf's expiry, zero when the verdict pins no leaf (a
-	// failure). A verdict is scoped to one certificate and cannot outlive it.
+	pin     SessionPin
+	// notAfter is the expiry of the pinned leaves, zero when the verdict pins
+	// no leaf (a failure). A verdict is scoped to its certificates and cannot
+	// outlive them.
 	notAfter time.Time
+}
+
+// SessionPin names the certificates a passing attest-lb verdict is scoped to.
+type SessionPin struct {
+	// Leaf is the SHA-256 of the attested serving-leaf DER: the certificate the
+	// router presents on its public TLS port.
+	Leaf [32]byte
+	// MeshLeaf is the SHA-256 of the attested mesh-leaf DER: the certificate
+	// that carries the matched-workload stamp. It is zero when the verdict does
+	// not pin it.
+	MeshLeaf [32]byte
+}
+
+// MeshLeafSeparate reports whether the mesh leaf is a certificate other than
+// the serving leaf. Only then does it need a check of its own: in cds
+// front-door mode the router serves its mesh leaf, so the serving-leaf pin
+// already covers it.
+func (p SessionPin) MeshLeafSeparate() bool {
+	return p.MeshLeaf != [32]byte{} && p.MeshLeaf != p.Leaf
 }
 
 // NewSessionCache returns a cache whose verdicts are valid for ttl.
@@ -55,11 +78,11 @@ func NewSessionCache(ttl time.Duration) *SessionCache {
 func (c *SessionCache) Now() time.Time { return c.now() }
 
 // RecordPass stores a passing verdict for an attestation that began at
-// started, with the SHA-256 of the attested serving-leaf DER the session is
-// pinned to and that leaf's expiry.
+// started, with the certificates the session is pinned to and the earliest of
+// their expiries.
 // It reports whether it stored the verdict rather than keeping a newer one.
-func (c *SessionCache) RecordPass(key string, started time.Time, leaf [32]byte, notAfter time.Time) bool {
-	return c.record(key, verdict{ok: true, started: started, leaf: leaf, notAfter: notAfter})
+func (c *SessionCache) RecordPass(key string, started time.Time, pin SessionPin, notAfter time.Time) bool {
+	return c.record(key, verdict{ok: true, started: started, pin: pin, notAfter: notAfter})
 }
 
 // RecordFailure stores a failed attestation that began at started.
@@ -80,30 +103,30 @@ func (c *SessionCache) record(key string, v verdict) bool {
 	return true
 }
 
-// FreshSession returns the pinned leaf hash for a still-valid passing verdict.
+// FreshSession returns the pin of a still-valid passing verdict.
 // fresh is false when there is no unexpired verdict; ok reports whether that
 // verdict passed.
 //
-// Reuse is bounded by min(ttl, the pinned leaf's NotAfter). The ttl alone is
+// Reuse is bounded by min(ttl, the pinned leaves' NotAfter). The ttl alone is
 // not enough: it is the caller-settable ReattestInterval, with no ceiling, so a
 // generous interval would otherwise keep a verdict — and the handshake pin
 // derived from it — alive past the point where the certificate it is scoped to
 // stopped being valid.
-func (c *SessionCache) FreshSession(key string) (leaf [32]byte, fresh, ok bool) {
+func (c *SessionCache) FreshSession(key string) (pin SessionPin, fresh, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	v, present := c.state[key]
 	if !present {
-		return [32]byte{}, false, false
+		return SessionPin{}, false, false
 	}
 	now := c.now()
 	if now.Sub(v.verifAt) > c.ttl {
-		return [32]byte{}, false, false
+		return SessionPin{}, false, false
 	}
 	if !v.notAfter.IsZero() && !now.Before(v.notAfter) {
-		return [32]byte{}, false, false
+		return SessionPin{}, false, false
 	}
-	return v.leaf, true, v.ok
+	return v.pin, true, v.ok
 }
 
 // Invalidate drops any cached verdict for key, forcing re-verification.
