@@ -63,8 +63,10 @@ mismatches, both digests are printed with the version counters that tell churn
 apart from a substituted document.
 
 Pass --pin to store the written file as the remote's --allowlist pin, which is
-a replacement for any existing allowlist pin. The other attestation checks
-still apply, and every later handshake checks the stamp against the saved file.
+the bootstrap this command exists for: fetch the document the cluster attested,
+then have every later handshake check the stamp against it. --pin replaces any
+existing pin, so the fetch is not checked against the old one; every other
+attestation check still applies.
 
   $ %s allowlist fetch 127.0.0.1:8080 -o ./allowlist.json --pin`, name),
 		Args: cobra.ExactArgs(1),
@@ -88,11 +90,13 @@ still apply, and every later handshake checks the stamp against the saved file.
 			ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
 			defer cancel()
 
-			verificationRemote := *r
+			// --pin replaces the stored pin, so the old file must not reject
+			// the new document; every other check still applies.
+			check := *r
 			if pin {
-				verificationRemote.AllowlistPath = ""
+				check.AllowlistPath = ""
 			}
-			res, err := proxy.FetchAllowlist(ctx, verificationRemote, cfg.Certs)
+			res, err := proxy.FetchAllowlist(ctx, check, cfg.Certs)
 			if err != nil {
 				return err
 			}
@@ -105,13 +109,15 @@ still apply, and every later handshake checks the stamp against the saved file.
 			if !pin {
 				return nil
 			}
-			if r.AllowlistPath != out {
-				r.AllowlistPath = out
-				if err := cfg.Save(); err != nil {
-					return fmt.Errorf("saving config: %w", err)
-				}
+			stored, err := validateWorkloadFlags(r.WorkloadName, out)
+			if err != nil {
+				return err
 			}
-			fmt.Printf("Pinned %s as the allowlist for %s: every attest-lb handshake now requires the stamp to name this file's exact bytes.\n", out, r.Local)
+			r.AllowlistPath = stored
+			if err := cfg.Save(); err != nil {
+				return fmt.Errorf("saving config: %w", err)
+			}
+			fmt.Printf("Pinned %s as the allowlist for %s: every attest-lb handshake now requires the stamp to name this file's exact bytes.\n", stored, r.Local)
 			return nil
 		},
 	}
@@ -119,7 +125,7 @@ still apply, and every later handshake checks the stamp against the saved file.
 	f := cmd.Flags()
 	f.StringVarP(&output, "output", "o", "", "file to write the checked allowlist document to (required); written verbatim, and only if the check passes")
 	f.BoolVar(&force, "force", false, "overwrite an existing output file (refused by default, and named explicitly when that file is the remote's current --allowlist pin)")
-	f.BoolVar(&pin, "pin", false, "after validation, store the written file as the remote's --allowlist pin, replacing any existing pin")
+	f.BoolVar(&pin, "pin", false, "after a successful fetch, store the written file as the remote's --allowlist pin, replacing any existing pin")
 	f.DurationVar(&timeout, "timeout", 30*time.Second, "overall timeout for the attestation and the fetch")
 	// Cannot fail: the flag is registered right above.
 	_ = cmd.MarkFlagRequired("output")
