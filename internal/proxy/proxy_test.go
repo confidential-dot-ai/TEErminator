@@ -839,15 +839,18 @@ func TestAttestDialsPerAttestation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr, err := newH3Transport(target, Options{Remote: config.Remote{Mode: config.AttestEndpoint}, ReattestInterval: time.Minute})
+	tr, err := newH3Transport(target, Options{
+		Remote:           config.Remote{Mode: config.AttestEndpoint, Measurements: []string{strings.Repeat("a1", 48)}},
+		ReattestInterval: time.Minute,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tr.Close() }()
 
 	for range 2 {
-		if _, err := tr.ea.Attest(context.Background()); err == nil {
-			t.Fatal("want the endpoint's error")
+		if _, err := tr.ea.Attest(context.Background()); err == nil || !strings.Contains(err.Error(), "returned 503") {
+			t.Fatalf("Attest() = %v, want the endpoint's 503", err)
 		}
 	}
 	if got := dials.Load(); got != 2 {
