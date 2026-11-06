@@ -15,25 +15,25 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 	c := NewSessionCache(time.Minute)
 	c.now = func() time.Time { return now }
 
-	if _, fresh, _ := c.FreshSession("host"); fresh {
+	if _, _, fresh, _ := c.FreshSession("host"); fresh {
 		t.Fatal("expected no verdict before first RecordPass")
 	}
 
 	spki := [32]byte{4, 2}
-	c.RecordPass("host", c.Now(), spki, now.Add(time.Hour))
-	if got, fresh, ok := c.FreshSession("host"); !fresh || !ok || got != spki {
+	c.RecordPass("host", c.Now(), spki, now.Add(time.Hour), nil)
+	if got, _, fresh, ok := c.FreshSession("host"); !fresh || !ok || got != spki {
 		t.Fatal("expected fresh+ok pinned verdict right after RecordPass")
 	}
 
 	// 30s later: still within the 60s TTL -> reused.
 	now = now.Add(30 * time.Second)
-	if _, fresh, ok := c.FreshSession("host"); !fresh || !ok {
+	if _, _, fresh, ok := c.FreshSession("host"); !fresh || !ok {
 		t.Fatal("expected verdict still fresh at 30s")
 	}
 
 	// 90s after RecordPass: expired -> must re-attest.
 	now = now.Add(60 * time.Second)
-	if _, fresh, _ := c.FreshSession("host"); fresh {
+	if _, _, fresh, _ := c.FreshSession("host"); fresh {
 		t.Fatal("expected verdict to expire past TTL")
 	}
 }
@@ -41,12 +41,12 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 func TestSessionCacheRemembersFailure(t *testing.T) {
 	c := NewSessionCache(time.Minute)
 	c.RecordFailure("bad", c.Now(), errors.New("boom"))
-	_, fresh, ok := c.FreshSession("bad")
+	_, _, fresh, ok := c.FreshSession("bad")
 	if !fresh || ok {
 		t.Fatalf("expected fresh failure verdict, got fresh=%v ok=%v", fresh, ok)
 	}
 	c.Invalidate("bad")
-	if _, fresh, _ := c.FreshSession("bad"); fresh {
+	if _, _, fresh, _ := c.FreshSession("bad"); fresh {
 		t.Fatal("expected Invalidate to clear the verdict")
 	}
 }
@@ -63,27 +63,27 @@ func TestRecordKeepsLatestAttempt(t *testing.T) {
 		wantOK bool
 	}{
 		{"failure that began before the pass", func(c *SessionCache) {
-			c.RecordPass("host", later, leaf, now.Add(time.Hour))
+			c.RecordPass("host", later, leaf, now.Add(time.Hour), nil)
 			c.RecordFailure("host", earlier, errors.New("boom"))
 		}, true},
 		{"failure that began after the pass", func(c *SessionCache) {
-			c.RecordPass("host", earlier, leaf, now.Add(time.Hour))
+			c.RecordPass("host", earlier, leaf, now.Add(time.Hour), nil)
 			c.RecordFailure("host", later, errors.New("boom"))
 		}, false},
 		{"pass that began before the failure", func(c *SessionCache) {
 			c.RecordFailure("host", later, errors.New("boom"))
-			c.RecordPass("host", earlier, leaf, now.Add(time.Hour))
+			c.RecordPass("host", earlier, leaf, now.Add(time.Hour), nil)
 		}, false},
 		{"pass that began after the failure", func(c *SessionCache) {
 			c.RecordFailure("host", earlier, errors.New("boom"))
-			c.RecordPass("host", later, leaf, now.Add(time.Hour))
+			c.RecordPass("host", later, leaf, now.Add(time.Hour), nil)
 		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := NewSessionCache(time.Minute)
 			c.now = func() time.Time { return now }
 			tc.record(c)
-			if _, fresh, ok := c.FreshSession("host"); !fresh || ok != tc.wantOK {
+			if _, _, fresh, ok := c.FreshSession("host"); !fresh || ok != tc.wantOK {
 				t.Errorf("FreshSession() = fresh %v, ok %v; want fresh, ok %v", fresh, ok, tc.wantOK)
 			}
 		})
@@ -103,22 +103,22 @@ func TestExpiredServedLeafForcesReverify(t *testing.T) {
 	c.now = func() time.Time { return now }
 
 	leaf := [32]byte{7}
-	c.RecordPass("host", c.Now(), leaf, now.Add(10*time.Second))
-	if _, fresh, ok := c.FreshSession("host"); !fresh || !ok {
+	c.RecordPass("host", c.Now(), leaf, now.Add(10*time.Second), nil)
+	if _, _, fresh, ok := c.FreshSession("host"); !fresh || !ok {
 		t.Fatal("verdict should be fresh inside both the TTL and the leaf validity")
 	}
 
 	// Past the leaf's NotAfter but well inside the one-hour TTL.
 	now = now.Add(11 * time.Second)
-	if _, fresh, _ := c.FreshSession("host"); fresh {
+	if _, _, fresh, _ := c.FreshSession("host"); fresh {
 		t.Fatal("a verdict must not outlive the serving leaf it is scoped to")
 	}
 
 	// The TTL still binds independently: a long-lived leaf does not extend it.
 	now = time.Unix(2000, 0)
-	c.RecordPass("host", c.Now(), leaf, now.Add(24*time.Hour))
+	c.RecordPass("host", c.Now(), leaf, now.Add(24*time.Hour), nil)
 	now = now.Add(time.Hour + time.Second)
-	if _, fresh, _ := c.FreshSession("host"); fresh {
+	if _, _, fresh, _ := c.FreshSession("host"); fresh {
 		t.Fatal("a long-lived leaf must not extend the re-attest interval")
 	}
 }
@@ -128,7 +128,8 @@ func TestExpiredServedLeafForcesReverify(t *testing.T) {
 func TestRemoteKey(t *testing.T) {
 	ca := mintCA(t, "key-test-ca")
 	otherCA := mintCA(t, "other-key-test-ca")
-	base := config.Remote{Mode: config.AttestEndpoint, Measurements: []string{"B2", "a1"}}
+	a1, b2 := launchDigestHex("a1"), launchDigestHex("b2")
+	base := config.Remote{Mode: config.AttestEndpoint, Measurements: []string{strings.ToUpper(b2), a1}}
 
 	k := RemoteKey("lb.example:443", base, nil, nil)
 	if !strings.HasPrefix(k, "lb.example:443|attest-lb|") {
@@ -138,9 +139,9 @@ func TestRemoteKey(t *testing.T) {
 		t.Fatal("key is not deterministic")
 	}
 	canon := base
-	canon.Measurements = []string{"A1", "b2"}
+	canon.Measurements = []string{" " + strings.ToUpper(a1) + " ", b2}
 	if k != RemoteKey("lb.example:443", canon, nil, nil) {
-		t.Fatal("key must be invariant under measurement order and case")
+		t.Fatal("key must be invariant under measurement order, case and whitespace")
 	}
 
 	variants := map[string]string{

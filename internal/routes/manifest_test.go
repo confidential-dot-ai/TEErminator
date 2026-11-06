@@ -217,7 +217,7 @@ func TestParseRejects(t *testing.T) {
 		{name: "lone low surrogate", raw: `{"schema":"\udc00"}`, wantErr: "unpaired Unicode surrogate"},
 		{name: "high surrogate before a non-surrogate", raw: `{"schema":"\ud800\u0041"}`, wantErr: "unpaired Unicode surrogate"},
 		{name: "high surrogate at the end of a string", raw: `{"schema":"\ud800"}`, wantErr: "unpaired Unicode surrogate"},
-		{name: "nesting beyond the limit", raw: strings.Repeat("[", maxDepth+1) + strings.Repeat("]", maxDepth+1), wantErr: "nesting depth"},
+		{name: "nesting beyond the limit", raw: strings.Repeat("[", maxDepth+1) + strings.Repeat("]", maxDepth+1), wantErr: "depth"},
 		{name: "truncated", raw: `{"schema": `, wantErr: "route manifest: JSON document is empty or truncated"},
 		{name: "trailing data", raw: `{} {}`, wantErr: "exactly one JSON document"},
 		{name: "duplicate key", raw: `{"schema":"c8s.routes/v1","schema":"c8s.routes/v1","revision":1,"notBefore":"2026-09-01T00:00:00Z","maxAgeSeconds":1,"hosts":{}}`, wantErr: "duplicate"},

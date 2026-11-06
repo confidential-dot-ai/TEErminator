@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -9,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -792,7 +794,7 @@ func TestForwardingPinSurvivesCacheInvalidation(t *testing.T) {
 	defer func() { _ = tr.Close() }()
 
 	pin := leafHashOf(attested.Certificate())
-	tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), pin, time.Now().Add(time.Hour))
+	tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), pin, time.Now().Add(time.Hour), nil)
 	forwarding := tr.transportFor(pin)
 
 	// The race: the verdict vanishes after the caller decided on it and before
@@ -848,7 +850,7 @@ func TestHandshakePinBlocksBeforeSend(t *testing.T) {
 		defer func() { _ = tr.Close() }()
 		// Seed a fresh passing verdict directly so the round trip skips the
 		// attester and exercises only the handshake-time pin.
-		tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), pin, time.Now().Add(time.Hour))
+		tr.cache.RecordPass(tr.remoteKey, tr.cache.Now(), pin, time.Now().Add(time.Hour), nil)
 		req, _ := http.NewRequest("GET", backend.URL, nil)
 		resp, err := tr.RoundTrip(req)
 		if err != nil {
@@ -979,9 +981,83 @@ func TestAttestationVerdictOrdering(t *testing.T) {
 			if n := hits.Load(); n != 0 {
 				t.Errorf("backend received %d requests, want 0", n)
 			}
-			if _, fresh, _ := tr.cache.FreshSession(tr.remoteKey); fresh != tc.wantFresh {
+			if _, _, fresh, _ := tr.cache.FreshSession(tr.remoteKey); fresh != tc.wantFresh {
 				t.Errorf("FreshSession() fresh = %v, want %v", fresh, tc.wantFresh)
 			}
 		})
+	}
+}
+
+// stampAttester passes with cert's leaf and a stamp naming allowlist,
+// counting its calls.
+type stampAttester struct {
+	cert      *x509.Certificate
+	allowlist []byte
+	calls     atomic.Int32
+}
+
+func (a *stampAttester) Attest(context.Context) (*verifier.SessionVerdict, error) {
+	a.calls.Add(1)
+	return &verifier.SessionVerdict{
+		LeafSHA256:   leafHashOf(a.cert),
+		LeafNotAfter: a.cert.NotAfter,
+		Stamp:        &verifier.MatchedWorkload{AllowlistDigest: a.allowlist},
+	}, nil
+}
+
+// TestExpectAllowlist: the verdict's stamp digest rides every forwarded
+// request, and only a 503 router_digest_changed drops the verdict so the next
+// request re-attests.
+func TestExpectAllowlist(t *testing.T) {
+	digest := bytes.Repeat([]byte{0x42}, 32)
+	var refusal atomic.Value
+	refusal.Store("")
+	var seen atomic.Value
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.Store(r.Header.Get(expectAllowlistHeader))
+		if body := refusal.Load().(string); body != "" {
+			http.Error(w, body, http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer backend.Close()
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := newH3Transport(target, Options{Remote: config.Remote{Mode: config.AttestEndpoint}, ReattestInterval: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tr.Close() }()
+	a := &stampAttester{cert: backend.Certificate(), allowlist: digest}
+	tr.ea = a
+	get := func() int {
+		t.Helper()
+		req, _ := http.NewRequest("GET", backend.URL, nil)
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip() = %v", err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := get(); code != http.StatusOK || seen.Load() != hex.EncodeToString(digest) {
+		t.Fatalf("GET = %d with %s %q, want 200 with %x", code, expectAllowlistHeader, seen.Load(), digest)
+	}
+	refusal.Store("sessions_busy")
+	get()
+	if get(); a.calls.Load() != 1 {
+		t.Fatalf("attestations after other 503s = %d, want 1", a.calls.Load())
+	}
+	refusal.Store(routerDigestChanged)
+	if code := get(); code != http.StatusServiceUnavailable {
+		t.Fatalf("GET after the router renewed = %d, want 503", code)
+	}
+	refusal.Store("")
+	if get(); a.calls.Load() != 2 {
+		t.Fatalf("attestations after router_digest_changed = %d, want 2", a.calls.Load())
 	}
 }

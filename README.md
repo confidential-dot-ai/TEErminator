@@ -88,6 +88,9 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   passing verdict for one minute, and never past the serving leaf's expiry: new upstream
   connections in that window are admitted only if they present the same leaf, and the
   first request after it re-attests. A failed attestation is kept for the same minute.
+  Forwarded requests carry the stamp's allowlist digest in `X-C8s-Expect-Allowlist`; a
+  503 `router_digest_changed` from a renewed c8s router (C8s#1489) drops the verdict, so
+  the next request re-attests. Older routers ignore the header.
 
   Key properties:
   - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is
@@ -101,7 +104,8 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     ("that particular cluster, not a genuine clone").
   - **Measurements are mandatory.** An empty `--measurements` allowlist is a
     configuration error in this mode, never a permissive default — as is an entry that
-    is not a launch digest, so `--measurements ""` cannot stand in for a policy.
+    is not a SHA-384 launch digest (96 hex chars), so `--measurements ""` cannot stand
+    in for a policy.
     `--image-manifest` is the other way to pin the launch digest, and supplies it in
     full; the two flags are mutually exclusive.
   - **Workload pin.** `--workload <name>` requires the committed mesh leaf to carry a

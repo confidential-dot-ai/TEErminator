@@ -1,13 +1,16 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -21,6 +24,12 @@ import (
 	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+)
+
+// The verdict's stamp digest, and a renewed c8s router's 503 body (C8s#1489).
+const (
+	expectAllowlistHeader = "X-C8s-Expect-Allowlist"
+	routerDigestChanged   = "router_digest_changed"
 )
 
 // Options configures attestation enforcement for a tunnel.
@@ -379,7 +388,7 @@ func (t *h3Transport) do(req *http.Request, host string) (*http.Response, error)
 // forwarded traffic must run on a connection presenting the same certificate
 // DER, otherwise the session re-attests.
 func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.Response, error) {
-	leaf, fresh, ok := t.cache.FreshSession(t.remoteKey)
+	leaf, allowlist, fresh, ok := t.cache.FreshSession(t.remoteKey)
 	if fresh && !ok {
 		return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
 	}
@@ -395,10 +404,13 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 				"mode", t.remote.Mode, "url", req.URL.String(), "error", err)
 			return nil, fmt.Errorf("attestation verification failed for %s: %w", host, err)
 		}
-		if !t.cache.RecordPass(t.remoteKey, started, v.LeafSHA256, v.LeafNotAfter) {
+		if v.Stamp != nil {
+			allowlist = v.Stamp.AllowlistDigest
+		}
+		if !t.cache.RecordPass(t.remoteKey, started, v.LeafSHA256, v.LeafNotAfter, allowlist) {
 			// A later attestation failed: refuse. A later pass leaves this
 			// verified leaf usable.
-			if _, fresh, ok := t.cache.FreshSession(t.remoteKey); fresh && !ok {
+			if _, _, fresh, ok := t.cache.FreshSession(t.remoteKey); fresh && !ok {
 				return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
 			}
 		}
@@ -420,7 +432,12 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	// re-read from the cache during the handshake, so a concurrent Invalidate
 	// or TTL expiry cannot turn this request's handshake permissive between the
 	// FreshSession read above and the dial below.
-	resp, err := t.transportFor(leaf).RoundTrip(req)
+	out := req.Clone(req.Context())
+	out.Header.Del(expectAllowlistHeader)
+	if allowlist != nil {
+		out.Header.Set(expectAllowlistHeader, hex.EncodeToString(allowlist))
+	}
+	resp, err := t.transportFor(leaf).RoundTrip(out)
 	if err != nil || resp == nil {
 		return resp, err
 	}
@@ -437,6 +454,18 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 		slog.Warn("upstream TLS leaf changed since attestation; dropping response",
 			"mode", t.remote.Mode, "url", req.URL.String())
 		return nil, fmt.Errorf("attestation binding broken for %s: upstream TLS leaf changed (re-attest required)", host)
+	}
+	// The router renewed under another allowlist: the next request re-attests.
+	if allowlist != nil && resp.StatusCode == http.StatusServiceUnavailable {
+		head, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
+		if string(bytes.TrimSpace(head)) == routerDigestChanged {
+			t.cache.Invalidate(t.remoteKey)
+			t.dropPinned(leaf)
+		}
 	}
 	return resp, nil
 }

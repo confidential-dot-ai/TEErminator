@@ -1,6 +1,6 @@
 module github.com/confidential-dot-ai/TEErminator
 
-go 1.26.9
+go 1.27.3
 
 require (
 	github.com/confidential-dot-ai/attestation-go v0.8.0
