@@ -38,12 +38,12 @@ func TestSessionCacheReusesVerdictWithinTTL(t *testing.T) {
 	}
 }
 
-func TestSessionCacheRemembersFailure(t *testing.T) {
+func TestSessionCacheDoesNotRememberFailure(t *testing.T) {
 	c := NewSessionCache(time.Minute)
 	c.RecordFailure("bad", c.Now(), errors.New("boom"))
 	_, fresh, ok := c.FreshSession("bad")
-	if !fresh || ok {
-		t.Fatalf("expected fresh failure verdict, got fresh=%v ok=%v", fresh, ok)
+	if fresh || ok {
+		t.Fatalf("expected no cached failure, got fresh=%v ok=%v", fresh, ok)
 	}
 	c.Invalidate("bad")
 	if _, fresh, _ := c.FreshSession("bad"); fresh {
@@ -83,8 +83,8 @@ func TestRecordKeepsLatestAttempt(t *testing.T) {
 			c := NewSessionCache(time.Minute)
 			c.now = func() time.Time { return now }
 			tc.record(c)
-			if _, fresh, ok := c.FreshSession("host"); !fresh || ok != tc.wantOK {
-				t.Errorf("FreshSession() = fresh %v, ok %v; want fresh, ok %v", fresh, ok, tc.wantOK)
+			if _, fresh, ok := c.FreshSession("host"); fresh != tc.wantOK || ok != tc.wantOK {
+				t.Errorf("FreshSession() = fresh %v, ok %v; want fresh and ok %v", fresh, ok, tc.wantOK)
 			}
 		})
 	}

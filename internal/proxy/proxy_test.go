@@ -902,7 +902,7 @@ func (a *blockingAttester) Attest(ctx context.Context) (*verifier.SessionVerdict
 
 // TestAttestationVerdictOrdering checks how roundTripEndpoint records a
 // verdict that races another: a pass superseded by a failure recorded from a
-// later attestation is refused, and a cancelled request records nothing.
+// later attestation is refused. A caller can cancel its wait for a shared check.
 func TestAttestationVerdictOrdering(t *testing.T) {
 	var hits atomic.Int32
 	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -929,8 +929,7 @@ func TestAttestationVerdictOrdering(t *testing.T) {
 				tr.cache.RecordFailure(tr.remoteKey, tr.cache.Now().Add(time.Second), errors.New("later attestation failed"))
 				return true
 			},
-			wantErr:   "attestation previously failed",
-			wantFresh: true,
+			wantErr: "a newer attestation failed",
 		},
 		{
 			name: "cancelled request",
@@ -956,6 +955,13 @@ func TestAttestationVerdictOrdering(t *testing.T) {
 				release: make(chan struct{}),
 				verdict: &verifier.SessionVerdict{LeafSHA256: leafHashOf(cert), LeafNotAfter: cert.NotAfter},
 			}
+			t.Cleanup(func() {
+				select {
+				case <-stub.release:
+				default:
+					close(stub.release)
+				}
+			})
 			tr.ea = stub
 
 			ctx, cancel := context.WithCancel(context.Background())

@@ -379,33 +379,19 @@ func (t *h3Transport) do(req *http.Request, host string) (*http.Response, error)
 // forwarded traffic must run on a connection presenting the same certificate
 // DER, otherwise the session re-attests.
 func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.Response, error) {
-	leaf, fresh, ok := t.cache.FreshSession(t.remoteKey)
-	if fresh && !ok {
-		return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
-	}
-	if !fresh {
-		started := t.cache.Now()
-		v, err := t.ea.Attest(req.Context())
-		if err != nil {
-			// A cancelled client request says nothing about the remote.
-			if req.Context().Err() == nil {
-				t.cache.RecordFailure(t.remoteKey, started, err)
-			}
-			slog.Warn("attestation verification failed; refusing to forward",
-				"mode", t.remote.Mode, "url", req.URL.String(), "error", err)
-			return nil, fmt.Errorf("attestation verification failed for %s: %w", host, err)
+	leaf, err := t.cache.AttestedLeaf(req.Context(), t.remoteKey, func(ctx context.Context) (*verifier.SessionVerdict, error) {
+		v, err := t.ea.Attest(ctx)
+		if err == nil {
+			slog.Info("attestation verified", "mode", t.remote.Mode, "host", host,
+				"measurement", v.Measurement, "trust", v.TrustMode, "route_digest", v.RouteDigest, "route_check", v.RouteCheck, "route_revision", v.RouteRevision,
+				"policy_check", v.PolicyCheck, "partial", v.Partial, "not_proven", v.NotProven)
 		}
-		if !t.cache.RecordPass(t.remoteKey, started, v.LeafSHA256, v.LeafNotAfter) {
-			// A later attestation failed: refuse. A later pass leaves this
-			// verified leaf usable.
-			if _, fresh, ok := t.cache.FreshSession(t.remoteKey); fresh && !ok {
-				return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
-			}
-		}
-		slog.Info("attestation verified", "mode", t.remote.Mode, "url", req.URL.String(),
-			"measurement", v.Measurement, "trust", v.TrustMode, "route_digest", v.RouteDigest, "route_check", v.RouteCheck, "route_revision", v.RouteRevision,
-			"policy_check", v.PolicyCheck, "partial", v.Partial, "not_proven", v.NotProven)
-		leaf = v.LeafSHA256
+		return v, err
+	})
+	if err != nil {
+		slog.Warn("attestation verification failed; refusing to forward",
+			"mode", t.remote.Mode, "url", req.URL.String(), "error", err)
+		return nil, fmt.Errorf("attestation verification failed for %s: %w", host, err)
 	}
 	if leaf == ([32]byte{}) {
 		// Unreachable via either branch above, and deliberately fatal rather
@@ -419,7 +405,7 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	// not use HTTP/3). The pin travels with the transport rather than being
 	// re-read from the cache during the handshake, so a concurrent Invalidate
 	// or TTL expiry cannot turn this request's handshake permissive between the
-	// FreshSession read above and the dial below.
+	// AttestedLeaf call above and the dial below.
 	resp, err := t.transportFor(leaf).RoundTrip(req)
 	if err != nil || resp == nil {
 		return resp, err

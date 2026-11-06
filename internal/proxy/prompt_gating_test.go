@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
 )
@@ -86,5 +88,45 @@ func TestAttestationFailureDoesNotReadPromptBody(t *testing.T) {
 	}
 	if got := body.reads.Load(); got != 0 {
 		t.Fatalf("prompt body was read %d time(s) after attestation failure; want 0", got)
+	}
+}
+
+// A 429 must fail before inference. The next request must attempt a new check.
+func TestAttestation429IsNotCached(t *testing.T) {
+	var attestHits, promptHits atomic.Int32
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/c8s/attest-lb" {
+			attestHits.Add(1)
+			http.Error(w, "caller limit", http.StatusTooManyRequests)
+			return
+		}
+		promptHits.Add(1)
+	}))
+	defer backend.Close()
+	digest := sha512.Sum384([]byte("a1"))
+	tunnel, err := StartWithOptions(context.Background(), "127.0.0.1:0", backend.URL, Options{
+		Remote:           config.Remote{Mode: config.AttestEndpoint, Measurements: []string{hex.EncodeToString(digest[:])}},
+		ReattestInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tunnel.Stop()
+	client := &http.Client{Timeout: 5 * time.Second}
+	for range 2 {
+		resp, err := client.Post("http://"+tunnel.Addr()+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502", resp.StatusCode)
+		}
+	}
+	if got := attestHits.Load(); got != 2 {
+		t.Fatalf("attestation checks = %d, want 2", got)
+	}
+	if got := promptHits.Load(); got != 0 {
+		t.Fatalf("inference requests = %d, want 0", got)
 	}
 }

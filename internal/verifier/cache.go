@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
@@ -27,10 +28,17 @@ import (
 // attested leaf (the transport's handshake and response-time pins); a leaf
 // change invalidates it and forces re-attestation.
 type SessionCache struct {
-	ttl   time.Duration
-	now   func() time.Time
-	mu    sync.Mutex
-	state map[string]verdict
+	ttl      time.Duration
+	now      func() time.Time
+	mu       sync.Mutex
+	state    map[string]verdict
+	inflight map[string]*sessionRefresh
+}
+
+type sessionRefresh struct {
+	done chan struct{}
+	leaf [32]byte
+	err  error
 }
 
 type verdict struct {
@@ -40,14 +48,13 @@ type verdict struct {
 	verifAt time.Time
 	err     error
 	leaf    [32]byte // SHA-256 of the attested serving-leaf DER the session is pinned to
-	// notAfter is that leaf's expiry, zero when the verdict pins no leaf (a
-	// failure). A verdict is scoped to one certificate and cannot outlive it.
+	// notAfter is the serving leaf expiry. A result cannot outlive its certificate.
 	notAfter time.Time
 }
 
 // NewSessionCache returns a cache whose verdicts are valid for ttl.
 func NewSessionCache(ttl time.Duration) *SessionCache {
-	return &SessionCache{ttl: ttl, now: time.Now, state: make(map[string]verdict)}
+	return &SessionCache{ttl: ttl, now: time.Now, state: make(map[string]verdict), inflight: make(map[string]*sessionRefresh)}
 }
 
 // Now returns the time on the cache's clock, for the started argument of
@@ -62,7 +69,7 @@ func (c *SessionCache) RecordPass(key string, started time.Time, leaf [32]byte, 
 	return c.record(key, verdict{ok: true, started: started, leaf: leaf, notAfter: notAfter})
 }
 
-// RecordFailure stores a failed attestation that began at started.
+// RecordFailure keeps a failed attempt for ordering. It cannot be reused.
 func (c *SessionCache) RecordFailure(key string, started time.Time, err error) {
 	_ = c.record(key, verdict{started: started, err: err}) // a newer verdict is kept either way
 }
@@ -72,12 +79,67 @@ func (c *SessionCache) RecordFailure(key string, started time.Time, err error) {
 func (c *SessionCache) record(key string, v verdict) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.recordLocked(key, v)
+}
+
+// recordLocked requires c.mu.
+func (c *SessionCache) recordLocked(key string, v verdict) bool {
 	if held, ok := c.state[key]; ok && held.started.After(v.started) {
 		return false
 	}
 	v.verifAt = c.now()
 	c.state[key] = v
 	return true
+}
+
+// AttestedLeaf shares one check per key. Only successful checks can be reused.
+// A caller can stop waiting without cancelling the check for other callers.
+func (c *SessionCache) AttestedLeaf(ctx context.Context, key string, attest func(context.Context) (*SessionVerdict, error)) ([32]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return [32]byte{}, err
+	}
+	c.mu.Lock()
+	if leaf, fresh, ok := c.freshSession(key); fresh && ok {
+		c.mu.Unlock()
+		return leaf, nil
+	}
+	f := c.inflight[key]
+	if f == nil {
+		f = &sessionRefresh{done: make(chan struct{})}
+		c.inflight[key] = f
+		started := c.now()
+		go func() {
+			// Bound shared work even if all callers stop waiting.
+			checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			v, err := attest(checkCtx)
+			if err == nil && (v == nil || v.LeafSHA256 == ([32]byte{})) {
+				err = fmt.Errorf("attestation returned no serving leaf")
+			}
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if err == nil {
+				f.leaf = v.LeafSHA256
+				if !c.recordLocked(key, verdict{ok: true, started: started, leaf: v.LeafSHA256, notAfter: v.LeafNotAfter}) {
+					if held := c.state[key]; !held.ok {
+						err = fmt.Errorf("a newer attestation failed: %w", held.err)
+					}
+				}
+			} else {
+				c.recordLocked(key, verdict{started: started, err: err})
+			}
+			f.err = err
+			delete(c.inflight, key)
+			close(f.done)
+		}()
+	}
+	c.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return [32]byte{}, ctx.Err()
+	case <-f.done:
+		return f.leaf, f.err
+	}
 }
 
 // FreshSession returns the pinned leaf hash for a still-valid passing verdict.
@@ -92,8 +154,13 @@ func (c *SessionCache) record(key string, v verdict) bool {
 func (c *SessionCache) FreshSession(key string) (leaf [32]byte, fresh, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.freshSession(key)
+}
+
+// freshSession requires c.mu.
+func (c *SessionCache) freshSession(key string) (leaf [32]byte, fresh, ok bool) {
 	v, present := c.state[key]
-	if !present {
+	if !present || !v.ok {
 		return [32]byte{}, false, false
 	}
 	now := c.now()
