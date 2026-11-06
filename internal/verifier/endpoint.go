@@ -1075,6 +1075,29 @@ func servingLeafFromTLS(state *tls.ConnectionState) (*x509.Certificate, error) {
 	return state.PeerCertificates[0], nil
 }
 
+// parseMeasurement decodes one launch-digest allowlist entry, which must be a
+// hex SHA-384 digest: any other length can never match a launch digest.
+func parseMeasurement(entry string) ([]byte, error) {
+	b, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(entry)))
+	if err != nil || len(b) != sha512.Size384 {
+		return nil, fmt.Errorf("--measurements entry %q is not a SHA-384 hex launch digest (%d hex chars)", entry, 2*sha512.Size384)
+	}
+	return b, nil
+}
+
+// ValidateMeasurements checks every launch-digest allowlist entry's syntax
+// and returns the entries in stored form: trimmed and lowercase.
+func ValidateMeasurements(entries []string) ([]string, error) {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if _, err := parseMeasurement(e); err != nil {
+			return nil, err
+		}
+		out = append(out, strings.ToLower(strings.TrimSpace(e)))
+	}
+	return out, nil
+}
+
 // checkMeasurement enforces the remote's launch-digest allowlist. In attest-lb
 // mode an all-empty measurement policy is a configuration error, not a
 // permissive default: nothing else in this flow pins WHAT
@@ -1088,14 +1111,14 @@ func checkMeasurement(measurement string, allowed []string) error {
 	}
 	want := make([][]byte, 0, len(allowed))
 	for _, a := range allowed {
-		b, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(a)))
-		if err != nil || len(b) == 0 {
-			return fmt.Errorf("attest-lb: configuration error: --measurements entry %q is not a non-empty hex launch digest", a)
+		b, err := parseMeasurement(a)
+		if err != nil {
+			return fmt.Errorf("attest-lb: configuration error: %w", err)
 		}
 		want = append(want, b)
 	}
 	m, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(measurement)))
-	if err != nil || len(m) == 0 {
+	if err != nil || len(m) != sha512.Size384 {
 		return fmt.Errorf("attest-lb: cannot enforce the measurement policy: launch_digest is missing or malformed (%q)", measurement)
 	}
 	for _, w := range want {

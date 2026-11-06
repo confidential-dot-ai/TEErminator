@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -100,7 +101,7 @@ func TestValidateImageManifestFlag(t *testing.T) {
 // nothing, so it is refused at add time rather than at some later verification
 // that never runs.
 func TestValidatePinModes(t *testing.T) {
-	flags := []string{"--image-manifest", "--expected-rtmr3", "--operator-pkey", "--rtmr", "--init-data", "--sandbox-id",
+	flags := []string{"--measurements", "--image-manifest", "--expected-rtmr3", "--operator-pkey", "--rtmr", "--init-data", "--sandbox-id",
 		"--min-tcb", "--tdx-tcb-status", "--route-digest", "--route-operator-key", "--routes-floor",
 		"--pin-policy", "--trust-operator", "--trust-operator-key"}
 	all := make([]pinFlag, len(flags))
@@ -163,6 +164,45 @@ func TestRemoteAddBlankRTMR3(t *testing.T) {
 	cmd.SilenceUsage = true
 	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "require an RTMR[3] seed") {
 		t.Errorf("remote add with a blank --expected-rtmr3 = %v, want the missing seed error", err)
+	}
+}
+
+// TestRemoteAddMeasurementsLength checks that a --measurements entry that is
+// not a SHA-384 digest is refused at add time rather than at first attest.
+func TestRemoteAddMeasurementsLength(t *testing.T) {
+	for _, tc := range []struct {
+		name, entry, wantErr string
+	}{
+		{"sha-384", strings.Repeat("ab", 48), ""},
+		{"raw", " " + strings.Repeat("AB", 48) + " ", ""},
+		{"short", "deadbeef", "--measurements entry"},
+		{"long", strings.Repeat("ab", 64), "--measurements entry"},
+		{"empty", "", "--measurements or --image-manifest is required"},
+		{"blank", " ", "--measurements entry"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			cmd := newRemoteAddCmd("teerm")
+			cmd.SetArgs([]string{"127.0.0.1:8080", "https://lb.example", "--mode", "attest-lb", "--measurements", tc.entry})
+			cmd.SilenceUsage = true
+			err := cmd.Execute()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("remote add --measurements %s = %v, want it accepted", tc.entry, err)
+				}
+				cfg, err := config.Load()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := []string{strings.Repeat("ab", 48)}; !slices.Equal(cfg.Remotes[0].Measurements, want) {
+					t.Fatalf("stored measurements = %q, want %q", cfg.Remotes[0].Measurements, want)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("remote add --measurements %s = %v, want an error containing %q", tc.entry, err, tc.wantErr)
+			}
+		})
 	}
 }
 

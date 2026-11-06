@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha512"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -131,9 +133,10 @@ func TestFetchAllowlistFailsClosedOnUnattestedBackend(t *testing.T) {
 	defer ts.Close()
 
 	r := attestLBRemote(ts.URL)
-	r.Measurements = []string{"a1"}
+	digest := sha512.Sum384([]byte("a1"))
+	r.Measurements = []string{hex.EncodeToString(digest[:])}
 	res, err := FetchAllowlist(context.Background(), r, caFor(t, ts))
-	if err == nil {
-		t.Fatalf("want an attestation failure, got %+v", res)
+	if err == nil || !strings.Contains(err.Error(), "required binding identifier") {
+		t.Fatalf("FetchAllowlist = %+v, %v, want an attestation failure", res, err)
 	}
 }
