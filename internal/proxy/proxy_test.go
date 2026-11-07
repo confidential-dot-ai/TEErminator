@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -999,16 +998,19 @@ func TestAttestationVerdictOrdering(t *testing.T) {
 }
 
 // stampAttester passes with cert's leaf and a stamp naming allowlist,
-// counting its calls. A non-nil gate holds each call until it is closed.
+// counting its calls. A non-nil entered is closed by the first call, and a
+// non-nil gate holds each call until it is closed.
 type stampAttester struct {
-	cert      *x509.Certificate
-	allowlist []byte
-	calls     atomic.Int32
-	gate      chan struct{}
+	cert          *x509.Certificate
+	allowlist     []byte
+	calls         atomic.Int32
+	entered, gate chan struct{}
 }
 
 func (a *stampAttester) Attest(context.Context) (*verifier.SessionVerdict, error) {
-	a.calls.Add(1)
+	if a.calls.Add(1) == 1 && a.entered != nil {
+		close(a.entered)
+	}
 	if a.gate != nil {
 		<-a.gate
 	}
@@ -1093,7 +1095,7 @@ func TestConcurrentRequestsShareAttestation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tr.Close() }()
-	a := &stampAttester{cert: backend.Certificate(), gate: make(chan struct{})}
+	a := &stampAttester{cert: backend.Certificate(), entered: make(chan struct{}), gate: make(chan struct{})}
 	tr.ea = a
 
 	const n = 16
@@ -1108,9 +1110,7 @@ func TestConcurrentRequestsShareAttestation(t *testing.T) {
 			errs <- err
 		}()
 	}
-	for a.calls.Load() == 0 {
-		runtime.Gosched()
-	}
+	<-a.entered
 	close(a.gate)
 	for range n {
 		if err := <-errs; err != nil {
