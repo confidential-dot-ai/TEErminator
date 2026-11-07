@@ -25,8 +25,15 @@ func TestStatusExitCode(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-			writeConfig(t, config.Config{Remotes: tc.remotes})
+			// os.UserConfigDir reads XDG_CONFIG_HOME on Linux, HOME on macOS
+			// and AppData on Windows.
+			dir := t.TempDir()
+			t.Setenv("XDG_CONFIG_HOME", dir)
+			t.Setenv("HOME", dir)
+			t.Setenv("AppData", dir)
+			if err := (&config.Config{Remotes: tc.remotes}).Save(); err != nil {
+				t.Fatal(err)
+			}
 			cmd := newStatusCmd()
 			cmd.SetArgs([]string{"--timeout", "5s"})
 			err := cmd.Execute()
