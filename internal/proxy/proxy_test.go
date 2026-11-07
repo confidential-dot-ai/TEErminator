@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -815,6 +816,45 @@ func TestForwardingPinSurvivesCacheInvalidation(t *testing.T) {
 	}
 	if got := impostorHits.Load(); got != 0 {
 		t.Fatalf("%d request(s) reached the unattested backend; want 0", got)
+	}
+}
+
+// TestAttestDialsPerAttestation pins that attest-lb never reuses a connection:
+// after the router renews its certificate an open connection still shows the
+// old leaf, and attesting on it would pin that leaf.
+func TestAttestDialsPerAttestation(t *testing.T) {
+	var dials atomic.Int32
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "try later", http.StatusServiceUnavailable)
+	}))
+	backend.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			dials.Add(1)
+		}
+	}
+	backend.StartTLS()
+	defer backend.Close()
+
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := newH3Transport(target, Options{
+		Remote:           config.Remote{Mode: config.AttestEndpoint, Measurements: []string{strings.Repeat("a1", 48)}},
+		ReattestInterval: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tr.Close() }()
+
+	for range 2 {
+		if _, err := tr.ea.Attest(context.Background()); err == nil || !strings.Contains(err.Error(), "returned 503") {
+			t.Fatalf("Attest() = %v, want the endpoint's 503", err)
+		}
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("%d connection(s) for 2 attestations; want 2", got)
 	}
 }
 

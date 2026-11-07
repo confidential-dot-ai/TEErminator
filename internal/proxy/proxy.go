@@ -289,9 +289,11 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 
 		// The attester fetches the bundle itself, over a transport built with
 		// the same trust construction the proxy forwards over, so the leaf it
-		// observes (and the evidence binds) is the one traffic rides.
+		// observes (and the evidence binds) is the one traffic rides. Each
+		// attestation dials anew: a reused connection keeps showing the leaf
+		// from before a renewal, and the verdict would pin that old leaf.
 		attestClient := &http.Client{
-			Transport: &http.Transport{TLSClientConfig: attestTLS.Clone()},
+			Transport: &http.Transport{TLSClientConfig: attestTLS.Clone(), DisableKeepAlives: true},
 			Timeout:   30 * time.Second,
 		}
 		baseURL := target.Scheme + "://" + target.Host
