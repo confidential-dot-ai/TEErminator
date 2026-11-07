@@ -26,10 +26,13 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-// The verdict's stamp digest, and a renewed c8s router's 503 body (C8s#1489).
+// The verdict's stamp and route digests, and a c8s router's 503 bodies when
+// they changed (C8s#1489, C8s#1507).
 const (
 	expectAllowlistHeader = "X-C8s-Expect-Allowlist"
+	expectRouteHeader     = "X-C8s-Expect-Route"
 	routerDigestChanged   = "router_digest_changed"
+	routeDigestChanged    = "route_digest_changed"
 )
 
 // Options configures attestation enforcement for a tunnel.
@@ -388,7 +391,7 @@ func (t *h3Transport) do(req *http.Request, host string) (*http.Response, error)
 // forwarded traffic must run on a connection presenting the same certificate
 // DER, otherwise the session re-attests.
 func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.Response, error) {
-	leaf, allowlist, fresh, ok := t.cache.FreshSession(t.remoteKey)
+	leaf, expect, fresh, ok := t.cache.FreshSession(t.remoteKey)
 	if fresh && !ok {
 		return nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
 	}
@@ -404,10 +407,11 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 				"mode", t.remote.Mode, "url", req.URL.String(), "error", err)
 			return nil, fmt.Errorf("attestation verification failed for %s: %w", host, err)
 		}
+		expect = &verifier.Expect{Route: v.RouteDigest}
 		if v.Stamp != nil {
-			allowlist = v.Stamp.AllowlistDigest
+			expect.Allowlist = v.Stamp.AllowlistDigest
 		}
-		if !t.cache.RecordPass(t.remoteKey, started, v.LeafSHA256, v.LeafNotAfter, allowlist) {
+		if !t.cache.RecordPass(t.remoteKey, started, v.LeafSHA256, v.LeafNotAfter, expect) {
 			// A later attestation failed: refuse. A later pass leaves this
 			// verified leaf usable.
 			if _, _, fresh, ok := t.cache.FreshSession(t.remoteKey); fresh && !ok {
@@ -434,8 +438,12 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	// FreshSession read above and the dial below.
 	out := req.Clone(req.Context())
 	out.Header.Del(expectAllowlistHeader)
-	if allowlist != nil {
-		out.Header.Set(expectAllowlistHeader, hex.EncodeToString(allowlist))
+	out.Header.Del(expectRouteHeader)
+	if expect != nil && expect.Allowlist != nil {
+		out.Header.Set(expectAllowlistHeader, hex.EncodeToString(expect.Allowlist))
+	}
+	if expect != nil && expect.Route != "" {
+		out.Header.Set(expectRouteHeader, expect.Route)
 	}
 	resp, err := t.transportFor(leaf).RoundTrip(out)
 	if err != nil || resp == nil {
@@ -455,14 +463,15 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 			"mode", t.remote.Mode, "url", req.URL.String())
 		return nil, fmt.Errorf("attestation binding broken for %s: upstream TLS leaf changed (re-attest required)", host)
 	}
-	// The router renewed under another allowlist: the next request re-attests.
-	if allowlist != nil && resp.StatusCode == http.StatusServiceUnavailable {
+	// The router renewed under another allowlist or applied another route
+	// manifest: the next request re-attests.
+	if expect != nil && resp.StatusCode == http.StatusServiceUnavailable {
 		head, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
 		resp.Body = struct {
 			io.Reader
 			io.Closer
 		}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
-		if string(bytes.TrimSpace(head)) == routerDigestChanged {
+		if body := string(bytes.TrimSpace(head)); body == routerDigestChanged || body == routeDigestChanged {
 			t.cache.Invalidate(t.remoteKey)
 			t.dropPinned(leaf)
 		}

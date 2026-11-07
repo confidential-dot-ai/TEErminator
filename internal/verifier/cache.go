@@ -42,8 +42,16 @@ type verdict struct {
 	leaf    [32]byte // SHA-256 of the attested serving-leaf DER the session is pinned to
 	// notAfter is that leaf's expiry, zero when the verdict pins no leaf (a
 	// failure). A verdict is scoped to one certificate and cannot outlive it.
-	notAfter  time.Time
-	allowlist []byte // the router stamp's allowlist digest, nil for none
+	notAfter time.Time
+	expect   *Expect // what forwarded requests ask the router to hold, nil for none
+}
+
+// Expect is what a passing verdict's forwarded requests ask a c8s router to
+// hold: the router stamp's allowlist digest, nil for none, and the attested
+// route digest in hex, "" for none.
+type Expect struct {
+	Allowlist []byte
+	Route     string
 }
 
 // NewSessionCache returns a cache whose verdicts are valid for ttl.
@@ -57,10 +65,10 @@ func (c *SessionCache) Now() time.Time { return c.now() }
 
 // RecordPass stores a passing verdict for an attestation that began at
 // started, with the SHA-256 of the attested serving-leaf DER the session is
-// pinned to, that leaf's expiry and the router stamp's allowlist digest.
+// pinned to, that leaf's expiry and what its requests expect of the router.
 // It reports whether it stored the verdict rather than keeping a newer one.
-func (c *SessionCache) RecordPass(key string, started time.Time, leaf [32]byte, notAfter time.Time, allowlist []byte) bool {
-	return c.record(key, verdict{ok: true, started: started, leaf: leaf, notAfter: notAfter, allowlist: allowlist})
+func (c *SessionCache) RecordPass(key string, started time.Time, leaf [32]byte, notAfter time.Time, expect *Expect) bool {
+	return c.record(key, verdict{ok: true, started: started, leaf: leaf, notAfter: notAfter, expect: expect})
 }
 
 // RecordFailure stores a failed attestation that began at started.
@@ -90,7 +98,7 @@ func (c *SessionCache) record(key string, v verdict) bool {
 // generous interval would otherwise keep a verdict — and the handshake pin
 // derived from it — alive past the point where the certificate it is scoped to
 // stopped being valid.
-func (c *SessionCache) FreshSession(key string) (leaf [32]byte, allowlist []byte, fresh, ok bool) {
+func (c *SessionCache) FreshSession(key string) (leaf [32]byte, expect *Expect, fresh, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	v, present := c.state[key]
@@ -104,7 +112,7 @@ func (c *SessionCache) FreshSession(key string) (leaf [32]byte, allowlist []byte
 	if !v.notAfter.IsZero() && !now.Before(v.notAfter) {
 		return [32]byte{}, nil, false, false
 	}
-	return v.leaf, v.allowlist, true, v.ok
+	return v.leaf, v.expect, true, v.ok
 }
 
 // Invalidate drops any cached verdict for key, forcing re-verification.
