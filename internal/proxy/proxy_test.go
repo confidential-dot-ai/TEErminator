@@ -944,7 +944,8 @@ func (a *blockingAttester) Attest(ctx context.Context) (*verifier.SessionVerdict
 
 // TestAttestationVerdictOrdering checks how roundTripEndpoint records a
 // verdict that races another: a pass superseded by a failure recorded from a
-// later attestation is refused, and a cancelled request records nothing.
+// later attestation is refused, and a cancelled request stops waiting without
+// recording anything.
 func TestAttestationVerdictOrdering(t *testing.T) {
 	var hits atomic.Int32
 	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -999,6 +1000,14 @@ func TestAttestationVerdictOrdering(t *testing.T) {
 				verdict: &verifier.SessionVerdict{LeafSHA256: leafHashOf(cert), LeafNotAfter: cert.NotAfter},
 			}
 			tr.ea = stub
+			defer func() {
+				// Let an attestation the cancelled request left running finish.
+				select {
+				case <-stub.release:
+				default:
+					close(stub.release)
+				}
+			}()
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -1029,15 +1038,22 @@ func TestAttestationVerdictOrdering(t *testing.T) {
 }
 
 // stampAttester passes with cert's leaf and a stamp naming allowlist,
-// counting its calls.
+// counting its calls. A non-nil entered is closed by the first call, and a
+// non-nil gate holds each call until it is closed.
 type stampAttester struct {
-	cert      *x509.Certificate
-	allowlist []byte
-	calls     atomic.Int32
+	cert          *x509.Certificate
+	allowlist     []byte
+	calls         atomic.Int32
+	entered, gate chan struct{}
 }
 
 func (a *stampAttester) Attest(context.Context) (*verifier.SessionVerdict, error) {
-	a.calls.Add(1)
+	if a.calls.Add(1) == 1 && a.entered != nil {
+		close(a.entered)
+	}
+	if a.gate != nil {
+		<-a.gate
+	}
 	return &verifier.SessionVerdict{
 		LeafSHA256:   leafHashOf(a.cert),
 		LeafNotAfter: a.cert.NotAfter,
@@ -1099,5 +1115,49 @@ func TestExpectAllowlist(t *testing.T) {
 	refusal.Store("")
 	if get(); a.calls.Load() != 2 {
 		t.Fatalf("attestations after router_digest_changed = %d, want 2", a.calls.Load())
+	}
+}
+
+// TestConcurrentRequestsShareAttestation: requests that find no fresh verdict
+// wait for one attestation rather than each starting their own, which would
+// run into C8s's per-client attestation limit.
+func TestConcurrentRequestsShareAttestation(t *testing.T) {
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer backend.Close()
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := newH3Transport(target, Options{Remote: config.Remote{Mode: config.AttestEndpoint}, ReattestInterval: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tr.Close() }()
+	a := &stampAttester{cert: backend.Certificate(), entered: make(chan struct{}), gate: make(chan struct{})}
+	tr.ea = a
+
+	const n = 16
+	errs := make(chan error, n)
+	for range n {
+		go func() {
+			req, _ := http.NewRequest("GET", backend.URL, nil)
+			resp, err := tr.RoundTrip(req)
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+			errs <- err
+		}()
+	}
+	<-a.entered
+	close(a.gate)
+	for range n {
+		if err := <-errs; err != nil {
+			t.Fatalf("RoundTrip() = %v", err)
+		}
+	}
+	if got := a.calls.Load(); got != 1 {
+		t.Fatalf("%d attestations for %d concurrent requests; want 1", got, n)
 	}
 }
