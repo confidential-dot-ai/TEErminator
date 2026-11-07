@@ -27,7 +27,8 @@ verification (Verified / Partial / Failed, with the measurement, workload name,
 trust mode, route digest and route check printed below the table), remotes without an attestation mode are
 probed for reachability (Untrusted / Failed), and remotes whose mode the proxy
 cannot enforce yet are reported Failed. The results are persisted, so
-'remote ls' shows the last checked status.`,
+'remote ls' shows the last checked status. The command exits non-zero when
+any remote is Failed.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load()
 			if err != nil {
@@ -80,6 +81,17 @@ cannot enforce yet are reported Failed. The results are persisted, so
 
 			if err := cfg.Save(); err != nil {
 				return fmt.Errorf("saving checked statuses: %w", err)
+			}
+
+			failed := 0
+			for _, r := range results {
+				if r.Status == config.StatusFailed {
+					failed++
+				}
+			}
+			if failed > 0 {
+				cmd.SilenceUsage = true
+				return fmt.Errorf("%d of %d remotes Failed", failed, len(results))
 			}
 			return nil
 		},
