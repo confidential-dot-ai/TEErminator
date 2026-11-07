@@ -26,10 +26,13 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-// The verdict's stamp digest, and a renewed c8s router's 503 body (C8s#1489).
+// The verdict's stamp and route digests, and a c8s router's 503 bodies when
+// they changed (C8s#1489, C8s#1507).
 const (
 	expectAllowlistHeader = "X-C8s-Expect-Allowlist"
+	expectRouteHeader     = "X-C8s-Expect-Route"
 	routerDigestChanged   = "router_digest_changed"
+	routeDigestChanged    = "route_digest_changed"
 )
 
 // Options configures attestation enforcement for a tunnel.
@@ -394,7 +397,7 @@ func (t *h3Transport) do(req *http.Request, host string) (*http.Response, error)
 // forwarded traffic must run on a connection presenting the same certificate
 // DER, otherwise the session re-attests.
 func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.Response, error) {
-	leaf, allowlist, err := t.verdict(req.Context())
+	leaf, expect, err := t.verdict(req.Context())
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", host, err)
 	}
@@ -413,8 +416,12 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	// verdict call above and the dial below.
 	out := req.Clone(req.Context())
 	out.Header.Del(expectAllowlistHeader)
-	if allowlist != nil {
-		out.Header.Set(expectAllowlistHeader, hex.EncodeToString(allowlist))
+	out.Header.Del(expectRouteHeader)
+	if expect != nil && expect.Allowlist != nil {
+		out.Header.Set(expectAllowlistHeader, hex.EncodeToString(expect.Allowlist))
+	}
+	if expect != nil && expect.Route != "" {
+		out.Header.Set(expectRouteHeader, expect.Route)
 	}
 	resp, err := t.transportFor(leaf).RoundTrip(out)
 	if err != nil || resp == nil {
@@ -434,14 +441,15 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 			"mode", t.remote.Mode, "url", req.URL.String())
 		return nil, fmt.Errorf("attestation binding broken for %s: upstream TLS leaf changed (re-attest required)", host)
 	}
-	// The router renewed under another allowlist: the next request re-attests.
-	if allowlist != nil && resp.StatusCode == http.StatusServiceUnavailable {
+	// The router renewed under another allowlist or applied another route
+	// manifest: the next request re-attests.
+	if expect != nil && resp.StatusCode == http.StatusServiceUnavailable {
 		head, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
 		resp.Body = struct {
 			io.Reader
 			io.Closer
 		}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
-		if string(bytes.TrimSpace(head)) == routerDigestChanged {
+		if body := string(bytes.TrimSpace(head)); body == routerDigestChanged || body == routeDigestChanged {
 			t.cache.Invalidate(t.remoteKey)
 			t.dropPinned(leaf)
 		}
@@ -451,33 +459,33 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 
 // attestCall is one attestation shared by the requests that wait for it.
 type attestCall struct {
-	done      chan struct{}
-	leaf      [32]byte
-	allowlist []byte
-	err       error
+	done   chan struct{}
+	leaf   [32]byte
+	expect *verifier.Expect
+	err    error
 }
 
-// verdict returns the leaf and allowlist digest a request forwards under: the
+// verdict returns the leaf and expected digests a request forwards under: the
 // cached verdict while fresh, otherwise the outcome of one attestation shared
 // by every request that arrives while it runs. C8s limits attestations per
 // client, so one per waiting request would get 429s after the verdict expires.
 // A request that gives up stops waiting without cancelling the attestation.
-func (t *h3Transport) verdict(ctx context.Context) ([32]byte, []byte, error) {
+func (t *h3Transport) verdict(ctx context.Context) ([32]byte, *verifier.Expect, error) {
 	t.attestMu.Lock()
-	leaf, allowlist, fresh, ok := t.cache.FreshSession(t.remoteKey)
+	leaf, expect, fresh, ok := t.cache.FreshSession(t.remoteKey)
 	if fresh {
 		t.attestMu.Unlock()
 		if !ok {
 			return [32]byte{}, nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
 		}
-		return leaf, allowlist, nil
+		return leaf, expect, nil
 	}
 	c := t.attesting
 	if c == nil {
 		c = &attestCall{done: make(chan struct{})}
 		t.attesting = c
 		go func() {
-			c.leaf, c.allowlist, c.err = t.attest(context.WithoutCancel(ctx))
+			c.leaf, c.expect, c.err = t.attest(context.WithoutCancel(ctx))
 			t.attestMu.Lock()
 			t.attesting = nil
 			t.attestMu.Unlock()
@@ -487,14 +495,14 @@ func (t *h3Transport) verdict(ctx context.Context) ([32]byte, []byte, error) {
 	t.attestMu.Unlock()
 	select {
 	case <-c.done:
-		return c.leaf, c.allowlist, c.err
+		return c.leaf, c.expect, c.err
 	case <-ctx.Done():
 		return [32]byte{}, nil, ctx.Err()
 	}
 }
 
 // attest runs one attestation and records its verdict.
-func (t *h3Transport) attest(ctx context.Context) ([32]byte, []byte, error) {
+func (t *h3Transport) attest(ctx context.Context) ([32]byte, *verifier.Expect, error) {
 	started := t.cache.Now()
 	v, err := t.ea.Attest(ctx)
 	if err != nil {
@@ -503,11 +511,11 @@ func (t *h3Transport) attest(ctx context.Context) ([32]byte, []byte, error) {
 			"mode", t.remote.Mode, "remote", t.remote.Remote, "error", err)
 		return [32]byte{}, nil, fmt.Errorf("attestation verification failed: %w", err)
 	}
-	var allowlist []byte
+	expect := &verifier.Expect{Route: v.RouteDigest}
 	if v.Stamp != nil {
-		allowlist = v.Stamp.AllowlistDigest
+		expect.Allowlist = v.Stamp.AllowlistDigest
 	}
-	if !t.cache.RecordPass(t.remoteKey, started, v.LeafSHA256, v.LeafNotAfter, allowlist) {
+	if !t.cache.RecordPass(t.remoteKey, started, v.LeafSHA256, v.LeafNotAfter, expect) {
 		// A later attestation failed: refuse. A later pass leaves this
 		// verified leaf usable.
 		if _, _, fresh, ok := t.cache.FreshSession(t.remoteKey); fresh && !ok {
@@ -517,7 +525,7 @@ func (t *h3Transport) attest(ctx context.Context) ([32]byte, []byte, error) {
 	slog.Info("attestation verified", "mode", t.remote.Mode, "remote", t.remote.Remote,
 		"measurement", v.Measurement, "trust", v.TrustMode, "route_digest", v.RouteDigest, "route_check", v.RouteCheck, "route_revision", v.RouteRevision,
 		"policy_check", v.PolicyCheck, "partial", v.Partial, "not_proven", v.NotProven)
-	return v.LeafSHA256, allowlist, nil
+	return v.LeafSHA256, expect, nil
 }
 
 // transportFor returns the forwarding transport for one attested leaf,

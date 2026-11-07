@@ -1037,12 +1037,13 @@ func TestAttestationVerdictOrdering(t *testing.T) {
 	}
 }
 
-// stampAttester passes with cert's leaf and a stamp naming allowlist,
+// stampAttester passes with cert's leaf, route and a stamp naming allowlist,
 // counting its calls. A non-nil entered is closed by the first call, and a
 // non-nil gate holds each call until it is closed.
 type stampAttester struct {
 	cert          *x509.Certificate
 	allowlist     []byte
+	route         string
 	calls         atomic.Int32
 	entered, gate chan struct{}
 }
@@ -1057,20 +1058,23 @@ func (a *stampAttester) Attest(context.Context) (*verifier.SessionVerdict, error
 	return &verifier.SessionVerdict{
 		LeafSHA256:   leafHashOf(a.cert),
 		LeafNotAfter: a.cert.NotAfter,
+		RouteDigest:  a.route,
 		Stamp:        &verifier.MatchedWorkload{AllowlistDigest: a.allowlist},
 	}, nil
 }
 
-// TestExpectAllowlist: the verdict's stamp digest rides every forwarded
-// request, and only a 503 router_digest_changed drops the verdict so the next
-// request re-attests.
+// TestExpectAllowlist: the verdict's stamp and route digests ride every
+// forwarded request, and only a 503 router_digest_changed or
+// route_digest_changed drops the verdict so the next request re-attests.
 func TestExpectAllowlist(t *testing.T) {
 	digest := bytes.Repeat([]byte{0x42}, 32)
 	var refusal atomic.Value
 	refusal.Store("")
-	var seen atomic.Value
+	route := strings.Repeat("ab", 32)
+	var seen, seenRoute atomic.Value
 	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen.Store(r.Header.Get(expectAllowlistHeader))
+		seenRoute.Store(r.Header.Get(expectRouteHeader))
 		if body := refusal.Load().(string); body != "" {
 			http.Error(w, body, http.StatusServiceUnavailable)
 			return
@@ -1087,7 +1091,7 @@ func TestExpectAllowlist(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tr.Close() }()
-	a := &stampAttester{cert: backend.Certificate(), allowlist: digest}
+	a := &stampAttester{cert: backend.Certificate(), allowlist: digest, route: route}
 	tr.ea = a
 	get := func() int {
 		t.Helper()
@@ -1100,8 +1104,8 @@ func TestExpectAllowlist(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	if code := get(); code != http.StatusOK || seen.Load() != hex.EncodeToString(digest) {
-		t.Fatalf("GET = %d with %s %q, want 200 with %x", code, expectAllowlistHeader, seen.Load(), digest)
+	if code := get(); code != http.StatusOK || seen.Load() != hex.EncodeToString(digest) || seenRoute.Load() != route {
+		t.Fatalf("GET = %d with %s %q, %s %q, want 200 with %x, %s", code, expectAllowlistHeader, seen.Load(), expectRouteHeader, seenRoute.Load(), digest, route)
 	}
 	refusal.Store("sessions_busy")
 	get()
@@ -1115,6 +1119,14 @@ func TestExpectAllowlist(t *testing.T) {
 	refusal.Store("")
 	if get(); a.calls.Load() != 2 {
 		t.Fatalf("attestations after router_digest_changed = %d, want 2", a.calls.Load())
+	}
+	refusal.Store(routeDigestChanged)
+	if code := get(); code != http.StatusServiceUnavailable {
+		t.Fatalf("GET after the route manifest changed = %d, want 503", code)
+	}
+	refusal.Store("")
+	if get(); a.calls.Load() != 3 {
+		t.Fatalf("attestations after route_digest_changed = %d, want 3", a.calls.Load())
 	}
 }
 

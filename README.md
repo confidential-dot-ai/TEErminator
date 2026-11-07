@@ -88,9 +88,11 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   passing verdict for one minute, and never past the serving leaf's expiry: new upstream
   connections in that window are admitted only if they present the same leaf, and the
   first request after it re-attests. A failed attestation is kept for the same minute.
-  Forwarded requests carry the stamp's allowlist digest in `X-C8s-Expect-Allowlist`; a
-  503 `router_digest_changed` from a renewed c8s router (C8s#1489) drops the verdict, so
-  the next request re-attests. Older routers ignore the header.
+  Forwarded requests carry the stamp's allowlist digest in `X-C8s-Expect-Allowlist` and
+  the attested route digest in `X-C8s-Expect-Route`; a 503 `router_digest_changed` from a
+  renewed c8s router (C8s#1489) or `route_digest_changed` after a route manifest change
+  (C8s#1507) drops the verdict, so the next request re-attests. Older routers ignore the
+  headers.
 
   Key properties:
   - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is
