@@ -15,7 +15,8 @@ unproven, such as a policy history nothing judged, reports `Partial` and names w
 not proven; the proxy still forwards to it, and logs `partial` and `not_proven` on
 every attestation. Details (the verified measurement, workload name,
 trust mode, route digest and how it was checked, or the failure reason) are printed below the table, and results
-are persisted so `remote ls` shows the last checked status.
+are persisted so `remote ls` shows the last checked status. `status` exits non-zero
+when any remote is `Failed`, so scripts and CI can rely on its exit code.
 
 ```
 $ ./teerminator status
