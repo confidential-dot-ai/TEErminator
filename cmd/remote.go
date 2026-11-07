@@ -269,7 +269,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			// the router verifies its route manifest under (c8s launchconfig),
 			// so --operator-pkey also checks the route signature by default.
 			if operatorPkey != "" && len(routeDigests) == 0 && len(routeKeyFiles) == 0 {
-				if u, err := url.Parse(remoteURL); err == nil && net.ParseIP(u.Hostname()) == nil {
+				if u, err := url.Parse(remoteURL); err == nil && u.Hostname() != "" && net.ParseIP(u.Hostname()) == nil {
 					routeKeyFiles = []string{operatorPkey}
 					fmt.Println("Note: --operator-pkey also verifies the published route manifest (no --route-digest or --route-operator-key given).")
 				}

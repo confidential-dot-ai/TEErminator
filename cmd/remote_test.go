@@ -299,7 +299,7 @@ func TestRemoteAddOperatorPkeyVerifiesRoutes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := cfg.Remotes[0].RouteOperatorKeys; strings.Join(got, "") != strings.Join(tc.want, "") {
+			if got := cfg.Remotes[0].RouteOperatorKeys; !slices.Equal(got, tc.want) {
 				t.Errorf("route_operator_keys = %q, want %q", got, tc.want)
 			}
 		})
