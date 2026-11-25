@@ -126,11 +126,24 @@ func attemptAllowlistFetch(ctx context.Context, r config.Remote, extraCAs []conf
 	fetchTr := &http.Transport{TLSClientConfig: fetchTLS}
 	defer fetchTr.CloseIdleConnections()
 
-	doc, err := verifier.FetchAllowlist(ctx, &http.Client{Transport: fetchTr}, origin, v.Stamp)
+	doc, err := verifier.FetchAllowlist(ctx, &http.Client{Transport: fetchTr}, origin, v.Stamp, v.ComponentSet)
 	if err != nil {
 		return nil, err
 	}
+	if err := componentSetFailure(r, doc); err != nil {
+		return nil, err
+	}
 	return &AllowlistFetch{Verdict: v, Document: doc}, nil
+}
+
+// componentSetFailure fails a fetch whose document contradicts the leaf's
+// component set when r pins a component set or an allowlist; otherwise the
+// caller reports the mismatch as a warning.
+func componentSetFailure(r config.Remote, doc *verifier.FetchedAllowlist) error {
+	if doc.ComponentSetMismatch == nil || len(r.ComponentSets) == 0 && r.AllowlistPath == "" {
+		return nil
+	}
+	return fmt.Errorf("allowlist fetch: %w", doc.ComponentSetMismatch)
 }
 
 // modeLabel renders an attestation mode for an error message, naming the

@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // allowlistRoute is the served allowlist document's path, at the front door's
@@ -58,6 +59,10 @@ type FetchedAllowlist struct {
 	// "" when the header was absent or malformed. Transport metadata, outside
 	// the digest: it may only sharpen a diagnosis, never decide one.
 	ServedVersion string
+	// ComponentSetMismatch is why the document's components section does not
+	// hold the mesh leaf's component set, or nil. The caller decides whether
+	// it fails the fetch.
+	ComponentSetMismatch error
 }
 
 // AllowlistDigestMismatch reports served (or pinned) allowlist bytes that are
@@ -116,8 +121,9 @@ func (e *AllowlistDigestMismatch) diagnosis() string {
 //
 // client is the caller's transport; it should be pinned to the attested serving
 // leaf, though the digest — not the channel — is what makes the returned bytes
-// trustworthy. stamp must come from a chain-verified mesh leaf (SessionVerdict.Stamp).
-func FetchAllowlist(ctx context.Context, client *http.Client, baseURL string, stamp *MatchedWorkload) (*FetchedAllowlist, error) {
+// trustworthy. stamp and set must come from a chain-verified mesh leaf
+// (SessionVerdict.Stamp and SessionVerdict.ComponentSet); set may be nil.
+func FetchAllowlist(ctx context.Context, client *http.Client, baseURL string, stamp *MatchedWorkload, set *ComponentSet) (*FetchedAllowlist, error) {
 	if stamp == nil {
 		return nil, fmt.Errorf("allowlist fetch: the attested mesh leaf carries no matched-workload stamp, so there is nothing to check a served document against")
 	}
@@ -168,7 +174,8 @@ func FetchAllowlist(ctx context.Context, client *http.Client, baseURL string, st
 	}
 
 	served := versionFromETag(resp.Header.Get("ETag"))
-	if err := checkAllowlistBytes(raw, stamp); err != nil {
+	doc, err := checkAllowlistBytes(raw, stamp, time.Now())
+	if err != nil {
 		var mismatch *AllowlistDigestMismatch
 		if errors.As(err, &mismatch) {
 			mismatch.ServedVersion = served
@@ -182,18 +189,20 @@ func FetchAllowlist(ctx context.Context, client *http.Client, baseURL string, st
 		Workload:       stamp.Name,
 		StampedVersion: stamp.AllowlistVersion,
 		ServedVersion:  served,
+
+		ComponentSetMismatch: doc.componentSetMismatch(set),
 	}, nil
 }
 
 // checkAllowlistBytes is the one allowlist check in this client, shared by the
 // pinned-file path (checkWorkloadPolicy) and the fetch path: SHA-256 over the
 // bytes exactly as read or received must equal the stamp's digest, and the
-// stamped workload must resolve in the parsed document. Parsing only ever
-// resolves the name — the digest is never taken over a reserialization.
-func checkAllowlistBytes(raw []byte, stamp *MatchedWorkload) error {
+// stamped workload must resolve in the parsed document at now. Parsing only
+// ever resolves the name — the digest is never taken over a reserialization.
+func checkAllowlistBytes(raw []byte, stamp *MatchedWorkload, now time.Time) (*PinnedAllowlist, error) {
 	digest := sha256.Sum256(raw)
 	if !bytes.Equal(digest[:], stamp.AllowlistDigest) {
-		return &AllowlistDigestMismatch{
+		return nil, &AllowlistDigestMismatch{
 			StampedDigest:  stamp.AllowlistDigest,
 			ServedDigest:   digest,
 			StampedVersion: stamp.AllowlistVersion,
@@ -201,12 +210,12 @@ func checkAllowlistBytes(raw []byte, stamp *MatchedWorkload) error {
 	}
 	doc, err := ParsePinnedAllowlist(raw)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if _, ok := doc.Workloads[stamp.Name]; !ok {
-		return fmt.Errorf("stamped workload %q does not resolve in the allowlist document", stamp.Name)
+	if !doc.Resolves(stamp.Name, now) {
+		return nil, fmt.Errorf("stamped workload %q does not resolve in the allowlist document (its workloads, or an entry of a component set in force)", stamp.Name)
 	}
-	return nil
+	return doc, nil
 }
 
 // versionFromETag extracts N from the weak ETag W/"N" c8s derives from the

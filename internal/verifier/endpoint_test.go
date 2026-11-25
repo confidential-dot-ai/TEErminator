@@ -1286,6 +1286,8 @@ func TestValidatePinCombination(t *testing.T) {
 		{"init data", config.Remote{InitDataDigest: strings.Repeat("ab", 32)}, ""},
 		{"short init data", config.Remote{InitDataDigest: "ab"}, "--init-data"},
 		{"malformed sandbox id", config.Remote{SandboxID: "a b"}, "--sandbox-id"},
+		{"malformed component set", config.Remote{ComponentSets: []string{"0.43"}}, "--component-set"},
+		{"short component set digest", config.Remote{ComponentSets: []string{"0.43.0@sha256:abcd"}}, "--component-set"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidatePinCombination(tc.r)

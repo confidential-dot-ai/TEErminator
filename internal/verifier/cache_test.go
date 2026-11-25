@@ -231,6 +231,11 @@ func TestRemoteKey(t *testing.T) {
 			r.SandboxID = "sb"
 			return RemoteKey("lb.example:443", r, nil, nil)
 		}(),
+		"component set": func() string {
+			r := base
+			r.ComponentSets = []string{"0.43.0"}
+			return RemoteKey("lb.example:443", r, nil, nil)
+		}(),
 		"pinned file":               RemoteKey("lb.example:443", base, map[string][]byte{"/a": {1, 2, 3}}, nil),
 		"other pinned file":         RemoteKey("lb.example:443", base, map[string][]byte{"/b": {1, 2, 3}}, nil),
 		"other pinned file content": RemoteKey("lb.example:443", base, map[string][]byte{"/a": {4, 5, 6}}, nil),

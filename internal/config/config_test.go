@@ -102,7 +102,7 @@ func TestLoadAcceptsEveryWrittenKey(t *testing.T) {
 			Measurements: []string{hex.EncodeToString(sha384("a1"))}, WorkloadName: "api", AllowlistPath: "/a", ImageManifestPath: "/i",
 			ExpectedRTMR3: "r", MinTCB: &TCBFloor{Bootloader: 1}, TDXTCBStatus: []string{"UpToDate"},
 			RouteDigests: []string{"ab"}, RouteOperatorKeys: []string{"k"},
-			RouteFloor: "1:ab", OperatorPubkeyPath: "/o", RTMRs: []string{"1=ab"}, InitDataDigest: "cd", SandboxID: "sb",
+			RouteFloor: "1:ab", OperatorPubkeyPath: "/o", RTMRs: []string{"1=ab"}, InitDataDigest: "cd", SandboxID: "sb", ComponentSets: []string{"0.43.0"},
 			PinnedPolicies: []string{"sha256:ab"}, TrustOperator: true, TrustOperatorKeys: []string{"k"}, StaticAllowlist: true, InitData: "x",
 			Pin: &CertPin{SHA256: "h", NotAfter: "n", PEM: "p"},
 		}},

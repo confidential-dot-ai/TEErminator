@@ -1,0 +1,25 @@
+{
+  "schema": "c8s.allowlist/v1",
+  "workloads": {
+    "tenant-api": {"containers": [{"digest": "sha256:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", "command": {"policy": "any"}, "args": {"policy": "any"}}]}
+  },
+  "components": {
+    "0.43.0": {"entries": {
+      "c8s-router": {"containers": [{"digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "role": "router",
+        "command": {"policy": "exact", "argv": ["/app/c8s", "router", "--listen=:443&:80"]}, "args": {"policy": "any"},
+        "mounts": {"policy": "exact", "rules": [{"destination": "/run/c8s", "kind": "emptyDir", "source": "c8s-run"}]}}]},
+      "c8s-mesh-endpoint": {"containers": [{"digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "role": "mesh",
+        "command": {"policy": "exact", "argv": ["/app/c8s", "armtls-mesh"]}, "args": {"policy": "any"},
+        "mounts": {"policy": "exact", "rules": [{"destination": "/run/c8s", "kind": "emptyDir", "source": "c8s-run"}]}}]},
+      "volumed": {"nodeService": true, "containers": [{"digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "command": {"policy": "exact", "argv": ["/app/c8s", "volumed"]}, "args": {"policy": "exact", "argv": ["--state-dir", "/run/c8s"]},
+        "env": {"policy": "exact", "values": {"HOME": "/root"}},
+        "mounts": {"policy": "exact", "rules": [{"destination": "/run/c8s", "kind": "emptyDir"}]}}]}
+    }},
+    "0.42.1": {"retire": {"deadline": "2026-12-01T00:00:00Z"}, "entries": {
+      "c8s-router-old": {"containers": [{"digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444", "role": "router",
+        "command": {"policy": "exact", "argv": ["/app/c8s", "router"]}, "args": {"policy": "any"},
+        "mounts": {"policy": "exact", "rules": [{"destination": "/run/c8s", "kind": "emptyDir", "source": "c8s-run"}]}}]}
+    }}
+  }
+}

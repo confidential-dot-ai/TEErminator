@@ -127,7 +127,7 @@ func ValidatePinCombination(r config.Remote) error {
 	if r.SandboxID != "" && !sandboxIDPattern.MatchString(r.SandboxID) {
 		return fmt.Errorf("--sandbox-id %q must match %s", r.SandboxID, sandboxIDPattern)
 	}
-	return nil
+	return validateComponentSetPins(r.ComponentSets)
 }
 
 // sandboxIDPattern is c8s's sandbox ID grammar (pkg/armtls ValidateSandboxID).

@@ -153,6 +153,11 @@ type Remote struct {
 	// SandboxID pins the CRI pod sandbox ID CDS stamped on the committed mesh
 	// leaf (OID 1.3.6.1.4.1.66378.1.4). CA-vouched, like WorkloadName.
 	SandboxID string `json:"sandbox_id,omitempty"`
+	// ComponentSets pins the component set the Trust Authority stamped on the
+	// committed mesh leaf (OID 1.3.6.1.4.1.66378.1.11), each as
+	// "<version>[@sha256:<64 hex>]"; any one matching passes. CA-vouched,
+	// like WorkloadName.
+	ComponentSets []string `json:"component_set,omitempty"`
 	// PinnedPolicies is the set of allowlist policies the node may have
 	// enforced: each entry is a "sha256:<64 hex>" digest or the path of an
 	// allowlist document, hashed exactly as read. Every policy in the node's
