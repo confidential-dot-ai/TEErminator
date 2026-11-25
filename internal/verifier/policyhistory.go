@@ -191,7 +191,7 @@ func (e *EndpointAttester) checkSignedPolicy(ctx context.Context, digest string,
 		return fmt.Errorf("policy_history_unsigned: fetch policy %s: %w", digest, err)
 	}
 	if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != hexDigest {
-		return fmt.Errorf("allowlist_digest_mismatch: CDS served bytes for %s that hash to sha256:%x", digest, sum)
+		return fmt.Errorf("allowlist_digest_mismatch: the Trust Authority (CDS) served bytes for %s that hash to sha256:%x", digest, sum)
 	}
 	token, err := e.fetchPolicyObject(ctx, allowlistObjects+hexDigest+"/signature", maxPolicyTokenBytes)
 	if errors.Is(err, errPolicyNotFound) {

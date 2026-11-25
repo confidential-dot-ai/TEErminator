@@ -308,7 +308,7 @@ func newH3Transport(target *url.URL, opts Options) (*h3Transport, error) {
 		if err != nil {
 			return nil, err
 		}
-	case config.AttestCDSCert:
+	case config.AttestTACert, config.AttestCDSCert:
 		// Recognised but not yet implemented: block every request rather than
 		// forwarding it to an unverified backend.
 		blocked = fmt.Errorf("%w: %s (use the c8s-verify-js browser client for this flow today)",
