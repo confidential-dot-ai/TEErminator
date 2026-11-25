@@ -206,6 +206,12 @@ func printFetchSummary(out string, res *proxy.AllowlistFetch) {
 		fmt.Printf("  note: the cluster served version %s while the leaf stamps version %s; the bytes match the stamped digest, which is what the check rests on (the served counter is transport metadata, outside the digest).\n",
 			doc.ServedVersion, doc.StampedVersion)
 	}
+	if v.ComponentSet != nil {
+		fmt.Printf("  component set %s (%s)\n", v.ComponentSet, v.Profile)
+	}
+	if doc.ComponentSetMismatch != nil {
+		fmt.Printf("  WARNING: %v\n", doc.ComponentSetMismatch)
+	}
 	if v.Warning != "" {
 		fmt.Printf("  WARNING: %s\n", v.Warning)
 	}

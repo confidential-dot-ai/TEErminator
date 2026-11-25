@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
 	"github.com/confidential-dot-ai/TEErminator/internal/routes"
@@ -76,7 +77,7 @@ func validateWorkloadFlags(workload, allowlistPath string) (string, error) {
 		return "", fmt.Errorf("--allowlist %s: %w", allowlistPath, err)
 	}
 	if workload != "" {
-		if _, ok := doc.Workloads[workload]; !ok {
+		if !doc.Resolves(workload, time.Now()) {
 			return "", fmt.Errorf("--allowlist %s does not contain workload %q", allowlistPath, workload)
 		}
 	}
@@ -211,6 +212,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 		rtmrs         []string
 		initData      string
 		sandboxID     string
+		componentSets []string
 		pinPolicies   []string
 		trustOperator bool
 		trustKeyFiles []string
@@ -248,6 +250,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				{"--rtmr", strings.Join(rtmrs, ",")},
 				{"--init-data", initData},
 				{"--sandbox-id", sandboxID},
+				{"--component-set", strings.Join(componentSets, ",")},
 				{"--min-tcb", minTCB},
 				{"--tdx-tcb-status", strings.Join(tdxTCBStatus, ",")},
 				{"--route-digest", strings.Join(routeDigests, ",")},
@@ -295,7 +298,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			if err := verifier.ValidatePinCombination(config.Remote{
 				Mode: attestMode, Measurements: measurements, ImageManifestPath: imageManifest, ExpectedRTMR3: rtmr3Stored,
 				OperatorPubkeyPath: operatorPkey, RTMRs: rtmrs, InitDataDigest: initData, SandboxID: sandboxID,
-				RouteOperatorKeys: routeOperatorKeys, RouteFloor: routesFloor,
+				ComponentSets: componentSets, RouteOperatorKeys: routeOperatorKeys, RouteFloor: routesFloor,
 				PinnedPolicies: pinPolicies, TrustOperator: trustOperator, TrustOperatorKeys: trustOperatorKeys,
 			}); err != nil {
 				return err
@@ -362,6 +365,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				RTMRs:              rtmrs,
 				InitDataDigest:     initData,
 				SandboxID:          sandboxID,
+				ComponentSets:      componentSets,
 				PinnedPolicies:     pinPoliciesStored,
 				TrustOperator:      trustOperator,
 				TrustOperatorKeys:  trustOperatorKeys,
@@ -400,6 +404,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringSliceVar(&rtmrs, "rtmr", nil, "TDX runtime register pins as <index>=<96 lowercase hex>, index 1, 2 or 3 (repeatable / comma-separated). RTMR[1] and RTMR[2] are the guest kernel and rootfs, so they exclude --image-manifest; pinning both beside --measurements counts as an image pin. RTMR[3] is another spelling of --expected-rtmr3 and requires --image-manifest. TDX evidence only")
 	f.StringVar(&initData, "init-data", "", "expected init-data digest: SHA-256 hex of the init-data document; the evidence must commit exactly this digest (SNP HOST_DATA, TDX MR_CONFIG_ID, PCR[8] on Azure)")
 	f.StringVar(&sandboxID, "sandbox-id", "", "CRI pod sandbox ID the committed mesh leaf must carry (OID 1.3.6.1.4.1.66378.1.4); CA-vouched, like --workload")
+	f.StringSliceVar(&componentSets, "component-set", nil, "component set the committed mesh leaf must carry (OID 1.3.6.1.4.1.66378.1.11), as <version>[@sha256:<64 lowercase hex>] (repeatable / comma-separated; any one matching passes). With --allowlist, the file's components section must also hold the leaf's set. CA-vouched, like --workload. Requires --mode attest-lb")
 	f.StringSliceVar(&pinPolicies, "pin-policy", nil, "accepted allowlist policies (repeatable / comma-separated), each a sha256:<hex> digest or the path of an allowlist document hashed exactly as read (the bytes GET /allowlist serves): every policy in the node's replayed history, and the one the mesh leaf was issued under, must be one of these. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=); excludes --trust-operator")
 	f.BoolVar(&trustOperator, "trust-operator", false, "accept every policy in the node's replayed history, and the one the mesh leaf was issued under, only when CDS stores its document with a write token signed under --trust-operator-key: each one is fetched from /allowlist/objects/sha256/<hex>, re-hashed, and its token verified. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=) and --trust-operator-key; excludes --pin-policy")
 	f.StringArrayVar(&trustKeyFiles, "trust-operator-key", nil, "PEM file of ECDSA operator public keys --trust-operator accepts signatures from (repeatable). Requires --trust-operator; --route-operator-key does not feed it")
