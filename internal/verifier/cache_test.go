@@ -90,13 +90,6 @@ func TestRecordKeepsLatestAttempt(t *testing.T) {
 	}
 }
 
-// TestExpiredServedLeafForcesReverify pins the second freshness bound: a
-// verdict is scoped to one serving leaf, so it stops being reusable when that
-// certificate expires even if the re-attest interval has not elapsed. The
-// interval is caller-settable with no ceiling (StartOptions.ReattestInterval),
-// while c8s caps a stamped leaf at 6h, so without this bound a generous
-// interval would keep both the verdict and the handshake pin derived from it
-// alive past the certificate's own lifetime.
 // TestInvalidateVerdict: only the verdict a refusal names is dropped.
 func TestInvalidateVerdict(t *testing.T) {
 	older, newer := &Expect{Route: "older"}, &Expect{Route: "newer"}
@@ -116,6 +109,13 @@ func TestInvalidateVerdict(t *testing.T) {
 	}
 }
 
+// TestExpiredServedLeafForcesReverify pins the second freshness bound: a
+// verdict is scoped to one serving leaf, so it stops being reusable when that
+// certificate expires even if the re-attest interval has not elapsed. The
+// interval is caller-settable with no ceiling (StartOptions.ReattestInterval),
+// while c8s caps a stamped leaf at 6h, so without this bound a generous
+// interval would keep both the verdict and the handshake pin derived from it
+// alive past the certificate's own lifetime.
 func TestExpiredServedLeafForcesReverify(t *testing.T) {
 	now := time.Unix(1000, 0)
 	c := NewSessionCache(time.Hour)
