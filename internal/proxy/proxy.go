@@ -26,13 +26,16 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-// The verdict's stamp and route digests, and a c8s router's 503 bodies when
-// they changed (C8s#1489, C8s#1507).
+// The verdict's stamp and route digests, and a c8s router's 503 bodies
+// (C8s pkg/types/error_codes.go): the first three ask the client to attest
+// again; routes_stale refuses new sessions until the ingress catches up.
 const (
 	expectAllowlistHeader = "X-C8s-Expect-Allowlist"
 	expectRouteHeader     = "X-C8s-Expect-Route"
 	routerDigestChanged   = "router_digest_changed"
 	routeDigestChanged    = "route_digest_changed"
+	bindingExpired        = "binding_expired"
+	routesStale           = "routes_stale"
 )
 
 // Options configures attestation enforcement for a tunnel.
@@ -193,6 +196,11 @@ type h3Transport struct {
 	// attestMu guards attesting, the attestation requests currently share.
 	attestMu  sync.Mutex
 	attesting *attestCall
+
+	// staleMu guards staleLogged, the verdict routes_stale was last logged
+	// for, so the log fires once per verdict rather than per request.
+	staleMu     sync.Mutex
+	staleLogged *verifier.Expect
 }
 
 // upstreamTLSConfig builds the TLS client config used to validate an upstream:
@@ -441,20 +449,41 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 			"mode", t.remote.Mode, "url", req.URL.String())
 		return nil, fmt.Errorf("attestation binding broken for %s: upstream TLS leaf changed (re-attest required)", host)
 	}
-	// The router renewed under another allowlist or applied another route
-	// manifest: the next request re-attests.
-	if expect != nil && resp.StatusCode == http.StatusServiceUnavailable {
-		head, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
-		resp.Body = struct {
-			io.Reader
-			io.Closer
-		}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
-		if body := string(bytes.TrimSpace(head)); body == routerDigestChanged || body == routeDigestChanged {
-			t.cache.Invalidate(t.remoteKey)
-			t.dropPinned(leaf)
+	if expect == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		return resp, nil
+	}
+	head, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
+	switch code := string(bytes.TrimSpace(head)); code {
+	case routerDigestChanged, routeDigestChanged, bindingExpired:
+		// The router renewed, applied another route manifest, or lapsed this
+		// connection's binding: the next request re-attests. A refusal of a
+		// verdict already replaced leaves the new one alone.
+		if !t.cache.InvalidateVerdict(t.remoteKey, expect) {
+			break
 		}
+		t.dropPinned(leaf)
+		slog.Info("router refused the attested session; re-attesting on the next request",
+			"mode", t.remote.Mode, "remote", t.remote.Remote, "code", code)
+	case routesStale:
+		// Attesting again cannot help while the route manifest is stale.
+		t.logStale(expect)
 	}
 	return resp, nil
+}
+
+func (t *h3Transport) logStale(expect *verifier.Expect) {
+	t.staleMu.Lock()
+	defer t.staleMu.Unlock()
+	if t.staleLogged == expect {
+		return
+	}
+	t.staleLogged = expect
+	slog.Warn("router refuses new attested sessions: its route manifest is stale",
+		"mode", t.remote.Mode, "remote", t.remote.Remote, "code", routesStale)
 }
 
 // attestCall is one attestation shared by the requests that wait for it.

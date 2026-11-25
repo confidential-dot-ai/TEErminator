@@ -348,6 +348,12 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 	}()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		var refusal struct {
+			Error string `json:"error"`
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable && json.Unmarshal(body, &refusal) == nil && refusal.Error == "routes_stale" {
+			return nil, fmt.Errorf("attest-lb: the ingress refuses new attested sessions until its route manifest is fresh again (routes_stale): %s", body)
+		}
 		return nil, fmt.Errorf("attest-lb: attestation endpoint returned %d: %s", resp.StatusCode, body)
 	}
 

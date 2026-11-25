@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
@@ -1696,5 +1697,38 @@ func TestValidateMeasurementsNormalizes(t *testing.T) {
 	}
 	if want := []string{launchDigestHex("seed")}; !slices.Equal(got, want) {
 		t.Fatalf("ValidateMeasurements(%q) = %q, want %q", raw, got, want)
+	}
+}
+
+// TestAttestLBRefusalMessage: a routes_stale refusal says that attesting
+// again does not help; other refusals keep the generic message.
+func TestAttestLBRefusalMessage(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"routes stale", http.StatusServiceUnavailable, `{"error":"routes_stale","message":"the applied route manifest is stale"}`, "refuses new attested sessions until its route manifest is fresh again (routes_stale)"},
+		{"routes unavailable", http.StatusServiceUnavailable, `{"error":"routes_unavailable","message":"no route manifest is applied yet"}`, "attestation endpoint returned 503"},
+		{"plain text", http.StatusServiceUnavailable, "routes_stale", "attestation endpoint returned 503"},
+		{"other status", http.StatusTooManyRequests, `{"error":"routes_stale"}`, "attestation endpoint returned 429"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer ts.Close()
+			ea, err := NewEndpointAttester(ts.URL, ts.Client(), measuredRemote(), nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = ea.Attest(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Attest() = %v, want an error containing %q", err, tc.want)
+			}
+		})
 	}
 }

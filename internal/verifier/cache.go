@@ -122,6 +122,19 @@ func (c *SessionCache) Invalidate(key string) {
 	delete(c.state, key)
 }
 
+// InvalidateVerdict drops the cached verdict for key only while it is the one
+// whose Expect is expect, so a late refusal of an older verdict leaves a newer
+// one alone. It reports whether it dropped it.
+func (c *SessionCache) InvalidateVerdict(key string, expect *Expect) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if v, ok := c.state[key]; !ok || v.expect != expect {
+		return false
+	}
+	delete(c.state, key)
+	return true
+}
+
 // PinnedFileDigests returns the SHA-256 of every file a remote's pins name,
 // keyed by path: the allowlist, the image manifest, the operator public key,
 // and the pinned policy documents.
