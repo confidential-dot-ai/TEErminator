@@ -5,6 +5,7 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 )
 
 // canonicalDoc is a served canonical-allowlist document whose exact byte string
@@ -196,5 +198,29 @@ func assertOnly(t *testing.T, dir string, want ...string) {
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("%s contains %v, want exactly %v", dir, got, want)
+	}
+}
+
+func TestComponentSetFailure(t *testing.T) {
+	mismatch := &verifier.FetchedAllowlist{ComponentSetMismatch: errors.New("holds no set 0.44.0")}
+	for _, tc := range []struct {
+		name string
+		r    config.Remote
+		pin  bool
+		doc  *verifier.FetchedAllowlist
+		fail bool
+	}{
+		{"consistent", config.Remote{ComponentSets: []string{"0.43.0"}}, true, &verifier.FetchedAllowlist{}, false},
+		{"unpinned mismatch warns", config.Remote{WorkloadName: "api"}, false, mismatch, false},
+		{"component set pin fails", config.Remote{ComponentSets: []string{"0.43.0"}}, false, mismatch, true},
+		{"allowlist pin fails", config.Remote{AllowlistPath: "/a.json"}, false, mismatch, true},
+		{"--pin fails", config.Remote{WorkloadName: "api"}, true, mismatch, true},
+		{"--pin replacing an allowlist pin fails", config.Remote{AllowlistPath: "/a.json"}, true, mismatch, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := componentSetFailure(tc.r, tc.pin, tc.doc); (err != nil) != tc.fail {
+				t.Fatalf("componentSetFailure(%+v, pin %v) = %v, want failure %v", tc.r, tc.pin, err, tc.fail)
+			}
+		})
 	}
 }

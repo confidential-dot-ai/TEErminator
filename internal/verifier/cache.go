@@ -205,6 +205,7 @@ func RemoteKey(host string, r config.Remote, files map[string][]byte, pinnedCAs 
 	sorted('R', r.RTMRs)
 	field('n', []byte(strings.ToLower(r.InitDataDigest)))
 	field('s', []byte(r.SandboxID))
+	sorted('C', r.ComponentSets)
 	sorted('p', r.PinnedPolicies)
 	field('T', []byte(strconv.FormatBool(r.TrustOperator)))
 	sorted('o', r.TrustOperatorKeys)

@@ -551,9 +551,13 @@ func (t *h3Transport) attest(ctx context.Context) ([32]byte, *verifier.Expect, e
 			return [32]byte{}, nil, fmt.Errorf("attestation previously failed for %s", t.remoteKey)
 		}
 	}
-	slog.Info("attestation verified", "mode", t.remote.Mode, "remote", t.remote.Remote,
+	attrs := []any{"mode", t.remote.Mode, "remote", t.remote.Remote,
 		"measurement", v.Measurement, "trust", v.TrustMode, "route_digest", v.RouteDigest, "route_check", v.RouteCheck, "route_revision", v.RouteRevision,
-		"policy_check", v.PolicyCheck, "partial", v.Partial, "not_proven", v.NotProven)
+		"policy_check", v.PolicyCheck, "partial", v.Partial, "not_proven", v.NotProven}
+	if v.ComponentSet != nil {
+		attrs = append(attrs, "component_set", v.ComponentSet.String()+" ("+verifier.ProfileCAVouched+")")
+	}
+	slog.Info("attestation verified", attrs...)
 	return v.LeafSHA256, expect, nil
 }
 

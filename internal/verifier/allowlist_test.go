@@ -48,7 +48,7 @@ func attestAndFetch(t *testing.T, f *lbFixture, spec bundleSpec) (*FetchedAllowl
 	client := &http.Client{
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 	}
-	return FetchAllowlist(context.Background(), client, ts.URL, v.Stamp)
+	return FetchAllowlist(context.Background(), client, ts.URL, v.Stamp, v.ComponentSet)
 }
 
 // stampedFixture is a front door stamped for workload "api" at allowlistVersion
@@ -227,7 +227,7 @@ func TestFetchAllowlistWithoutStamp(t *testing.T) {
 		t.Fatalf("verdict carries a stamp %+v, want none for an unstamped leaf", v.Stamp)
 	}
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	if _, err := FetchAllowlist(context.Background(), client, ts.URL, v.Stamp); err == nil ||
+	if _, err := FetchAllowlist(context.Background(), client, ts.URL, v.Stamp, v.ComponentSet); err == nil ||
 		!strings.Contains(err.Error(), "no matched-workload stamp") {
 		t.Fatalf("want a refusal to check a document against nothing, got %v", err)
 	}

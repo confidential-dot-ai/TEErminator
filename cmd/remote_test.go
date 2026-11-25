@@ -102,7 +102,7 @@ func TestValidateImageManifestFlag(t *testing.T) {
 // that never runs.
 func TestValidatePinModes(t *testing.T) {
 	flags := []string{"--measurements", "--image-manifest", "--expected-rtmr3", "--operator-pkey", "--rtmr", "--init-data", "--sandbox-id",
-		"--min-tcb", "--tdx-tcb-status", "--route-digest", "--route-operator-key", "--routes-floor",
+		"--component-set", "--min-tcb", "--tdx-tcb-status", "--route-digest", "--route-operator-key", "--routes-floor",
 		"--pin-policy", "--trust-operator", "--trust-operator-key"}
 	all := make([]pinFlag, len(flags))
 	for i, f := range flags {
@@ -301,6 +301,56 @@ func TestRemoteAddOperatorPkeyVerifiesRoutes(t *testing.T) {
 			}
 			if got := cfg.Remotes[0].RouteOperatorKeys; !slices.Equal(got, tc.want) {
 				t.Errorf("route_operator_keys = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRemoteAddComponentSet checks that --component-set is validated at add
+// time, round-trips through the config file, and that --workload resolves an
+// entry of a component set in --allowlist.
+func TestRemoteAddComponentSet(t *testing.T) {
+	allowlist, err := filepath.Abs(filepath.Join("..", "internal", "verifier", "testdata", "componentsets", "allowlist.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:63dcd44e147cb37434493fb57de8ec0aaa05aa3c9bf3c63d2bf42ae259a2905d"
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		want    []string
+		wantErr string
+	}{
+		{"version", []string{"--component-set", "0.43.0"}, []string{"0.43.0"}, ""},
+		{"version and digest, repeated", []string{"--component-set", "0.43.0@" + digest, "--component-set", "0.42.1"}, []string{"0.43.0@" + digest, "0.42.1"}, ""},
+		{"component entry as workload", []string{"--component-set", "0.43.0", "--workload", "c8s-router", "--allowlist", allowlist}, []string{"0.43.0"}, ""},
+		{"unknown workload", []string{"--workload", "c8s-nothing", "--allowlist", allowlist}, nil, "does not contain workload"},
+		{"two-part version", []string{"--component-set", "0.43"}, nil, "--component-set"},
+		{"upper-case digest", []string{"--component-set", "0.43.0@" + strings.ToUpper(digest)}, nil, "--component-set"},
+		{"short digest", []string{"--component-set", "0.43.0@sha256:abcd"}, nil, "--component-set"},
+		{"sha384 digest", []string{"--component-set", "0.43.0@sha384:" + strings.Repeat("ab", 48)}, nil, "--component-set"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			cmd := newRemoteAddCmd("teerm")
+			cmd.SetArgs(append([]string{"127.0.0.1:8080", "https://lb.example", "--mode", "attest-lb", "--measurements", strings.Repeat("ab", 48)}, tc.args...))
+			cmd.SilenceUsage = true
+			err := cmd.Execute()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("remote add %v = %v, want an error containing %q", tc.args, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("remote add %v = %v, want it accepted", tc.args, err)
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Remotes[0].ComponentSets; !slices.Equal(got, tc.want) {
+				t.Errorf("component_set = %q, want %q", got, tc.want)
 			}
 		})
 	}

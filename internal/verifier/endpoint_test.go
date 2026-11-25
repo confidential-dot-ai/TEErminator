@@ -1009,6 +1009,28 @@ func TestAttestLBWorkloadPolicy(t *testing.T) {
 			t.Fatalf("want unresolved-name failure, got %v", err)
 		}
 	})
+
+	t.Run("stamped name in a component set of the pinned allowlist", func(t *testing.T) {
+		set := func(deadline string) []byte {
+			return []byte(`{"schema":"c8s.allowlist/v1","workloads":{},"components":{"0.43.0":{"retire":{"deadline":"` + deadline +
+				`"},"entries":{"api":{"containers":[]}}}}}`)
+		}
+		for _, tc := range []struct {
+			name, deadline, wantErr string
+		}{
+			{"retiring", "2999-01-01T00:00:00Z", ""},
+			{"retired", "2020-01-01T00:00:00Z", "does not resolve"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				doc := set(tc.deadline)
+				f := newLBFixture(t, fixtureOpts{allowlistRaw: doc})
+				_, err := attest(t, f, config.Remote{WorkloadName: "api", AllowlistPath: writeAllowlist(t, doc)})
+				if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+					t.Fatalf("Attest(deadline %s) = %v, want error containing %q", tc.deadline, err, tc.wantErr)
+				}
+			})
+		}
+	})
 }
 
 var rtmr3Hex = strings.Repeat("4d", RegisterSize)
@@ -1287,6 +1309,8 @@ func TestValidatePinCombination(t *testing.T) {
 		{"init data", config.Remote{InitDataDigest: strings.Repeat("ab", 32)}, ""},
 		{"short init data", config.Remote{InitDataDigest: "ab"}, "--init-data"},
 		{"malformed sandbox id", config.Remote{SandboxID: "a b"}, "--sandbox-id"},
+		{"malformed component set", config.Remote{ComponentSets: []string{"0.43"}}, "--component-set"},
+		{"short component set digest", config.Remote{ComponentSets: []string{"0.43.0@sha256:abcd"}}, "--component-set"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidatePinCombination(tc.r)
