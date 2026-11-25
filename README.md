@@ -91,8 +91,13 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   Forwarded requests carry the stamp's allowlist digest in `X-C8s-Expect-Allowlist` and
   the attested route digest in `X-C8s-Expect-Route`; a 503 `router_digest_changed` from a
   renewed c8s router (C8s#1489) or `route_digest_changed` after a route manifest change
-  (C8s#1507) drops the verdict, so the next request re-attests. Older routers ignore the
-  headers.
+  (C8s#1507) drops the verdict, so the next request re-attests. So does a 503
+  `binding_expired`, sent when the router's binding of the attested connection lapsed. A 503
+  `routes_stale` means the ingress's route manifest is stale and it refuses new attested
+  sessions; attesting again does not help, so the verdict is kept, the response is passed
+  through, and the daemon logs the code once per verdict. Attestation itself fails with
+  `routes_stale` in its reason while the stale manifest lasts. Older routers ignore the
+  headers and send none of these codes.
 
   Key properties:
   - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is

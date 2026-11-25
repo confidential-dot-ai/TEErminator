@@ -90,6 +90,25 @@ func TestRecordKeepsLatestAttempt(t *testing.T) {
 	}
 }
 
+// TestInvalidateVerdict: only the verdict a refusal names is dropped.
+func TestInvalidateVerdict(t *testing.T) {
+	older, newer := &Expect{Route: "older"}, &Expect{Route: "newer"}
+	c := NewSessionCache(time.Minute)
+	c.RecordPass("host", c.Now(), [32]byte{1}, time.Now().Add(time.Hour), newer)
+	if c.InvalidateVerdict("host", older) {
+		t.Error("InvalidateVerdict(older) = true, want false while newer is held")
+	}
+	if _, _, fresh, _ := c.FreshSession("host"); !fresh {
+		t.Fatal("newer verdict dropped by a refusal of the older one")
+	}
+	if !c.InvalidateVerdict("host", newer) {
+		t.Error("InvalidateVerdict(newer) = false, want true")
+	}
+	if c.InvalidateVerdict("host", newer) {
+		t.Error("InvalidateVerdict(newer) after the drop = true, want false")
+	}
+}
+
 // TestExpiredServedLeafForcesReverify pins the second freshness bound: a
 // verdict is scoped to one serving leaf, so it stops being reusable when that
 // certificate expires even if the re-attest interval has not elapsed. The
