@@ -102,8 +102,8 @@ func TestValidateImageManifestFlag(t *testing.T) {
 // that never runs.
 func TestValidatePinModes(t *testing.T) {
 	flags := []string{"--measurements", "--image-manifest", "--expected-rtmr3", "--operator-pkey", "--rtmr", "--init-data", "--sandbox-id",
-		"--min-tcb", "--tdx-tcb-status", "--route-digest", "--route-operator-key", "--routes-floor",
-		"--pin-policy", "--trust-operator", "--trust-operator-key"}
+		"--component-set", "--min-tcb", "--tdx-tcb-status", "--route-digest", "--route-operator-key", "--routes-floor",
+		"--pin-policy", "--sigstore-trusted-root", "--trust-operator", "--trust-operator-key"}
 	all := make([]pinFlag, len(flags))
 	for i, f := range flags {
 		all[i] = pinFlag{f, "x"}
@@ -114,7 +114,7 @@ func TestValidatePinModes(t *testing.T) {
 	if err := validatePinModes(config.AttestNone, []pinFlag{{"--min-tcb", ""}}); err != nil {
 		t.Fatalf("validatePinModes(no mode, no pins) = %v, want nil", err)
 	}
-	for _, mode := range []config.AttestMode{config.AttestNone, config.AttestCDSCert} {
+	for _, mode := range []config.AttestMode{config.AttestNone, config.AttestTACert, config.AttestCDSCert} {
 		for _, f := range flags {
 			err := validatePinModes(mode, []pinFlag{{f, "x"}})
 			if err == nil || !strings.Contains(err.Error(), f) {
@@ -301,6 +301,118 @@ func TestRemoteAddOperatorPkeyVerifiesRoutes(t *testing.T) {
 			}
 			if got := cfg.Remotes[0].RouteOperatorKeys; !slices.Equal(got, tc.want) {
 				t.Errorf("route_operator_keys = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRemoteAddComponentSet checks that --component-set is validated at add
+// time, round-trips through the config file, and that --workload resolves an
+// entry of a component set in --allowlist.
+func TestRemoteAddComponentSet(t *testing.T) {
+	allowlist, err := filepath.Abs(filepath.Join("..", "internal", "verifier", "testdata", "componentsets", "allowlist.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := "sha256:63dcd44e147cb37434493fb57de8ec0aaa05aa3c9bf3c63d2bf42ae259a2905d"
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		want    []string
+		wantErr string
+	}{
+		{"version", []string{"--component-set", "0.43.0"}, []string{"0.43.0"}, ""},
+		{"version and digest, repeated", []string{"--component-set", "0.43.0@" + digest, "--component-set", "0.42.1"}, []string{"0.43.0@" + digest, "0.42.1"}, ""},
+		{"component entry as workload", []string{"--component-set", "0.43.0", "--workload", "c8s-router", "--allowlist", allowlist}, []string{"0.43.0"}, ""},
+		{"unknown workload", []string{"--workload", "c8s-nothing", "--allowlist", allowlist}, nil, "does not contain workload"},
+		{"two-part version", []string{"--component-set", "0.43"}, nil, "--component-set"},
+		{"upper-case digest", []string{"--component-set", "0.43.0@" + strings.ToUpper(digest)}, nil, "--component-set"},
+		{"short digest", []string{"--component-set", "0.43.0@sha256:abcd"}, nil, "--component-set"},
+		{"sha384 digest", []string{"--component-set", "0.43.0@sha384:" + strings.Repeat("ab", 48)}, nil, "--component-set"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			cmd := newRemoteAddCmd("teerm")
+			cmd.SetArgs(append([]string{"127.0.0.1:8080", "https://lb.example", "--mode", "attest-lb", "--measurements", strings.Repeat("ab", 48)}, tc.args...))
+			cmd.SilenceUsage = true
+			err := cmd.Execute()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("remote add %v = %v, want an error containing %q", tc.args, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("remote add %v = %v, want it accepted", tc.args, err)
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Remotes[0].ComponentSets; !slices.Equal(got, tc.want) {
+				t.Errorf("component_set = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRemoteAddReleaseSeed checks that a seed: --pin-policy is verified at add
+// time and stored with absolute paths.
+func TestRemoteAddReleaseSeed(t *testing.T) {
+	const (
+		statement   = "../internal/release/testdata/v0.108.0/release-statement.json"
+		trustedRoot = "../internal/release/testdata/trusted_root.json"
+	)
+	manifest := filepath.Join(t.TempDir(), "manifest.json")
+	body := `{"mrtd":"` + strings.Repeat("1a", 48) + `","rtmr1":"` + strings.Repeat("2b", 48) + `","rtmr2":"` + strings.Repeat("3c", 48) + `"}`
+	if err := os.WriteFile(manifest, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	absStatement, err := filepath.Abs(statement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	absRoot, err := filepath.Abs(trustedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		extra   []string
+		wantErr string
+	}{
+		{name: "verified seed", extra: []string{"--pin-policy", "seed:" + statement + ":tdx", "--sigstore-trusted-root", trustedRoot}},
+		{name: "no trusted root", extra: []string{"--pin-policy", "seed:" + statement + ":tdx"}, wantErr: "requires --sigstore-trusted-root"},
+		{name: "seed not downloaded", extra: []string{"--pin-policy", "seed:" + statement + ":sev-snp", "--sigstore-trusted-root", trustedRoot}, wantErr: "read allowlist seed"},
+		{name: "trusted root alone", extra: []string{"--pin-policy", "sha256:" + strings.Repeat("ab", 32), "--sigstore-trusted-root", trustedRoot}, wantErr: "requires a seed:"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			cmd := newRemoteAddCmd("teerm")
+			cmd.SetArgs(append([]string{"127.0.0.1:8080", "https://192.0.2.1/", "--mode", "attest-lb",
+				"--image-manifest", manifest, "--expected-rtmr3", strings.Repeat("ab", 48)}, tc.extra...))
+			cmd.SilenceUsage = true
+			err := cmd.Execute()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("remote add %q = %v, want an error containing %q", tc.extra, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("remote add %q = %v", tc.extra, err)
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := cfg.Remotes[0]
+			if want := []string{"seed:" + absStatement + ":tdx"}; !slices.Equal(r.PinnedPolicies, want) {
+				t.Errorf("pinned_policies = %q, want %q", r.PinnedPolicies, want)
+			}
+			if r.SigstoreTrustedRoot != absRoot {
+				t.Errorf("sigstore_trusted_root = %q, want %q", r.SigstoreTrustedRoot, absRoot)
 			}
 		})
 	}

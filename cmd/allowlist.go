@@ -11,6 +11,7 @@ import (
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
 	"github.com/confidential-dot-ai/TEErminator/internal/proxy"
+	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 	"github.com/spf13/cobra"
 )
 
@@ -100,6 +101,9 @@ attestation check still applies.
 			if err != nil {
 				return err
 			}
+			if err := componentSetFailure(*r, pin, res.Document); err != nil {
+				return err
+			}
 			// Only now, after the check passed, does anything touch the disk.
 			if err := writeAllowlistFile(out, res.Document.Raw); err != nil {
 				return err
@@ -130,6 +134,17 @@ attestation check still applies.
 	// Cannot fail: the flag is registered right above.
 	_ = cmd.MarkFlagRequired("output")
 	return cmd
+}
+
+// componentSetFailure fails a fetch whose document contradicts the leaf's
+// component set when r pins a component set or an allowlist, or when pin would
+// make the document the allowlist pin every later handshake rejects; otherwise
+// the summary reports the mismatch as a warning.
+func componentSetFailure(r config.Remote, pin bool, doc *verifier.FetchedAllowlist) error {
+	if doc.ComponentSetMismatch == nil || !pin && len(r.ComponentSets) == 0 && r.AllowlistPath == "" {
+		return nil
+	}
+	return fmt.Errorf("allowlist fetch: %w", doc.ComponentSetMismatch)
 }
 
 // resolveOutputPath decides whether the fetched document may be written to
@@ -205,6 +220,12 @@ func printFetchSummary(out string, res *proxy.AllowlistFetch) {
 	if doc.ServedVersion != "" && doc.ServedVersion != doc.StampedVersion {
 		fmt.Printf("  note: the cluster served version %s while the leaf stamps version %s; the bytes match the stamped digest, which is what the check rests on (the served counter is transport metadata, outside the digest).\n",
 			doc.ServedVersion, doc.StampedVersion)
+	}
+	if v.ComponentSet != nil {
+		fmt.Printf("  component set %s (%s)\n", v.ComponentSet, v.Profile)
+	}
+	if doc.ComponentSetMismatch != nil {
+		fmt.Printf("  WARNING: %v\n", doc.ComponentSetMismatch)
 	}
 	if v.Warning != "" {
 		fmt.Printf("  WARNING: %s\n", v.Warning)

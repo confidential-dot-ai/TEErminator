@@ -13,8 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/release"
 	"github.com/confidential-dot-ai/TEErminator/internal/routes"
 	"github.com/confidential-dot-ai/TEErminator/internal/verifier"
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
@@ -76,7 +78,7 @@ func validateWorkloadFlags(workload, allowlistPath string) (string, error) {
 		return "", fmt.Errorf("--allowlist %s: %w", allowlistPath, err)
 	}
 	if workload != "" {
-		if _, ok := doc.Workloads[workload]; !ok {
+		if !doc.Resolves(workload, time.Now()) {
 			return "", fmt.Errorf("--allowlist %s does not contain workload %q", allowlistPath, workload)
 		}
 	}
@@ -211,7 +213,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 		rtmrs         []string
 		initData      string
 		sandboxID     string
+		componentSets []string
 		pinPolicies   []string
+		trustedRoot   string
 		trustOperator bool
 		trustKeyFiles []string
 	)
@@ -226,7 +230,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 
 			attestMode, normalized, ok := config.ParseAttestMode(mode)
 			if !ok {
-				return fmt.Errorf("invalid --mode %q (want one of: attest-lb, cds-cert, or empty)", mode)
+				return fmt.Errorf("invalid --mode %q (want one of: attest-lb, ta-cert, cds-cert, or empty)", mode)
 			}
 			if normalized {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
@@ -248,12 +252,14 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				{"--rtmr", strings.Join(rtmrs, ",")},
 				{"--init-data", initData},
 				{"--sandbox-id", sandboxID},
+				{"--component-set", strings.Join(componentSets, ",")},
 				{"--min-tcb", minTCB},
 				{"--tdx-tcb-status", strings.Join(tdxTCBStatus, ",")},
 				{"--route-digest", strings.Join(routeDigests, ",")},
 				{"--route-operator-key", strings.Join(routeKeyFiles, ",")},
 				{"--routes-floor", routesFloor},
 				{"--pin-policy", strings.Join(pinPolicies, ",")},
+				{"--sigstore-trusted-root", trustedRoot},
 				{"--trust-operator", trust},
 				{"--trust-operator-key", strings.Join(trustKeyFiles, ",")},
 			}); err != nil {
@@ -295,8 +301,8 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			if err := verifier.ValidatePinCombination(config.Remote{
 				Mode: attestMode, Measurements: measurements, ImageManifestPath: imageManifest, ExpectedRTMR3: rtmr3Stored,
 				OperatorPubkeyPath: operatorPkey, RTMRs: rtmrs, InitDataDigest: initData, SandboxID: sandboxID,
-				RouteOperatorKeys: routeOperatorKeys, RouteFloor: routesFloor,
-				PinnedPolicies: pinPolicies, TrustOperator: trustOperator, TrustOperatorKeys: trustOperatorKeys,
+				ComponentSets: componentSets, RouteOperatorKeys: routeOperatorKeys, RouteFloor: routesFloor,
+				PinnedPolicies: pinPolicies, SigstoreTrustedRoot: trustedRoot, TrustOperator: trustOperator, TrustOperatorKeys: trustOperatorKeys,
 			}); err != nil {
 				return err
 			}
@@ -311,7 +317,11 @@ func newRemoteAddCmd(name string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			pinPoliciesStored, err := validatePinPolicyFlags(pinPolicies)
+			trustedRootStored, err := absPath("--sigstore-trusted-root", trustedRoot)
+			if err != nil {
+				return err
+			}
+			pinPoliciesStored, err := validatePinPolicyFlags(pinPolicies, trustedRootStored)
 			if err != nil {
 				return err
 			}
@@ -362,10 +372,12 @@ func newRemoteAddCmd(name string) *cobra.Command {
 				RTMRs:              rtmrs,
 				InitDataDigest:     initData,
 				SandboxID:          sandboxID,
+				ComponentSets:      componentSets,
 				PinnedPolicies:     pinPoliciesStored,
 				TrustOperator:      trustOperator,
 				TrustOperatorKeys:  trustOperatorKeys,
 			}
+			r.SigstoreTrustedRoot = trustedRootStored
 			if err := cfg.AddRemote(r); err != nil {
 				return err
 			}
@@ -383,9 +395,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	}
 
 	f := cmd.Flags()
-	f.StringVar(&mode, "mode", "", "attestation mode: attest-lb (per-handshake attestation binding the exact serving leaf, over ordinary TLS), cds-cert (CDS-cert pinning, not yet implemented), or empty to disable")
+	f.StringVar(&mode, "mode", "", "attestation mode: attest-lb (per-handshake attestation binding the exact serving leaf, over ordinary TLS), ta-cert (Trust Authority (CDS) certificate pinning, not yet implemented; cds-cert is an alias), or empty to disable")
 	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (SHA-384, 96 hex chars each), comma-separated; required for attest-lb unless --image-manifest is given (an empty measurement policy is a configuration error, and the two flags are mutually exclusive)")
-	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest-lb always uses the remote's origin)")
+	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for ta-cert (attest-lb always uses the remote's origin)")
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
 	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb)")
 	f.StringVar(&allowlistPath, "allowlist", "", "path to a pinned canonical-allowlist JSON file; hashed exactly as read against the stamp's digest, and the stamped name must resolve in it (attest-lb)")
@@ -400,8 +412,10 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringSliceVar(&rtmrs, "rtmr", nil, "TDX runtime register pins as <index>=<96 lowercase hex>, index 1, 2 or 3 (repeatable / comma-separated). RTMR[1] and RTMR[2] are the guest kernel and rootfs, so they exclude --image-manifest; pinning both beside --measurements counts as an image pin. RTMR[3] is another spelling of --expected-rtmr3 and requires --image-manifest. TDX evidence only")
 	f.StringVar(&initData, "init-data", "", "expected init-data digest: SHA-256 hex of the init-data document; the evidence must commit exactly this digest (SNP HOST_DATA, TDX MR_CONFIG_ID, PCR[8] on Azure)")
 	f.StringVar(&sandboxID, "sandbox-id", "", "CRI pod sandbox ID the committed mesh leaf must carry (OID 1.3.6.1.4.1.66378.1.4); CA-vouched, like --workload")
-	f.StringSliceVar(&pinPolicies, "pin-policy", nil, "accepted allowlist policies (repeatable / comma-separated), each a sha256:<hex> digest or the path of an allowlist document hashed exactly as read (the bytes GET /allowlist serves): every policy in the node's replayed history, and the one the mesh leaf was issued under, must be one of these. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=); excludes --trust-operator")
-	f.BoolVar(&trustOperator, "trust-operator", false, "accept every policy in the node's replayed history, and the one the mesh leaf was issued under, only when CDS stores its document with a write token signed under --trust-operator-key: each one is fetched from /allowlist/objects/sha256/<hex>, re-hashed, and its token verified. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=) and --trust-operator-key; excludes --pin-policy")
+	f.StringSliceVar(&componentSets, "component-set", nil, "component set the committed mesh leaf must carry (OID 1.3.6.1.4.1.66378.1.11), as <version>[@sha256:<64 lowercase hex>] (repeatable / comma-separated; any one matching passes). With --allowlist, the file's components section must also hold the leaf's set. CA-vouched, like --workload. Requires --mode attest-lb")
+	f.StringSliceVar(&pinPolicies, "pin-policy", nil, "accepted allowlist policies (repeatable / comma-separated), each a sha256:<hex> digest or the path of an allowlist document hashed exactly as read (the bytes GET /allowlist serves), or seed:<release-statement.json>:<tdx|sev-snp>, a C8s release's allowlist seed verified against its signed release statement (see --sigstore-trusted-root): every policy in the node's replayed history, and the one the mesh leaf was issued under, must be one of these. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=); excludes --trust-operator")
+	f.StringVar(&trustedRoot, "sigstore-trusted-root", "", "Sigstore trusted_root.json that a seed: --pin-policy's release statement signature verifies under, offline. Required by, and only valid with, a seed: --pin-policy")
+	f.BoolVar(&trustOperator, "trust-operator", false, "accept every policy in the node's replayed history, and the one the mesh leaf was issued under, only when the Trust Authority (CDS) stores its document with a write token signed under --trust-operator-key: each one is fetched from /allowlist/objects/sha256/<hex>, re-hashed, and its token verified. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=) and --trust-operator-key; excludes --pin-policy")
 	f.StringArrayVar(&trustKeyFiles, "trust-operator-key", nil, "PEM file of ECDSA operator public keys --trust-operator accepts signatures from (repeatable). Requires --trust-operator; --route-operator-key does not feed it")
 	return cmd
 }
@@ -423,16 +437,24 @@ func validateOperatorPkeyFlag(path string) (string, error) {
 }
 
 // validatePinPolicyFlags resolves each --pin-policy entry once to catch a bad
-// digest or document, and returns the entries to store: digests as given,
-// files as absolute paths.
-func validatePinPolicyFlags(entries []string) ([]string, error) {
+// digest, document or release seed, and returns the entries to store: digests
+// as given, files and release statements as absolute paths.
+func validatePinPolicyFlags(entries []string, trustedRoot string) ([]string, error) {
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if _, err := verifier.PinnedPolicyDigest(e); err != nil {
+		if _, err := verifier.PinnedPolicyDigest(e, trustedRoot); err != nil {
 			return nil, fmt.Errorf("--pin-policy: %w", err)
 		}
 		if strings.HasPrefix(e, "sha256:") {
 			out = append(out, e)
+			continue
+		}
+		if seed, ok, _ := release.ParseSeedPin(e); ok {
+			abs, err := absPath("--pin-policy", seed.Statement)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, release.SeedPrefix+abs+":"+seed.Platform)
 			continue
 		}
 		abs, err := filepath.Abs(e)
@@ -442,6 +464,18 @@ func validatePinPolicyFlags(entries []string) ([]string, error) {
 		out = append(out, abs)
 	}
 	return out, nil
+}
+
+// absPath returns path made absolute, or "" for "".
+func absPath(flag, path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolving %s path: %w", flag, err)
+	}
+	return abs, nil
 }
 
 func newRemoteAuthCmd() *cobra.Command {

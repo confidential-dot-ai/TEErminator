@@ -168,6 +168,9 @@ type SessionVerdict struct {
 	// SandboxID is the CRI pod sandbox ID CDS stamped on the mesh leaf, ""
 	// when it carries none. CA-vouched, like Stamp.
 	SandboxID string
+	// ComponentSet is the component set the Trust Authority stamped on the
+	// mesh leaf, nil when it carries none. CA-vouched, like Stamp.
+	ComponentSet *ComponentSet
 	// Warning is a policy gap in an otherwise passing verdict — the MRTD-only
 	// note for specific-cluster TDX remotes without an image pin.
 	Warning string
@@ -348,6 +351,12 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 	}()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		var refusal struct {
+			Error string `json:"error"`
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable && json.Unmarshal(body, &refusal) == nil && refusal.Error == "routes_stale" {
+			return nil, fmt.Errorf("attest-lb: the ingress refuses new attested sessions until its route manifest is fresh again (routes_stale): %s", body)
+		}
 		return nil, fmt.Errorf("attest-lb: attestation endpoint returned %d: %s", resp.StatusCode, body)
 	}
 
@@ -502,8 +511,14 @@ func (e *EndpointAttester) attest(ctx context.Context) (*SessionVerdict, error) 
 		}
 		return nil, fmt.Errorf("attest-lb: mesh leaf sandbox ID %q does not match the pinned %q", v.SandboxID, want)
 	}
+	if v.ComponentSet, err = componentSetFromCert(meshLeaf); err != nil {
+		return nil, fmt.Errorf("attest-lb: component set: %w", err)
+	}
+	if err := checkComponentSetPins(v.ComponentSet, e.remote.ComponentSets); err != nil {
+		return nil, fmt.Errorf("attest-lb: %w", err)
+	}
 	if e.remote.WorkloadName != "" || e.remote.AllowlistPath != "" {
-		if err := e.checkWorkloadPolicy(stamp); err != nil {
+		if err := e.checkWorkloadPolicy(stamp, v.ComponentSet); err != nil {
 			return nil, fmt.Errorf("attest-lb: %w", err)
 		}
 		v.WorkloadName = stamp.Name
@@ -952,8 +967,9 @@ func checkValidity(cert *x509.Certificate, now time.Time) error {
 // carried by the committed (chain-verified) mesh leaf, fail closed: with a pin
 // set, an absent, mismatched, or unresolvable stamp is an error. stamp is nil
 // when the leaf carries none (a malformed or duplicated one never reaches
-// here — matchedWorkloadFromCert already failed).
-func (e *EndpointAttester) checkWorkloadPolicy(stamp *MatchedWorkload) error {
+// here — matchedWorkloadFromCert already failed). With a pinned file, the
+// file's components section must also hold set, the leaf's component set.
+func (e *EndpointAttester) checkWorkloadPolicy(stamp *MatchedWorkload, set *ComponentSet) error {
 	if stamp == nil {
 		return fmt.Errorf("workload policy: pin set but the mesh leaf carries no matched-workload stamp")
 	}
@@ -968,13 +984,17 @@ func (e *EndpointAttester) checkWorkloadPolicy(stamp *MatchedWorkload) error {
 		if err != nil {
 			return fmt.Errorf("workload policy: %w", err)
 		}
-		if err := checkAllowlistBytes(raw, stamp); err != nil {
+		doc, err := checkAllowlistBytes(raw, stamp, time.Now())
+		if err != nil {
 			var mismatch *AllowlistDigestMismatch
 			if errors.As(err, &mismatch) {
 				return fmt.Errorf("workload policy: stamped allowlist digest does not match the pinned allowlist file %s (stamped %s, file %s)",
 					e.remote.AllowlistPath, mismatch.stampedHex(), mismatch.servedHex())
 			}
 			return fmt.Errorf("workload policy: %w", err)
+		}
+		if err := doc.componentSetMismatch(set); err != nil {
+			return fmt.Errorf("workload policy: pinned allowlist file %s: %w", e.remote.AllowlistPath, err)
 		}
 	}
 	return nil
@@ -1139,6 +1159,8 @@ const AllowlistSchema = "c8s.allowlist/v1"
 type PinnedAllowlist struct {
 	Schema    string                     `json:"schema"`
 	Workloads map[string]json.RawMessage `json:"workloads"`
+	// Components are the document's component sets, keyed by version.
+	Components map[string]documentComponentSet `json:"components,omitempty"`
 }
 
 // ParsePinnedAllowlist parses raw canonical-allowlist bytes and checks the

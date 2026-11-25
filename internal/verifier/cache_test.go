@@ -3,6 +3,8 @@ package verifier
 import (
 	"crypto/x509"
 	"errors"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -87,6 +89,25 @@ func TestRecordKeepsLatestAttempt(t *testing.T) {
 				t.Errorf("FreshSession() = fresh %v, ok %v; want fresh, ok %v", fresh, ok, tc.wantOK)
 			}
 		})
+	}
+}
+
+// TestInvalidateVerdict: only the verdict a refusal names is dropped.
+func TestInvalidateVerdict(t *testing.T) {
+	older, newer := &Expect{Route: "older"}, &Expect{Route: "newer"}
+	c := NewSessionCache(time.Minute)
+	c.RecordPass("host", c.Now(), [32]byte{1}, time.Now().Add(time.Hour), newer)
+	if c.InvalidateVerdict("host", older) {
+		t.Error("InvalidateVerdict(older) = true, want false while newer is held")
+	}
+	if _, _, fresh, _ := c.FreshSession("host"); !fresh {
+		t.Fatal("newer verdict dropped by a refusal of the older one")
+	}
+	if !c.InvalidateVerdict("host", newer) {
+		t.Error("InvalidateVerdict(newer) = false, want true")
+	}
+	if c.InvalidateVerdict("host", newer) {
+		t.Error("InvalidateVerdict(newer) after the drop = true, want false")
 	}
 }
 
@@ -231,6 +252,11 @@ func TestRemoteKey(t *testing.T) {
 			r.SandboxID = "sb"
 			return RemoteKey("lb.example:443", r, nil, nil)
 		}(),
+		"component set": func() string {
+			r := base
+			r.ComponentSets = []string{"0.43.0"}
+			return RemoteKey("lb.example:443", r, nil, nil)
+		}(),
 		"pinned file":               RemoteKey("lb.example:443", base, map[string][]byte{"/a": {1, 2, 3}}, nil),
 		"other pinned file":         RemoteKey("lb.example:443", base, map[string][]byte{"/b": {1, 2, 3}}, nil),
 		"other pinned file content": RemoteKey("lb.example:443", base, map[string][]byte{"/a": {4, 5, 6}}, nil),
@@ -256,5 +282,23 @@ func TestRemoteKey(t *testing.T) {
 	b := RemoteKey("h", base, nil, []*x509.Certificate{otherCA.cert, ca.cert})
 	if a != b {
 		t.Fatal("key must be invariant under pinned-CA order")
+	}
+}
+
+// A seed pin's verdict must follow its statement, bundle and trusted root; the
+// statement lists the seed's digest.
+func TestPinnedFileDigestsReleaseSeed(t *testing.T) {
+	dir := "../release/testdata"
+	r := config.Remote{
+		PinnedPolicies:      []string{"seed:" + dir + "/v0.108.0/release-statement.json:tdx"},
+		SigstoreTrustedRoot: dir + "/trusted_root.json",
+	}
+	files, err := PinnedFileDigests(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{dir + "/trusted_root.json", dir + "/v0.108.0/release-statement.json", dir + "/v0.108.0/release-statement.sigstore.json"}
+	if got := slices.Sorted(maps.Keys(files)); !slices.Equal(got, want) {
+		t.Errorf("PinnedFileDigests(seed pin) paths = %q, want %q", got, want)
 	}
 }

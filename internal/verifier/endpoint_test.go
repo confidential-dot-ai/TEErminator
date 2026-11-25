@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
@@ -1008,6 +1009,28 @@ func TestAttestLBWorkloadPolicy(t *testing.T) {
 			t.Fatalf("want unresolved-name failure, got %v", err)
 		}
 	})
+
+	t.Run("stamped name in a component set of the pinned allowlist", func(t *testing.T) {
+		set := func(deadline string) []byte {
+			return []byte(`{"schema":"c8s.allowlist/v1","workloads":{},"components":{"0.43.0":{"retire":{"deadline":"` + deadline +
+				`"},"entries":{"api":{"containers":[]}}}}}`)
+		}
+		for _, tc := range []struct {
+			name, deadline, wantErr string
+		}{
+			{"retiring", "2999-01-01T00:00:00Z", ""},
+			{"retired", "2020-01-01T00:00:00Z", "does not resolve"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				doc := set(tc.deadline)
+				f := newLBFixture(t, fixtureOpts{allowlistRaw: doc})
+				_, err := attest(t, f, config.Remote{WorkloadName: "api", AllowlistPath: writeAllowlist(t, doc)})
+				if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+					t.Fatalf("Attest(deadline %s) = %v, want error containing %q", tc.deadline, err, tc.wantErr)
+				}
+			})
+		}
+	})
 }
 
 var rtmr3Hex = strings.Repeat("4d", RegisterSize)
@@ -1279,6 +1302,10 @@ func TestValidatePinCombination(t *testing.T) {
 		{"trust operator with keys", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, TrustOperator: true, TrustOperatorKeys: []string{"k"}}, ""},
 		{"trust operator without keys", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, TrustOperator: true}, "requires --trust-operator-key"},
 		{"trust operator keys alone", config.Remote{TrustOperatorKeys: []string{"k"}}, "requires --trust-operator"},
+		{"pinned release seed", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, PinnedPolicies: []string{"seed:/r/release-statement.json:tdx"}, SigstoreTrustedRoot: "/t.json"}, ""},
+		{"release seed without a trusted root", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, PinnedPolicies: []string{"seed:/r/release-statement.json:tdx"}}, "requires --sigstore-trusted-root"},
+		{"release seed of an unknown platform", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, PinnedPolicies: []string{"seed:/r/release-statement.json:snp"}, SigstoreTrustedRoot: "/t.json"}, "platform \"snp\""},
+		{"trusted root without a release seed", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, PinnedPolicies: []string{digest}, SigstoreTrustedRoot: "/t.json"}, "requires a seed:"},
 		{"both history checks", config.Remote{ImageManifestPath: manifest, ExpectedRTMR3: rtmr3Hex, PinnedPolicies: []string{digest}, TrustOperator: true, TrustOperatorKeys: []string{"k"}}, "mutually exclusive"},
 		{"route floor without keys", config.Remote{RouteFloor: "1:" + strings.Repeat("ab", 32)}, "requires --route-operator-key"},
 		{"route floor", config.Remote{RouteOperatorKeys: []string{"k"}, RouteFloor: "1:" + strings.Repeat("ab", 32)}, ""},
@@ -1286,6 +1313,8 @@ func TestValidatePinCombination(t *testing.T) {
 		{"init data", config.Remote{InitDataDigest: strings.Repeat("ab", 32)}, ""},
 		{"short init data", config.Remote{InitDataDigest: "ab"}, "--init-data"},
 		{"malformed sandbox id", config.Remote{SandboxID: "a b"}, "--sandbox-id"},
+		{"malformed component set", config.Remote{ComponentSets: []string{"0.43"}}, "--component-set"},
+		{"short component set digest", config.Remote{ComponentSets: []string{"0.43.0@sha256:abcd"}}, "--component-set"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidatePinCombination(tc.r)
@@ -1696,5 +1725,38 @@ func TestValidateMeasurementsNormalizes(t *testing.T) {
 	}
 	if want := []string{launchDigestHex("seed")}; !slices.Equal(got, want) {
 		t.Fatalf("ValidateMeasurements(%q) = %q, want %q", raw, got, want)
+	}
+}
+
+// TestAttestLBRefusalMessage: a routes_stale refusal says that attesting
+// again does not help; other refusals keep the generic message.
+func TestAttestLBRefusalMessage(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"routes stale", http.StatusServiceUnavailable, `{"error":"routes_stale","message":"the applied route manifest is stale"}`, "refuses new attested sessions until its route manifest is fresh again (routes_stale)"},
+		{"routes unavailable", http.StatusServiceUnavailable, `{"error":"routes_unavailable","message":"no route manifest is applied yet"}`, "attestation endpoint returned 503"},
+		{"plain text", http.StatusServiceUnavailable, "routes_stale", "attestation endpoint returned 503"},
+		{"other status", http.StatusTooManyRequests, `{"error":"routes_stale"}`, "attestation endpoint returned 429"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer ts.Close()
+			ea, err := NewEndpointAttester(ts.URL, ts.Client(), measuredRemote(), nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = ea.Attest(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Attest() = %v, want an error containing %q", err, tc.want)
+			}
+		})
 	}
 }

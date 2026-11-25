@@ -1,0 +1,13 @@
+{
+  "allowlist_sha256": "4b9d5d8c40b42aead642faf056dfa9f884c23b5e9ea57094a725dd8ef9295d48",
+  "sets": {
+    "0.42.1": {
+      "digest": "sha256:e8df93ddb82207267c3f11fb21ccced355625a96c4e7968d0db34d0a69273030",
+      "extension_der": "302a0c06302e34322e310420e8df93ddb82207267c3f11fb21ccced355625a96c4e7968d0db34d0a69273030"
+    },
+    "0.43.0": {
+      "digest": "sha256:63dcd44e147cb37434493fb57de8ec0aaa05aa3c9bf3c63d2bf42ae259a2905d",
+      "extension_der": "302a0c06302e34332e30042063dcd44e147cb37434493fb57de8ec0aaa05aa3c9bf3c63d2bf42ae259a2905d"
+    }
+  }
+}

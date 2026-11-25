@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/release"
 )
 
 // SessionCache memoises attestation verdicts per remote so a long-lived TLS
@@ -122,15 +123,37 @@ func (c *SessionCache) Invalidate(key string) {
 	delete(c.state, key)
 }
 
+// InvalidateVerdict drops the cached verdict for key only while it is the one
+// whose Expect is expect, so a late refusal of an older verdict leaves a newer
+// one alone. It reports whether it dropped it.
+func (c *SessionCache) InvalidateVerdict(key string, expect *Expect) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if v, ok := c.state[key]; !ok || v.expect != expect {
+		return false
+	}
+	delete(c.state, key)
+	return true
+}
+
 // PinnedFileDigests returns the SHA-256 of every file a remote's pins name,
 // keyed by path: the allowlist, the image manifest, the operator public key,
-// and the pinned policy documents.
+// the pinned policy documents, and for a release seed its statement, bundle
+// and Sigstore trusted root. The statement lists the seed's own digest.
 func PinnedFileDigests(r config.Remote) (map[string][]byte, error) {
-	paths := []string{r.AllowlistPath, r.ImageManifestPath, r.OperatorPubkeyPath}
+	paths := []string{r.AllowlistPath, r.ImageManifestPath, r.OperatorPubkeyPath, r.SigstoreTrustedRoot}
 	for _, p := range r.PinnedPolicies {
-		if !strings.HasPrefix(p, "sha256:") {
-			paths = append(paths, p)
+		if strings.HasPrefix(p, "sha256:") {
+			continue
 		}
+		if seed, ok, err := release.ParseSeedPin(p); ok {
+			if err != nil {
+				return nil, err
+			}
+			paths = append(paths, seed.Statement, seed.Bundle())
+			continue
+		}
+		paths = append(paths, p)
 	}
 	files := make(map[string][]byte)
 	for _, p := range paths {
@@ -192,6 +215,7 @@ func RemoteKey(host string, r config.Remote, files map[string][]byte, pinnedCAs 
 	sorted('R', r.RTMRs)
 	field('n', []byte(strings.ToLower(r.InitDataDigest)))
 	field('s', []byte(r.SandboxID))
+	sorted('C', r.ComponentSets)
 	sorted('p', r.PinnedPolicies)
 	field('T', []byte(strconv.FormatBool(r.TrustOperator)))
 	sorted('o', r.TrustOperatorKeys)

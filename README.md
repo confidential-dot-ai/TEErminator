@@ -91,8 +91,13 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   Forwarded requests carry the stamp's allowlist digest in `X-C8s-Expect-Allowlist` and
   the attested route digest in `X-C8s-Expect-Route`; a 503 `router_digest_changed` from a
   renewed c8s router (C8s#1489) or `route_digest_changed` after a route manifest change
-  (C8s#1507) drops the verdict, so the next request re-attests. Older routers ignore the
-  headers.
+  (C8s#1507) drops the verdict, so the next request re-attests. So does a 503
+  `binding_expired`, sent when the router's binding of the attested connection lapsed. A 503
+  `routes_stale` means the ingress's route manifest is stale and it refuses new attested
+  sessions; attesting again does not help, so the verdict is kept, the response is passed
+  through, and the daemon logs the code once per verdict. Attestation itself fails with
+  `routes_stale` in its reason while the stale manifest lasts. Older routers ignore the
+  headers and send none of these codes.
 
   Key properties:
   - **Derived CA = deployment-class.** No mesh CA file is needed: the issuing mesh CA is
@@ -113,7 +118,9 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   - **Workload pin.** `--workload <name>` requires the committed mesh leaf to carry a
     matched-workload stamp (OID `1.3.6.1.4.1.66378.1.5`) naming `<name>`;
     `--allowlist <file>` additionally requires the stamp's digest to equal the SHA-256 of
-    the exact file bytes and the stamped name to resolve in the document. The stamp is
+    the exact file bytes and the stamped name to resolve in the document: as a
+    `workloads` entry, or as an entry of a component set in the `components` section
+    that is in force now (current, or retiring with its deadline ahead). The stamp is
     CA-vouched (`ca-vouched` profile in the verdict) — the mesh CA signature, not the
     hardware evidence, vouches for it. `allowlist fetch` obtains that file from the
     cluster itself (see below); the stamp's allowlist **version** counter, which `status`
@@ -163,8 +170,8 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
 
     | Flag (config key) | Accepts | Failure |
     |---|---|---|
-    | `--pin-policy <sha256:hex or file>` (`pinned_policies`, repeatable) | Only these policies, for every history entry and for the policy the mesh leaf was issued under. A file is an allowlist document hashed exactly as read, the bytes `GET /allowlist` serves | `policy_history_not_pinned` |
-    | `--trust-operator --trust-operator-key <pem-file>` (`trust_operator`, `trust_operator_keys`) | Every history entry, and the policy the mesh leaf was issued under, whose document CDS stores with an operator write token signed under these keys | `policy_history_unsigned` |
+    | `--pin-policy <sha256:hex, file or seed:…>` (`pinned_policies`, repeatable) | Only these policies, for every history entry and for the policy the mesh leaf was issued under. A file is an allowlist document hashed exactly as read, the bytes `GET /allowlist` serves. A `seed:` entry is a C8s release's allowlist seed, see below | `policy_history_not_pinned` |
+    | `--trust-operator --trust-operator-key <pem-file>` (`trust_operator`, `trust_operator_keys`) | Every history entry, and the policy the mesh leaf was issued under, whose document the Trust Authority (CDS) stores with an operator write token signed under these keys | `policy_history_unsigned` |
 
     Both fail with `policy_history_absent` when nothing replays: a node that does not
     measure its policies proves nothing about them. `--trust-operator` fetches each
@@ -182,6 +189,37 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     a leaf without a stamp leaves it `Partial` too. With neither check, a non-empty
     history is accepted and the verdict is `Partial`. `status` prints the check as
     `policy history pinned`, `operator-signed` or `unchecked`.
+
+    A C8s release publishes the allowlist seed of each CPU TEE as
+    `allowlist-seed-{tdx,sev-snp}.json`, listed by SHA-256 under `allowlistSeeds` in
+    its Sigstore-signed `release-statement.json`. To pin a seed, download the
+    statement, its bundle and the seed into one directory, then pass
+    `--pin-policy seed:<dir>/release-statement.json:<tdx|sev-snp>` with
+    `--sigstore-trusted-root <trusted_root.json>` (config key `sigstore_trusted_root`):
+
+    ```sh
+    gh release download <RELEASE_TAG> --repo confidential-dot-ai/confidential-kubernetes \
+      --pattern 'release-statement*' --pattern allowlist-seed-tdx.json --dir seed
+    ```
+
+    At `remote add` and at every attestation, TEErminator verifies the bundle offline
+    under the trusted root: the signer must be `semver-tag.yml` on `refs/heads/main`
+    of the repository the statement names, `confidential-dot-ai/confidential-kubernetes`
+    or its former name `confidential-dot-ai/C8s`, with issuer
+    `https://token.actions.githubusercontent.com`, as
+    [releases.md](https://github.com/confidential-dot-ai/confidential-kubernetes/blob/main/docs/releases.md#verify-a-release)
+    verifies it with cosign. The certificate must also carry the repository's GitHub ID,
+    `1040957973`, as source repository identifier, so a repository created later under
+    either name cannot sign. The bundle is the statement's name with `.json` replaced by
+    `.sigstore.json`; the seed is the asset the statement lists, beside it. The seed must
+    hash to the listed SHA-256, and its SHA-256 is then pinned like a file. A statement
+    that lists no seed for the platform, a release older than published seeds, or a
+    signature that does not verify fails `remote add`. The trusted root is Sigstore's
+    public-good `trusted_root.json`: cosign 3 caches it from Sigstore's TUF repository at
+    `~/.sigstore/root/tuf-repo-cdn.sigstore.dev/targets/trusted_root.json`. The pin
+    matches only a node whose policy is the seed unchanged: a Trust Authority that adds
+    tenant workloads or nodes to the seed serves a different document, which you pin as
+    a file or digest.
   - **Init data.** `--init-data <hex>` (config key `init_data_digest`) requires the
     evidence to commit exactly this SHA-256 of the init-data document: SNP `HOST_DATA`,
     TDX `MR_CONFIG_ID`, or vTPM PCR[8] on Azure.
@@ -189,8 +227,21 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     mesh leaf to carry this CRI pod sandbox ID (OID `1.3.6.1.4.1.66378.1.4`). Like the
     workload stamp it is CA-vouched. `status` prints the ID whenever the leaf carries one,
     and a malformed one fails the attestation even unpinned.
+  - **Component set.** A C8s Trust Authority stamps the mesh leaf with the component set
+    its pod runs on (OID `1.3.6.1.4.1.66378.1.11`): the release version and the SHA-256
+    of that set's entries. It is CA-vouched, like the workload stamp. Whenever the leaf
+    carries one, `status` prints `component set <version> sha256:<hex> (ca-vouched)`
+    and the proxy's attestation log line adds it as `component_set`. A malformed or
+    non-canonical one fails the attestation even unpinned.
+    `--component-set <version>[@sha256:<hex>]` (config key `component_set`, repeatable;
+    any one matching passes) requires the leaf to carry a set of that version, and that
+    digest when given; a malformed or non-attest-lb `component_set` in the config file
+    fails at load. When the leaf carries a set and an allowlist document has a
+    `components` section, the document must hold a set of that version whose digest
+    equals the leaf's. With `--allowlist`, `--component-set` or `allowlist fetch --pin`
+    a mismatch fails; otherwise `allowlist fetch` prints it as a warning. A document without `components`, or a leaf without a set, skips the check.
   - **Pins of `c8s verify` a remote does not take.** `--allow-debug`: debug guests are
-    always rejected. `--served-policy-file`: it checks what a CDS target serves at
+    always rejected. `--served-policy-file`: it checks what a Trust Authority target serves at
     `/measurements`, which an attest-lb front door does not answer. `--image-policy-file`:
     pin one image with `--image-manifest` and, for its anchor, `--operator-pkey`.
     `--fetch-allowlists` and `--expected-report-data` are not pins; `allowlist fetch`
@@ -212,7 +263,7 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     logs it on every attestation. `--route-digest <hex,...>` (config key
     `route_digests`) requires the attested digest to be one of the listed values, and
     the error names both. Take the value from `c8s routes digest FILE` or
-    `c8s routes show`: it hashes the manifest bytes as stored on CDS, so hashing a
+    `c8s routes show`: it hashes the manifest bytes as stored on the Trust Authority, so hashing a
     reformatted copy or the signed envelope gives a digest that never matches. To
     change routes without failing, add the new digest to `route_digests` in the config
     file (the daemon reloads it; `remote add` sets pins only on a new remote), apply the
@@ -269,7 +320,7 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   [`attestation-go`](https://github.com/confidential-dot-ai/attestation-go) verifier
   (`teeverify`), so every platform it supports works here: bare-metal/GCP SNP (binding in
   `report_data`), Azure az-snp (binding in the AK-signed vTPM quote), and the TDX variants.
-- **`cds-cert`** — planned CDS-cert pinning; configuring it today fails
+- **`ta-cert`** (alias `cds-cert`) — planned Trust Authority certificate pinning; configuring it today fails
   closed (requests are blocked before reaching the backend).
 
 ```
@@ -304,6 +355,11 @@ $ ./teerminator remote add 127.0.0.1:8086 https://<LB-IP>/ \
     --mode attest-lb --image-manifest ./image-manifest.json \
     --operator-pkey ./operator.pub --pin-policy ./allowlist.json,sha256:<hex>
 
+# Or accept only the allowlist seed of a signed C8s release.
+$ ./teerminator remote add 127.0.0.1:8088 https://<LB-IP>/ \
+    --mode attest-lb --image-manifest ./image-manifest.json --operator-pkey ./operator.pub \
+    --pin-policy seed:./seed/release-statement.json:tdx --sigstore-trusted-root ./trusted_root.json
+
 # Or accept every policy the operator signed.
 $ ./teerminator remote add 127.0.0.1:8087 https://<LB-IP>/ \
     --mode attest-lb --image-manifest ./image-manifest.json \
@@ -331,7 +387,8 @@ The remote is attested exactly as `status` attests it (`--mode attest-lb` only, 
 other mode yields a stamp), the matched-workload stamp is read off the chain-verified mesh
 leaf, `GET /allowlist` is fetched over a connection pinned to the attested serving leaf,
 and the response is written only when SHA-256 over the bytes **as received** equals the
-digest the stamp names and the stamped workload resolves in the document. The bytes go to
+digest the stamp names and the stamped workload resolves in the document (see the
+workload pin above). The bytes go to
 disk verbatim — the digest is over exactly them, so a JSON round trip that preserves the
 document's meaning still produces a file the stamp no longer matches. A document that
 fails the check is never written, not even partially, and the command exits non-zero.

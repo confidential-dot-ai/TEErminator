@@ -23,6 +23,7 @@ import (
 	"sync"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/release"
 	"github.com/confidential-dot-ai/TEErminator/internal/routes"
 )
 
@@ -60,17 +61,30 @@ type historyPolicy struct {
 }
 
 // PinnedPolicyDigest resolves one pinned_policies entry: a sha256:<64 hex>
-// digest as is, or else the path of an allowlist document, hashed exactly as
-// read — the same canonical bytes GET /allowlist serves.
-func PinnedPolicyDigest(entry string) (string, error) {
+// digest as is; a seed:<statement>:<platform> release seed, verified under
+// trustedRoot and hashed like a file; or else the path of an allowlist
+// document, hashed exactly as read — the same canonical bytes GET /allowlist
+// serves.
+func PinnedPolicyDigest(entry, trustedRoot string) (string, error) {
 	if canonicalPolicyDigest.MatchString(entry) {
 		return entry, nil
 	}
 	if strings.HasPrefix(entry, "sha256:") {
 		return "", fmt.Errorf("pinned policy %q is not sha256:<64 lowercase hex>", entry)
 	}
-	raw, err := os.ReadFile(entry)
+	seed, isSeed, err := release.ParseSeedPin(entry)
 	if err != nil {
+		return "", err
+	}
+	var raw []byte
+	if isSeed {
+		if trustedRoot == "" {
+			return "", errSeedNeedsTrustedRoot
+		}
+		if raw, err = release.VerifySeed(seed, trustedRoot); err != nil {
+			return "", err
+		}
+	} else if raw, err = os.ReadFile(entry); err != nil {
 		return "", fmt.Errorf("read pinned policy: %w", err)
 	}
 	if _, err := ParsePinnedAllowlist(raw); err != nil {
@@ -80,12 +94,14 @@ func PinnedPolicyDigest(entry string) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
+var errSeedNeedsTrustedRoot = errors.New("a seed: --pin-policy requires --sigstore-trusted-root: the Sigstore trusted_root.json its release statement's signature verifies under")
+
 // loadHistoryPolicy resolves a remote's policy history check, reading every
 // pinned file once. ValidatePinCombination has already run.
 func loadHistoryPolicy(r config.Remote) (historyPolicy, error) {
 	var h historyPolicy
 	for _, entry := range r.PinnedPolicies {
-		d, err := PinnedPolicyDigest(entry)
+		d, err := PinnedPolicyDigest(entry, r.SigstoreTrustedRoot)
 		if err != nil {
 			return historyPolicy{}, fmt.Errorf("pinned_policies: %w", err)
 		}
@@ -191,7 +207,7 @@ func (e *EndpointAttester) checkSignedPolicy(ctx context.Context, digest string,
 		return fmt.Errorf("policy_history_unsigned: fetch policy %s: %w", digest, err)
 	}
 	if sum := sha256.Sum256(body); hex.EncodeToString(sum[:]) != hexDigest {
-		return fmt.Errorf("allowlist_digest_mismatch: CDS served bytes for %s that hash to sha256:%x", digest, sum)
+		return fmt.Errorf("allowlist_digest_mismatch: the Trust Authority (CDS) served bytes for %s that hash to sha256:%x", digest, sum)
 	}
 	token, err := e.fetchPolicyObject(ctx, allowlistObjects+hexDigest+"/signature", maxPolicyTokenBytes)
 	if errors.Is(err, errPolicyNotFound) {

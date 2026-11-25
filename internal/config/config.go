@@ -50,8 +50,11 @@ const (
 	// legacyAttestEndpoint is the pre-attest-lb spelling, still accepted on
 	// input and normalized to AttestEndpoint.
 	legacyAttestEndpoint AttestMode = "attest"
-	// AttestCDSCert fetches and pins the CDS cert before trusting the
-	// connection.
+	// AttestTACert fetches and pins the Trust Authority certificate before
+	// trusting the connection.
+	AttestTACert AttestMode = "ta-cert"
+	// AttestCDSCert is the pre-rename spelling of AttestTACert. It stays
+	// accepted and is stored as given, so older binaries still read it.
 	AttestCDSCert AttestMode = "cds-cert"
 )
 
@@ -153,12 +156,22 @@ type Remote struct {
 	// SandboxID pins the CRI pod sandbox ID CDS stamped on the committed mesh
 	// leaf (OID 1.3.6.1.4.1.66378.1.4). CA-vouched, like WorkloadName.
 	SandboxID string `json:"sandbox_id,omitempty"`
+	// ComponentSets pins the component set the Trust Authority stamped on the
+	// committed mesh leaf (OID 1.3.6.1.4.1.66378.1.11), each as
+	// "<version>[@sha256:<64 hex>]"; any one matching passes. CA-vouched,
+	// like WorkloadName.
+	ComponentSets []string `json:"component_set,omitempty"`
 	// PinnedPolicies is the set of allowlist policies the node may have
 	// enforced: each entry is a "sha256:<64 hex>" digest or the path of an
 	// allowlist document, hashed exactly as read. Every policy in the node's
 	// replayed history, and the one the mesh leaf was issued under, must be
 	// in the set. Exclusive with TrustOperator; requires an RTMR[3] seed.
+	// An entry "seed:<release-statement.json>:<platform>" pins a C8s
+	// release's allowlist seed; it requires SigstoreTrustedRoot.
 	PinnedPolicies []string `json:"pinned_policies,omitempty"`
+	// SigstoreTrustedRoot is the path of the Sigstore trusted_root.json the
+	// release statements of seed: pinned policies verify under, offline.
+	SigstoreTrustedRoot string `json:"sigstore_trusted_root,omitempty"`
 	// TrustOperator accepts every policy in the node's replayed history, and
 	// the one the mesh leaf was issued under, whose document CDS stores with
 	// a write token signed under TrustOperatorKeys. Exclusive with
@@ -182,7 +195,7 @@ func ParseAttestMode(s string) (mode AttestMode, normalized, ok bool) {
 	switch AttestMode(s) {
 	case legacyAttestEndpoint:
 		return AttestEndpoint, true, true
-	case AttestNone, AttestEndpoint, AttestCDSCert:
+	case AttestNone, AttestEndpoint, AttestTACert, AttestCDSCert:
 		return AttestMode(s), false, true
 	default:
 		return "", false, false
@@ -265,6 +278,9 @@ func Load() (*Config, error) {
 	for i := range cfg.Remotes {
 		if cfg.Remotes[i].Mode == legacyAttestEndpoint {
 			cfg.Remotes[i].Mode = AttestEndpoint
+		}
+		if err := cfg.Remotes[i].validateComponentSets(); err != nil {
+			return nil, fmt.Errorf("%s: remote %s: %w", path, cfg.Remotes[i].Local, err)
 		}
 	}
 	// Configs written before fingerprint keying store certs without one;

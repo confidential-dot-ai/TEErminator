@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -534,6 +535,7 @@ func TestPerRemoteAttestationMethods(t *testing.T) {
 	}{
 		{"none forwards", config.AttestNone, false, true},
 		{"attest fails closed without valid attestation", config.AttestEndpoint, true, true},
+		{"ta-cert (unimplemented) blocks before forwarding", config.AttestTACert, true, false},
 		{"cds-cert (unimplemented) blocks before forwarding", config.AttestCDSCert, true, false},
 	}
 
@@ -1064,24 +1066,31 @@ func (a *stampAttester) Attest(context.Context) (*verifier.SessionVerdict, error
 }
 
 // TestExpectAllowlist: the verdict's stamp and route digests ride every
-// forwarded request, and only a 503 router_digest_changed or
-// route_digest_changed drops the verdict so the next request re-attests.
+// forwarded request.
 func TestExpectAllowlist(t *testing.T) {
 	digest := bytes.Repeat([]byte{0x42}, 32)
-	var refusal atomic.Value
-	refusal.Store("")
 	route := strings.Repeat("ab", 32)
 	var seen, seenRoute atomic.Value
 	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen.Store(r.Header.Get(expectAllowlistHeader))
 		seenRoute.Store(r.Header.Get(expectRouteHeader))
-		if body := refusal.Load().(string); body != "" {
-			http.Error(w, body, http.StatusServiceUnavailable)
-			return
-		}
 		fmt.Fprint(w, "ok")
 	}))
 	defer backend.Close()
+	tr, _ := refusalTransport(t, backend, digest, route)
+	req, _ := http.NewRequest("GET", backend.URL, nil)
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip() = %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || seen.Load() != hex.EncodeToString(digest) || seenRoute.Load() != route {
+		t.Fatalf("GET = %d with %s %q, %s %q, want 200 with %x, %s", resp.StatusCode, expectAllowlistHeader, seen.Load(), expectRouteHeader, seenRoute.Load(), digest, route)
+	}
+}
+
+func refusalTransport(t *testing.T, backend *httptest.Server, allowlist []byte, route string) (*h3Transport, *stampAttester) {
+	t.Helper()
 	target, err := url.Parse(backend.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -1090,43 +1099,98 @@ func TestExpectAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = tr.Close() }()
-	a := &stampAttester{cert: backend.Certificate(), allowlist: digest, route: route}
+	t.Cleanup(func() { _ = tr.Close() })
+	a := &stampAttester{cert: backend.Certificate(), allowlist: allowlist, route: route}
 	tr.ea = a
-	get := func() int {
-		t.Helper()
-		req, _ := http.NewRequest("GET", backend.URL, nil)
-		resp, err := tr.RoundTrip(req)
-		if err != nil {
-			t.Fatalf("RoundTrip() = %v", err)
-		}
-		_ = resp.Body.Close()
-		return resp.StatusCode
-	}
+	return tr, a
+}
 
-	if code := get(); code != http.StatusOK || seen.Load() != hex.EncodeToString(digest) || seenRoute.Load() != route {
-		t.Fatalf("GET = %d with %s %q, %s %q, want 200 with %x, %s", code, expectAllowlistHeader, seen.Load(), expectRouteHeader, seenRoute.Load(), digest, route)
+// syncBuffer is a log sink safe for the attestation goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestRouterRefusals: a 503 whose body is exactly router_digest_changed,
+// route_digest_changed or binding_expired drops the verdict so the next
+// request re-attests; routes_stale keeps it and is logged once per verdict;
+// any other response leaves the verdict alone.
+func TestRouterRefusals(t *testing.T) {
+	tests := []struct {
+		name         string
+		status       int
+		body         string
+		wantAttests  int32
+		wantStaleLog int
+	}{
+		{"router digest changed", http.StatusServiceUnavailable, routerDigestChanged, 3, 0},
+		{"route digest changed", http.StatusServiceUnavailable, routeDigestChanged, 3, 0},
+		{"binding expired", http.StatusServiceUnavailable, bindingExpired, 3, 0},
+		{"routes stale", http.StatusServiceUnavailable, routesStale, 1, 1},
+		{"unrelated 503", http.StatusServiceUnavailable, "sessions_busy", 1, 0},
+		{"code with suffix", http.StatusServiceUnavailable, bindingExpired + ": soon", 1, 0},
+		{"code on 502", http.StatusBadGateway, bindingExpired, 1, 0},
+		{"200", http.StatusOK, bindingExpired, 1, 0},
 	}
-	refusal.Store("sessions_busy")
-	get()
-	if get(); a.calls.Load() != 1 {
-		t.Fatalf("attestations after other 503s = %d, want 1", a.calls.Load())
-	}
-	refusal.Store(routerDigestChanged)
-	if code := get(); code != http.StatusServiceUnavailable {
-		t.Fatalf("GET after the router renewed = %d, want 503", code)
-	}
-	refusal.Store("")
-	if get(); a.calls.Load() != 2 {
-		t.Fatalf("attestations after router_digest_changed = %d, want 2", a.calls.Load())
-	}
-	refusal.Store(routeDigestChanged)
-	if code := get(); code != http.StatusServiceUnavailable {
-		t.Fatalf("GET after the route manifest changed = %d, want 503", code)
-	}
-	refusal.Store("")
-	if get(); a.calls.Load() != 3 {
-		t.Fatalf("attestations after route_digest_changed = %d, want 3", a.calls.Load())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &syncBuffer{}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			var refuse atomic.Bool
+			backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if refuse.Load() {
+					http.Error(w, tc.body, tc.status)
+					return
+				}
+				fmt.Fprint(w, "ok")
+			}))
+			defer backend.Close()
+			tr, a := refusalTransport(t, backend, bytes.Repeat([]byte{0x42}, 32), strings.Repeat("ab", 32))
+			get := func() int {
+				t.Helper()
+				req, _ := http.NewRequest("GET", backend.URL, nil)
+				resp, err := tr.RoundTrip(req)
+				if err != nil {
+					t.Fatalf("RoundTrip() = %v", err)
+				}
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if refuse.Load() && strings.TrimSpace(string(body)) != tc.body {
+					t.Errorf("refused body = %q, want %q passed through", body, tc.body)
+				}
+				return resp.StatusCode
+			}
+
+			refuse.Store(true)
+			for range 2 {
+				if code := get(); code != tc.status {
+					t.Fatalf("GET = %d, want %d", code, tc.status)
+				}
+			}
+			refuse.Store(false)
+			get()
+			if got := a.calls.Load(); got != tc.wantAttests {
+				t.Errorf("attestations after two %d %q and one 200 = %d, want %d", tc.status, tc.body, got, tc.wantAttests)
+			}
+			if got := strings.Count(logs.String(), "code="+routesStale); got != tc.wantStaleLog {
+				t.Errorf("routes_stale log lines = %d, want %d", got, tc.wantStaleLog)
+			}
+		})
 	}
 }
 
