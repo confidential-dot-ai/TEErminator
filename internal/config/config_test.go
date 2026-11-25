@@ -29,7 +29,8 @@ func TestParseAttestMode(t *testing.T) {
 		{"", AttestNone, false, true},
 		{"attest-lb", AttestEndpoint, false, true},
 		{"attest", AttestEndpoint, true, true}, // legacy spelling
-		{"cds-cert", AttestCDSCert, false, true},
+		{"ta-cert", AttestTACert, false, true},
+		{"cds-cert", AttestCDSCert, false, true}, // pre-rename spelling, kept as given
 		{"bogus", "", false, false},
 	} {
 		mode, normalized, ok := ParseAttestMode(tc.in)
@@ -62,6 +63,41 @@ func TestLoadNormalizesLegacyAttestMode(t *testing.T) {
 	}
 	if got := cfg.Remotes[0].Mode; got != AttestEndpoint {
 		t.Fatalf("mode = %q, want %q", got, AttestEndpoint)
+	}
+}
+
+// TestTACertModeRoundTrip: both Trust Authority certificate spellings load and
+// save as written, so a config shared with an older binary keeps working.
+func TestTACertModeRoundTrip(t *testing.T) {
+	for _, mode := range []AttestMode{AttestTACert, AttestCDSCert} {
+		t.Run(string(mode), func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("XDG_CONFIG_HOME", dir)
+			if err := os.MkdirAll(filepath.Join(dir, "teerminator"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			raw := []byte(`{"remotes":[{"local":"127.0.0.1:8080","remote":"https://lb.example/","mode":"` + string(mode) + `"}]}`)
+			if err := os.WriteFile(filepath.Join(dir, "teerminator", "config.json"), raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Remotes[0].Mode; got != mode {
+				t.Fatalf("Load() mode = %q, want %q", got, mode)
+			}
+			if err := cfg.Save(); err != nil {
+				t.Fatal(err)
+			}
+			again, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := again.Remotes[0].Mode; got != mode {
+				t.Errorf("Load() after Save() mode = %q, want %q", got, mode)
+			}
+		})
 	}
 }
 

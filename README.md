@@ -171,7 +171,7 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     | Flag (config key) | Accepts | Failure |
     |---|---|---|
     | `--pin-policy <sha256:hex, file or seed:…>` (`pinned_policies`, repeatable) | Only these policies, for every history entry and for the policy the mesh leaf was issued under. A file is an allowlist document hashed exactly as read, the bytes `GET /allowlist` serves. A `seed:` entry is a C8s release's allowlist seed, see below | `policy_history_not_pinned` |
-    | `--trust-operator --trust-operator-key <pem-file>` (`trust_operator`, `trust_operator_keys`) | Every history entry, and the policy the mesh leaf was issued under, whose document CDS stores with an operator write token signed under these keys | `policy_history_unsigned` |
+    | `--trust-operator --trust-operator-key <pem-file>` (`trust_operator`, `trust_operator_keys`) | Every history entry, and the policy the mesh leaf was issued under, whose document the Trust Authority (CDS) stores with an operator write token signed under these keys | `policy_history_unsigned` |
 
     Both fail with `policy_history_absent` when nothing replays: a node that does not
     measure its policies proves nothing about them. `--trust-operator` fetches each
@@ -241,7 +241,7 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     equals the leaf's. With `--allowlist`, `--component-set` or `allowlist fetch --pin`
     a mismatch fails; otherwise `allowlist fetch` prints it as a warning. A document without `components`, or a leaf without a set, skips the check.
   - **Pins of `c8s verify` a remote does not take.** `--allow-debug`: debug guests are
-    always rejected. `--served-policy-file`: it checks what a CDS target serves at
+    always rejected. `--served-policy-file`: it checks what a Trust Authority target serves at
     `/measurements`, which an attest-lb front door does not answer. `--image-policy-file`:
     pin one image with `--image-manifest` and, for its anchor, `--operator-pkey`.
     `--fetch-allowlists` and `--expected-report-data` are not pins; `allowlist fetch`
@@ -263,7 +263,7 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     logs it on every attestation. `--route-digest <hex,...>` (config key
     `route_digests`) requires the attested digest to be one of the listed values, and
     the error names both. Take the value from `c8s routes digest FILE` or
-    `c8s routes show`: it hashes the manifest bytes as stored on CDS, so hashing a
+    `c8s routes show`: it hashes the manifest bytes as stored on the Trust Authority, so hashing a
     reformatted copy or the signed envelope gives a digest that never matches. To
     change routes without failing, add the new digest to `route_digests` in the config
     file (the daemon reloads it; `remote add` sets pins only on a new remote), apply the
@@ -320,7 +320,7 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   [`attestation-go`](https://github.com/confidential-dot-ai/attestation-go) verifier
   (`teeverify`), so every platform it supports works here: bare-metal/GCP SNP (binding in
   `report_data`), Azure az-snp (binding in the AK-signed vTPM quote), and the TDX variants.
-- **`cds-cert`** — planned CDS-cert pinning; configuring it today fails
+- **`ta-cert`** (alias `cds-cert`) — planned Trust Authority certificate pinning; configuring it today fails
   closed (requests are blocked before reaching the backend).
 
 ```

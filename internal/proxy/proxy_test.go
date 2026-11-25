@@ -535,6 +535,7 @@ func TestPerRemoteAttestationMethods(t *testing.T) {
 	}{
 		{"none forwards", config.AttestNone, false, true},
 		{"attest fails closed without valid attestation", config.AttestEndpoint, true, true},
+		{"ta-cert (unimplemented) blocks before forwarding", config.AttestTACert, true, false},
 		{"cds-cert (unimplemented) blocks before forwarding", config.AttestCDSCert, true, false},
 	}
 

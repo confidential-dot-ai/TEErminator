@@ -114,7 +114,7 @@ func TestValidatePinModes(t *testing.T) {
 	if err := validatePinModes(config.AttestNone, []pinFlag{{"--min-tcb", ""}}); err != nil {
 		t.Fatalf("validatePinModes(no mode, no pins) = %v, want nil", err)
 	}
-	for _, mode := range []config.AttestMode{config.AttestNone, config.AttestCDSCert} {
+	for _, mode := range []config.AttestMode{config.AttestNone, config.AttestTACert, config.AttestCDSCert} {
 		for _, f := range flags {
 			err := validatePinModes(mode, []pinFlag{{f, "x"}})
 			if err == nil || !strings.Contains(err.Error(), f) {

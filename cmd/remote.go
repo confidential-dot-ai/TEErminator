@@ -230,7 +230,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 
 			attestMode, normalized, ok := config.ParseAttestMode(mode)
 			if !ok {
-				return fmt.Errorf("invalid --mode %q (want one of: attest-lb, cds-cert, or empty)", mode)
+				return fmt.Errorf("invalid --mode %q (want one of: attest-lb, ta-cert, cds-cert, or empty)", mode)
 			}
 			if normalized {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)
@@ -395,9 +395,9 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	}
 
 	f := cmd.Flags()
-	f.StringVar(&mode, "mode", "", "attestation mode: attest-lb (per-handshake attestation binding the exact serving leaf, over ordinary TLS), cds-cert (CDS-cert pinning, not yet implemented), or empty to disable")
+	f.StringVar(&mode, "mode", "", "attestation mode: attest-lb (per-handshake attestation binding the exact serving leaf, over ordinary TLS), ta-cert (Trust Authority (CDS) certificate pinning, not yet implemented; cds-cert is an alias), or empty to disable")
 	f.StringSliceVar(&measurements, "measurements", nil, "accepted launch-digest allowlist (SHA-384, 96 hex chars each), comma-separated; required for attest-lb unless --image-manifest is given (an empty measurement policy is a configuration error, and the two flags are mutually exclusive)")
-	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for cds-cert (attest-lb always uses the remote's origin)")
+	f.StringVar(&discoveryURL, "discovery-url", "", "discovery base URL, reserved for ta-cert (attest-lb always uses the remote's origin)")
 	f.StringVar(&serverName, "server-name", "", fmt.Sprintf("TLS server name (SNI) to validate the upstream certificate against, when the <remote-url> host has no matching SAN — e.g. an LB reached by IP whose cert only has an internal DNS SAN. Defaults to %q when <remote-url> is an IP. Pair with `%s certs add <ca.pem>` to trust the issuing CA", defaultC8sServerName, name))
 	f.StringVar(&workload, "workload", "", "workload name the committed mesh leaf's matched-workload stamp must carry (attest-lb)")
 	f.StringVar(&allowlistPath, "allowlist", "", "path to a pinned canonical-allowlist JSON file; hashed exactly as read against the stamp's digest, and the stamped name must resolve in it (attest-lb)")
@@ -415,7 +415,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 	f.StringSliceVar(&componentSets, "component-set", nil, "component set the committed mesh leaf must carry (OID 1.3.6.1.4.1.66378.1.11), as <version>[@sha256:<64 lowercase hex>] (repeatable / comma-separated; any one matching passes). With --allowlist, the file's components section must also hold the leaf's set. CA-vouched, like --workload. Requires --mode attest-lb")
 	f.StringSliceVar(&pinPolicies, "pin-policy", nil, "accepted allowlist policies (repeatable / comma-separated), each a sha256:<hex> digest or the path of an allowlist document hashed exactly as read (the bytes GET /allowlist serves), or seed:<release-statement.json>:<tdx|sev-snp>, a C8s release's allowlist seed verified against its signed release statement (see --sigstore-trusted-root): every policy in the node's replayed history, and the one the mesh leaf was issued under, must be one of these. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=); excludes --trust-operator")
 	f.StringVar(&trustedRoot, "sigstore-trusted-root", "", "Sigstore trusted_root.json that a seed: --pin-policy's release statement signature verifies under, offline. Required by, and only valid with, a seed: --pin-policy")
-	f.BoolVar(&trustOperator, "trust-operator", false, "accept every policy in the node's replayed history, and the one the mesh leaf was issued under, only when CDS stores its document with a write token signed under --trust-operator-key: each one is fetched from /allowlist/objects/sha256/<hex>, re-hashed, and its token verified. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=) and --trust-operator-key; excludes --pin-policy")
+	f.BoolVar(&trustOperator, "trust-operator", false, "accept every policy in the node's replayed history, and the one the mesh leaf was issued under, only when the Trust Authority (CDS) stores its document with a write token signed under --trust-operator-key: each one is fetched from /allowlist/objects/sha256/<hex>, re-hashed, and its token verified. Requires an RTMR[3] seed (--operator-pkey, --expected-rtmr3 or --rtmr 3=) and --trust-operator-key; excludes --pin-policy")
 	f.StringArrayVar(&trustKeyFiles, "trust-operator-key", nil, "PEM file of ECDSA operator public keys --trust-operator accepts signatures from (repeatable). Requires --trust-operator; --route-operator-key does not feed it")
 	return cmd
 }
