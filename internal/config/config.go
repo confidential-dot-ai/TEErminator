@@ -158,7 +158,12 @@ type Remote struct {
 	// allowlist document, hashed exactly as read. Every policy in the node's
 	// replayed history, and the one the mesh leaf was issued under, must be
 	// in the set. Exclusive with TrustOperator; requires an RTMR[3] seed.
+	// An entry "seed:<release-statement.json>:<platform>" pins a C8s
+	// release's allowlist seed; it requires SigstoreTrustedRoot.
 	PinnedPolicies []string `json:"pinned_policies,omitempty"`
+	// SigstoreTrustedRoot is the path of the Sigstore trusted_root.json the
+	// release statements of seed: pinned policies verify under, offline.
+	SigstoreTrustedRoot string `json:"sigstore_trusted_root,omitempty"`
 	// TrustOperator accepts every policy in the node's replayed history, and
 	// the one the mesh leaf was issued under, whose document CDS stores with
 	// a write token signed under TrustOperatorKeys. Exclusive with

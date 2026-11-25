@@ -103,7 +103,7 @@ func TestLoadAcceptsEveryWrittenKey(t *testing.T) {
 			ExpectedRTMR3: "r", MinTCB: &TCBFloor{Bootloader: 1}, TDXTCBStatus: []string{"UpToDate"},
 			RouteDigests: []string{"ab"}, RouteOperatorKeys: []string{"k"},
 			RouteFloor: "1:ab", OperatorPubkeyPath: "/o", RTMRs: []string{"1=ab"}, InitDataDigest: "cd", SandboxID: "sb",
-			PinnedPolicies: []string{"sha256:ab"}, TrustOperator: true, TrustOperatorKeys: []string{"k"}, StaticAllowlist: true, InitData: "x",
+			PinnedPolicies: []string{"sha256:ab"}, SigstoreTrustedRoot: "/t", TrustOperator: true, TrustOperatorKeys: []string{"k"}, StaticAllowlist: true, InitData: "x",
 			Pin: &CertPin{SHA256: "h", NotAfter: "n", PEM: "p"},
 		}},
 		Certs: []Cert{{Fingerprint: "f", CommonName: "c", PEM: "p"}},
