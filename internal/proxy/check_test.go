@@ -97,3 +97,22 @@ func TestVerdictResult(t *testing.T) {
 		t.Errorf("verdictResult(partial) = %+v, want Partial naming what is not proven", got)
 	}
 }
+
+func TestVerdictResultComponentSet(t *testing.T) {
+	set := &verifier.ComponentSet{Version: "0.43.0", Digest: make([]byte, 32)}
+	for _, tc := range []struct {
+		name string
+		set  *verifier.ComponentSet
+		want string
+	}{
+		{"absent", nil, ""},
+		{"present", set, ", component set 0.43.0 sha256:" + strings.Repeat("00", 32) + " (ca-vouched)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := verdictResult(&verifier.SessionVerdict{Measurement: "a1", ComponentSet: tc.set}, "127.0.0.1:8080").Detail
+			if tc.want == "" && strings.Contains(got, "component set") || !strings.Contains(got, tc.want) {
+				t.Errorf("verdictResult(%v).Detail = %q, want it to contain %q", tc.set, got, tc.want)
+			}
+		})
+	}
+}

@@ -122,6 +122,9 @@ func verdictResult(v *verifier.SessionVerdict, local string) CheckResult {
 	if v.SandboxID != "" {
 		detail += ", sandbox " + v.SandboxID
 	}
+	if v.ComponentSet != nil {
+		detail += fmt.Sprintf(", component set %s (%s)", v.ComponentSet, verifier.ProfileCAVouched)
+	}
 	if v.TCBFloor != "" {
 		detail += ", tcb floor " + v.TCBFloor
 	}

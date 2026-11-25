@@ -126,7 +126,7 @@ func attemptAllowlistFetch(ctx context.Context, r config.Remote, extraCAs []conf
 	fetchTr := &http.Transport{TLSClientConfig: fetchTLS}
 	defer fetchTr.CloseIdleConnections()
 
-	doc, err := verifier.FetchAllowlist(ctx, &http.Client{Transport: fetchTr}, origin, v.Stamp)
+	doc, err := verifier.FetchAllowlist(ctx, &http.Client{Transport: fetchTr}, origin, v.Stamp, v.ComponentSet)
 	if err != nil {
 		return nil, err
 	}
