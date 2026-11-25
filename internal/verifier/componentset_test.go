@@ -264,6 +264,7 @@ func TestAttestLBComponentSet(t *testing.T) {
 		{name: "malformed fails unpinned", rawExt: []byte{0x30, 0x00}, wantErr: "component set"},
 		{name: "allowlist holds the set", set: current, allowlist: true, want: current.String()},
 		{name: "allowlist lacks the set", set: &ComponentSet{Version: "0.44.0", Digest: current.Digest}, allowlist: true, wantErr: "holds no set 0.44.0"},
+		{name: "allowlist set has another digest", set: &ComponentSet{Version: "0.43.0", Digest: fixtureSet(t, vectors, "0.42.1").Digest}, allowlist: true, wantErr: "has digest " + vectors.Sets["0.43.0"].Digest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stubEvidence(t)

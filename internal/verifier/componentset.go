@@ -18,6 +18,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/confidential-dot-ai/TEErminator/internal/config"
 )
 
 // oidComponentSet identifies the component-set extension:
@@ -116,24 +118,10 @@ type componentSetPin struct {
 	digest  []byte
 }
 
-// parseComponentSetPin parses "<version>[@sha256:<64 lowercase hex>]".
 func parseComponentSetPin(s string) (componentSetPin, error) {
-	version, digest, hasDigest := strings.Cut(s, "@")
-	if !componentVersionPattern.MatchString(version) {
-		return componentSetPin{}, fmt.Errorf("--component-set %q: version %q is not MAJOR.MINOR.PATCH", s, version)
-	}
-	if !hasDigest {
-		return componentSetPin{version: version}, nil
-	}
-	hexDigest, ok := strings.CutPrefix(digest, "sha256:")
-	if !ok || !lowerHex64.MatchString(hexDigest) {
-		return componentSetPin{}, fmt.Errorf("--component-set %q: digest %q is not sha256:<64 lowercase hex>", s, digest)
-	}
-	b, _ := hex.DecodeString(hexDigest) // lowerHex64 matched
-	return componentSetPin{version: version, digest: b}, nil
+	version, digest, err := config.ParseComponentSetPin(s)
+	return componentSetPin{version: version, digest: digest}, err
 }
-
-var lowerHex64 = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // validateComponentSetPins checks every component_set entry's syntax.
 func validateComponentSetPins(pins []string) error {

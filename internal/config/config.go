@@ -271,6 +271,9 @@ func Load() (*Config, error) {
 		if cfg.Remotes[i].Mode == legacyAttestEndpoint {
 			cfg.Remotes[i].Mode = AttestEndpoint
 		}
+		if err := cfg.Remotes[i].validateComponentSets(); err != nil {
+			return nil, fmt.Errorf("%s: remote %s: %w", path, cfg.Remotes[i].Local, err)
+		}
 	}
 	// Configs written before fingerprint keying store certs without one;
 	// compute it from the PEM so lookup and dedup work. An unparseable PEM
