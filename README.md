@@ -113,7 +113,9 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
   - **Workload pin.** `--workload <name>` requires the committed mesh leaf to carry a
     matched-workload stamp (OID `1.3.6.1.4.1.66378.1.5`) naming `<name>`;
     `--allowlist <file>` additionally requires the stamp's digest to equal the SHA-256 of
-    the exact file bytes and the stamped name to resolve in the document. The stamp is
+    the exact file bytes and the stamped name to resolve in the document: as a
+    `workloads` entry, or as an entry of a component set in the `components` section
+    that is in force now (current, or retiring with its deadline ahead). The stamp is
     CA-vouched (`ca-vouched` profile in the verdict) — the mesh CA signature, not the
     hardware evidence, vouches for it. `allowlist fetch` obtains that file from the
     cluster itself (see below); the stamp's allowlist **version** counter, which `status`
@@ -189,6 +191,19 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     mesh leaf to carry this CRI pod sandbox ID (OID `1.3.6.1.4.1.66378.1.4`). Like the
     workload stamp it is CA-vouched. `status` prints the ID whenever the leaf carries one,
     and a malformed one fails the attestation even unpinned.
+  - **Component set.** A C8s Trust Authority stamps the mesh leaf with the component set
+    its pod runs on (OID `1.3.6.1.4.1.66378.1.11`): the release version and the SHA-256
+    of that set's entries. It is CA-vouched, like the workload stamp. Whenever the leaf
+    carries one, `status` prints `component set <version> sha256:<hex> (ca-vouched)`
+    and the proxy's attestation log line adds it as `component_set`. A malformed or
+    non-canonical one
+    fails the attestation even unpinned. `--component-set <version>[@sha256:<hex>]`
+    (config key `component_set`, repeatable; any one matching passes) requires the leaf
+    to carry a set of that version, and that digest when given. When the leaf carries a
+    set and an allowlist document has a `components` section, the document must hold a
+    set of that version whose digest equals the leaf's. With `--allowlist` or
+    `--component-set` a mismatch fails; otherwise `allowlist fetch` prints it as a
+    warning. A document without `components`, or a leaf without a set, skips the check.
   - **Pins of `c8s verify` a remote does not take.** `--allow-debug`: debug guests are
     always rejected. `--served-policy-file`: it checks what a CDS target serves at
     `/measurements`, which an attest-lb front door does not answer. `--image-policy-file`:
@@ -331,7 +346,8 @@ The remote is attested exactly as `status` attests it (`--mode attest-lb` only, 
 other mode yields a stamp), the matched-workload stamp is read off the chain-verified mesh
 leaf, `GET /allowlist` is fetched over a connection pinned to the attested serving leaf,
 and the response is written only when SHA-256 over the bytes **as received** equals the
-digest the stamp names and the stamped workload resolves in the document. The bytes go to
+digest the stamp names and the stamped workload resolves in the document (see the
+workload pin above). The bytes go to
 disk verbatim — the digest is over exactly them, so a JSON round trip that preserves the
 document's meaning still produces a file the stamp no longer matches. A document that
 fails the check is never written, not even partially, and the command exits non-zero.
