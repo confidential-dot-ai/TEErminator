@@ -460,8 +460,11 @@ func (t *h3Transport) roundTripEndpoint(req *http.Request, host string) (*http.R
 	switch code := string(bytes.TrimSpace(head)); code {
 	case routerDigestChanged, routeDigestChanged, bindingExpired:
 		// The router renewed, applied another route manifest, or lapsed this
-		// connection's binding: the next request re-attests.
-		t.cache.Invalidate(t.remoteKey)
+		// connection's binding: the next request re-attests. A refusal of a
+		// verdict already replaced leaves the new one alone.
+		if !t.cache.InvalidateVerdict(t.remoteKey, expect) {
+			break
+		}
 		t.dropPinned(leaf)
 		slog.Info("router refused the attested session; re-attesting on the next request",
 			"mode", t.remote.Mode, "remote", t.remote.Remote, "code", code)
