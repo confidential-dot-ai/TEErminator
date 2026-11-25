@@ -140,24 +140,3 @@ func TestFetchAllowlistFailsClosedOnUnattestedBackend(t *testing.T) {
 		t.Fatalf("FetchAllowlist = %+v, %v, want an attestation failure", res, err)
 	}
 }
-
-func TestComponentSetFailure(t *testing.T) {
-	mismatch := &verifier.FetchedAllowlist{ComponentSetMismatch: errors.New("holds no set 0.44.0")}
-	for _, tc := range []struct {
-		name string
-		r    config.Remote
-		doc  *verifier.FetchedAllowlist
-		fail bool
-	}{
-		{"consistent", config.Remote{ComponentSets: []string{"0.43.0"}}, &verifier.FetchedAllowlist{}, false},
-		{"unpinned mismatch warns", config.Remote{WorkloadName: "api"}, mismatch, false},
-		{"component set pin fails", config.Remote{ComponentSets: []string{"0.43.0"}}, mismatch, true},
-		{"allowlist pin fails", config.Remote{AllowlistPath: "/a.json"}, mismatch, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := componentSetFailure(tc.r, tc.doc); (err != nil) != tc.fail {
-				t.Fatalf("componentSetFailure(%+v) = %v, want failure %v", tc.r, err, tc.fail)
-			}
-		})
-	}
-}

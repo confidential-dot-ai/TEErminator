@@ -196,14 +196,14 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     of that set's entries. It is CA-vouched, like the workload stamp. Whenever the leaf
     carries one, `status` prints `component set <version> sha256:<hex> (ca-vouched)`
     and the proxy's attestation log line adds it as `component_set`. A malformed or
-    non-canonical one
-    fails the attestation even unpinned. `--component-set <version>[@sha256:<hex>]`
-    (config key `component_set`, repeatable; any one matching passes) requires the leaf
-    to carry a set of that version, and that digest when given. When the leaf carries a
-    set and an allowlist document has a `components` section, the document must hold a
-    set of that version whose digest equals the leaf's. With `--allowlist` or
-    `--component-set` a mismatch fails; otherwise `allowlist fetch` prints it as a
-    warning. A document without `components`, or a leaf without a set, skips the check.
+    non-canonical one fails the attestation even unpinned.
+    `--component-set <version>[@sha256:<hex>]` (config key `component_set`, repeatable;
+    any one matching passes) requires the leaf to carry a set of that version, and that
+    digest when given; a malformed or non-attest-lb `component_set` in the config file
+    fails at load. When the leaf carries a set and an allowlist document has a
+    `components` section, the document must hold a set of that version whose digest
+    equals the leaf's. With `--allowlist`, `--component-set` or `allowlist fetch --pin`
+    a mismatch fails; otherwise `allowlist fetch` prints it as a warning. A document without `components`, or a leaf without a set, skips the check.
   - **Pins of `c8s verify` a remote does not take.** `--allow-debug`: debug guests are
     always rejected. `--served-policy-file`: it checks what a CDS target serves at
     `/measurements`, which an attest-lb front door does not answer. `--image-policy-file`:
