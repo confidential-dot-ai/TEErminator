@@ -224,7 +224,7 @@ func TestComponentSetMismatch(t *testing.T) {
 
 func TestPinnedPolicyDigestAcceptsComponents(t *testing.T) {
 	_, vectors := loadComponentSetFixture(t)
-	got, err := PinnedPolicyDigest(filepath.Join("testdata", "componentsets", "allowlist.json"))
+	got, err := PinnedPolicyDigest(filepath.Join("testdata", "componentsets", "allowlist.json"), "")
 	if err != nil {
 		t.Fatalf("PinnedPolicyDigest(allowlist.json) = %v, want a document with components accepted", err)
 	}
