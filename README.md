@@ -170,7 +170,7 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
 
     | Flag (config key) | Accepts | Failure |
     |---|---|---|
-    | `--pin-policy <sha256:hex or file>` (`pinned_policies`, repeatable) | Only these policies, for every history entry and for the policy the mesh leaf was issued under. A file is an allowlist document hashed exactly as read, the bytes `GET /allowlist` serves | `policy_history_not_pinned` |
+    | `--pin-policy <sha256:hex, file or seed:…>` (`pinned_policies`, repeatable) | Only these policies, for every history entry and for the policy the mesh leaf was issued under. A file is an allowlist document hashed exactly as read, the bytes `GET /allowlist` serves. A `seed:` entry is a C8s release's allowlist seed, see below | `policy_history_not_pinned` |
     | `--trust-operator --trust-operator-key <pem-file>` (`trust_operator`, `trust_operator_keys`) | Every history entry, and the policy the mesh leaf was issued under, whose document CDS stores with an operator write token signed under these keys | `policy_history_unsigned` |
 
     Both fail with `policy_history_absent` when nothing replays: a node that does not
@@ -189,6 +189,37 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     a leaf without a stamp leaves it `Partial` too. With neither check, a non-empty
     history is accepted and the verdict is `Partial`. `status` prints the check as
     `policy history pinned`, `operator-signed` or `unchecked`.
+
+    A C8s release publishes the allowlist seed of each CPU TEE as
+    `allowlist-seed-{tdx,sev-snp}.json`, listed by SHA-256 under `allowlistSeeds` in
+    its Sigstore-signed `release-statement.json`. To pin a seed, download the
+    statement, its bundle and the seed into one directory, then pass
+    `--pin-policy seed:<dir>/release-statement.json:<tdx|sev-snp>` with
+    `--sigstore-trusted-root <trusted_root.json>` (config key `sigstore_trusted_root`):
+
+    ```sh
+    gh release download <RELEASE_TAG> --repo confidential-dot-ai/confidential-kubernetes \
+      --pattern 'release-statement*' --pattern allowlist-seed-tdx.json --dir seed
+    ```
+
+    At `remote add` and at every attestation, TEErminator verifies the bundle offline
+    under the trusted root: the signer must be `semver-tag.yml` on `refs/heads/main`
+    of the repository the statement names, `confidential-dot-ai/confidential-kubernetes`
+    or its former name `confidential-dot-ai/C8s`, with issuer
+    `https://token.actions.githubusercontent.com`, as
+    [releases.md](https://github.com/confidential-dot-ai/confidential-kubernetes/blob/main/docs/releases.md#verify-a-release)
+    verifies it with cosign. The certificate must also carry the repository's GitHub ID,
+    `1040957973`, as source repository identifier, so a repository created later under
+    either name cannot sign. The bundle is the statement's name with `.json` replaced by
+    `.sigstore.json`; the seed is the asset the statement lists, beside it. The seed must
+    hash to the listed SHA-256, and its SHA-256 is then pinned like a file. A statement
+    that lists no seed for the platform, a release older than published seeds, or a
+    signature that does not verify fails `remote add`. The trusted root is Sigstore's
+    public-good `trusted_root.json`: cosign 3 caches it from Sigstore's TUF repository at
+    `~/.sigstore/root/tuf-repo-cdn.sigstore.dev/targets/trusted_root.json`. The pin
+    matches only a node whose policy is the seed unchanged: a Trust Authority that adds
+    tenant workloads or nodes to the seed serves a different document, which you pin as
+    a file or digest.
   - **Init data.** `--init-data <hex>` (config key `init_data_digest`) requires the
     evidence to commit exactly this SHA-256 of the init-data document: SNP `HOST_DATA`,
     TDX `MR_CONFIG_ID`, or vTPM PCR[8] on Azure.
@@ -323,6 +354,11 @@ $ ./teerminator remote add 127.0.0.1:8085 https://app.example/ \
 $ ./teerminator remote add 127.0.0.1:8086 https://<LB-IP>/ \
     --mode attest-lb --image-manifest ./image-manifest.json \
     --operator-pkey ./operator.pub --pin-policy ./allowlist.json,sha256:<hex>
+
+# Or accept only the allowlist seed of a signed C8s release.
+$ ./teerminator remote add 127.0.0.1:8088 https://<LB-IP>/ \
+    --mode attest-lb --image-manifest ./image-manifest.json --operator-pkey ./operator.pub \
+    --pin-policy seed:./seed/release-statement.json:tdx --sigstore-trusted-root ./trusted_root.json
 
 # Or accept every policy the operator signed.
 $ ./teerminator remote add 127.0.0.1:8087 https://<LB-IP>/ \

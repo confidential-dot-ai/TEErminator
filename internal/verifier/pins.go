@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/release"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/attestation-go/refvalues"
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
@@ -101,6 +102,22 @@ func ValidatePinCombination(r config.Remote) error {
 	}
 	if len(r.PinnedPolicies) > 0 && r.TrustOperator {
 		return errors.New("--pin-policy and --trust-operator are mutually exclusive: accept what the operator signed, or only what you pinned")
+	}
+	seedPins := 0
+	for _, p := range r.PinnedPolicies {
+		_, isSeed, err := release.ParseSeedPin(p)
+		if err != nil {
+			return fmt.Errorf("--pin-policy: %w", err)
+		}
+		if isSeed {
+			seedPins++
+		}
+	}
+	if seedPins > 0 && r.SigstoreTrustedRoot == "" {
+		return errSeedNeedsTrustedRoot
+	}
+	if seedPins == 0 && r.SigstoreTrustedRoot != "" {
+		return errors.New("--sigstore-trusted-root requires a seed: --pin-policy, the only pin it verifies")
 	}
 	if len(r.TrustOperatorKeys) > 0 && !r.TrustOperator {
 		return errors.New("--trust-operator-key requires --trust-operator")
