@@ -226,7 +226,7 @@ func newRemoteAddCmd(name string) *cobra.Command {
 
 			attestMode, normalized, ok := config.ParseAttestMode(mode)
 			if !ok {
-				return fmt.Errorf("invalid --mode %q (want one of: attest-lb, cds-cert, or empty)", mode)
+				return fmt.Errorf("invalid --mode %q (want one of: attest-lb, ta-cert, cds-cert, or empty)", mode)
 			}
 			if normalized {
 				fmt.Printf("Note: --mode attest is now attest-lb; storing mode %q.\n", attestMode)

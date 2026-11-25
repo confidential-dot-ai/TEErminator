@@ -50,8 +50,11 @@ const (
 	// legacyAttestEndpoint is the pre-attest-lb spelling, still accepted on
 	// input and normalized to AttestEndpoint.
 	legacyAttestEndpoint AttestMode = "attest"
-	// AttestCDSCert fetches and pins the CDS cert before trusting the
-	// connection.
+	// AttestTACert fetches and pins the Trust Authority certificate before
+	// trusting the connection.
+	AttestTACert AttestMode = "ta-cert"
+	// AttestCDSCert is the pre-rename spelling of AttestTACert. It stays
+	// accepted and is stored as given, so older binaries still read it.
 	AttestCDSCert AttestMode = "cds-cert"
 )
 
@@ -182,7 +185,7 @@ func ParseAttestMode(s string) (mode AttestMode, normalized, ok bool) {
 	switch AttestMode(s) {
 	case legacyAttestEndpoint:
 		return AttestEndpoint, true, true
-	case AttestNone, AttestEndpoint, AttestCDSCert:
+	case AttestNone, AttestEndpoint, AttestTACert, AttestCDSCert:
 		return AttestMode(s), false, true
 	default:
 		return "", false, false
