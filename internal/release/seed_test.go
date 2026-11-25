@@ -157,6 +157,32 @@ func TestVerifySeedPreRenameRepository(t *testing.T) {
 	}
 }
 
+// A repository created under a release repository's name signs with the same
+// workflow identity but another repository ID.
+func TestVerifyStatementRepositoryID(t *testing.T) {
+	tests := []struct {
+		tag, repository, repositoryID string
+		wantErr                       bool
+	}{
+		{"v0.108.0", "confidential-dot-ai/confidential-kubernetes", signerRepositoryID, false},
+		{"v0.100.0", "confidential-dot-ai/C8s", signerRepositoryID, false},
+		{"v0.108.0", "confidential-dot-ai/confidential-kubernetes", "1", true},
+		{"v0.100.0", "confidential-dot-ai/C8s", "1", true},
+	}
+	for _, tt := range tests {
+		statement := release(t, tt.tag, nil)
+		raw, err := os.ReadFile(statement)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bundle := SeedPin{Statement: statement}.Bundle()
+		err = verifyStatement(raw, tt.repository, tt.repositoryID, bundle, trustedRoot)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("verifyStatement(%s, repository ID %s) = %v, want error %t", tt.tag, tt.repositoryID, err, tt.wantErr)
+		}
+	}
+}
+
 func TestParseSeedPin(t *testing.T) {
 	tests := []struct {
 		entry   string

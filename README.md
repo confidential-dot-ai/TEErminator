@@ -201,7 +201,9 @@ The staging root provides chain trust for the acme check only. It is not a mesh-
     or its former name `confidential-dot-ai/C8s`, with issuer
     `https://token.actions.githubusercontent.com`, as
     [releases.md](https://github.com/confidential-dot-ai/confidential-kubernetes/blob/main/docs/releases.md#verify-a-release)
-    verifies it with cosign. The bundle is the statement's name with `.json` replaced by
+    verifies it with cosign. The certificate must also carry the repository's GitHub ID,
+    `1040957973`, as source repository identifier, so a repository created later under
+    either name cannot sign. The bundle is the statement's name with `.json` replaced by
     `.sigstore.json`; the seed is the asset the statement lists, beside it. The seed must
     hash to the listed SHA-256, and its SHA-256 is then pinned like a file. A statement
     that lists no seed for the platform, a release older than published seeds, or a

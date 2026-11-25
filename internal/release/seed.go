@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/sigstore/sigstore-go/pkg/bundle"
+	"github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/verify"
 )
@@ -25,6 +26,11 @@ const SeedPrefix = "seed:"
 
 // signerIssuer is the OIDC issuer of the release workflow's certificate.
 const signerIssuer = "https://token.actions.githubusercontent.com"
+
+// signerRepositoryID is GitHub's numeric ID of confidential-kubernetes, which
+// Fulcio certifies as the source repository identifier. It survives the rename
+// from C8s, and a repository later created under either name does not get it.
+const signerRepositoryID = "1040957973"
 
 // signerRepositories are the names releases were signed under: the
 // repository was C8s before it became confidential-kubernetes.
@@ -95,7 +101,7 @@ func VerifySeed(p SeedPin, trustedRoot string) ([]byte, error) {
 	if err := json.Unmarshal(raw, &st); err != nil {
 		return nil, fmt.Errorf("release statement %s: %w", p.Statement, err)
 	}
-	if err := verifyStatement(raw, st.Repository, p.Bundle(), trustedRoot); err != nil {
+	if err := verifyStatement(raw, st.Repository, signerRepositoryID, p.Bundle(), trustedRoot); err != nil {
 		return nil, fmt.Errorf("release statement %s: %w", p.Statement, err)
 	}
 	if st.AllowlistSeeds == nil {
@@ -125,8 +131,8 @@ func VerifySeed(p SeedPin, trustedRoot string) ([]byte, error) {
 
 // verifyStatement checks the bundle signs raw under the release workflow
 // identity of repository, the statement's own field, so the field is bound
-// to the signer.
-func verifyStatement(raw []byte, repository, bundlePath, trustedRoot string) error {
+// to the signer, from the repository whose GitHub ID is repositoryID.
+func verifyStatement(raw []byte, repository, repositoryID, bundlePath, trustedRoot string) error {
 	if !slices.Contains(signerRepositories, repository) {
 		return fmt.Errorf("repository %q is not one of %s", repository, strings.Join(signerRepositories, ", "))
 	}
@@ -145,7 +151,15 @@ func verifyStatement(raw []byte, repository, bundlePath, trustedRoot string) err
 	if err != nil {
 		return err
 	}
-	identity, err := verify.NewShortCertificateIdentity(signerIssuer, "", signerIdentity(repository), "")
+	san, err := verify.NewSANMatcher(signerIdentity(repository), "")
+	if err != nil {
+		return err
+	}
+	issuer, err := verify.NewIssuerMatcher(signerIssuer, "")
+	if err != nil {
+		return err
+	}
+	identity, err := verify.NewCertificateIdentity(san, issuer, certificate.Extensions{SourceRepositoryIdentifier: repositoryID})
 	if err != nil {
 		return err
 	}
