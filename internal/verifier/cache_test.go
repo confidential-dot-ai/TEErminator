@@ -3,6 +3,8 @@ package verifier
 import (
 	"crypto/x509"
 	"errors"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -256,5 +258,23 @@ func TestRemoteKey(t *testing.T) {
 	b := RemoteKey("h", base, nil, []*x509.Certificate{otherCA.cert, ca.cert})
 	if a != b {
 		t.Fatal("key must be invariant under pinned-CA order")
+	}
+}
+
+// A seed pin's verdict must follow its statement, bundle and trusted root; the
+// statement lists the seed's digest.
+func TestPinnedFileDigestsReleaseSeed(t *testing.T) {
+	dir := "../release/testdata"
+	r := config.Remote{
+		PinnedPolicies:      []string{"seed:" + dir + "/v0.108.0/release-statement.json:tdx"},
+		SigstoreTrustedRoot: dir + "/trusted_root.json",
+	}
+	files, err := PinnedFileDigests(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{dir + "/trusted_root.json", dir + "/v0.108.0/release-statement.json", dir + "/v0.108.0/release-statement.sigstore.json"}
+	if got := slices.Sorted(maps.Keys(files)); !slices.Equal(got, want) {
+		t.Errorf("PinnedFileDigests(seed pin) paths = %q, want %q", got, want)
 	}
 }

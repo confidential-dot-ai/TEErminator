@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/TEErminator/internal/config"
+	"github.com/confidential-dot-ai/TEErminator/internal/release"
 )
 
 // SessionCache memoises attestation verdicts per remote so a long-lived TLS
@@ -124,13 +125,22 @@ func (c *SessionCache) Invalidate(key string) {
 
 // PinnedFileDigests returns the SHA-256 of every file a remote's pins name,
 // keyed by path: the allowlist, the image manifest, the operator public key,
-// and the pinned policy documents.
+// the pinned policy documents, and for a release seed its statement, bundle
+// and Sigstore trusted root. The statement lists the seed's own digest.
 func PinnedFileDigests(r config.Remote) (map[string][]byte, error) {
-	paths := []string{r.AllowlistPath, r.ImageManifestPath, r.OperatorPubkeyPath}
+	paths := []string{r.AllowlistPath, r.ImageManifestPath, r.OperatorPubkeyPath, r.SigstoreTrustedRoot}
 	for _, p := range r.PinnedPolicies {
-		if !strings.HasPrefix(p, "sha256:") {
-			paths = append(paths, p)
+		if strings.HasPrefix(p, "sha256:") {
+			continue
 		}
+		if seed, ok, err := release.ParseSeedPin(p); ok {
+			if err != nil {
+				return nil, err
+			}
+			paths = append(paths, seed.Statement, seed.Bundle())
+			continue
+		}
+		paths = append(paths, p)
 	}
 	files := make(map[string][]byte)
 	for _, p := range paths {

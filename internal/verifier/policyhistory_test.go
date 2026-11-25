@@ -230,3 +230,62 @@ func TestAttestLBSignedPolicyCache(t *testing.T) {
 		t.Errorf("fetches = %d, want 2: a verified document and token are fetched once per attester", n)
 	}
 }
+
+func TestAttestLBPinnedReleaseSeed(t *testing.T) {
+	const releaseDir = "../release/testdata/v0.108.0"
+	trustedRoot, err := filepath.Abs("../release/testdata/trusted_root.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, err := os.ReadFile(filepath.Join(releaseDir, "allowlist-seed-tdx.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := t.TempDir()
+	for _, name := range []string{"release-statement.json", "release-statement.sigstore.json", "allowlist-seed-tdx.json"} {
+		raw, err := os.ReadFile(filepath.Join(releaseDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name == "allowlist-seed-tdx.json" {
+			raw = append(raw, ' ')
+		}
+		if err := os.WriteFile(filepath.Join(tampered, name), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	node := newHistoryNode(t, seed)
+	leaf := policyDigest(defaultAllowlistRaw)
+	for _, tc := range []struct {
+		name    string
+		entry   string
+		wantErr string
+	}{
+		{name: "verified seed", entry: "seed:" + releaseDir + "/release-statement.json:tdx"},
+		{name: "tampered seed", entry: "seed:" + tampered + "/release-statement.json:tdx", wantErr: "lists 894ea078448423e53fb659513b214486dedb527394cec373bb55985e277066c3"},
+		{name: "seed of another platform", entry: "seed:" + releaseDir + "/release-statement.json:sev-snp", wantErr: "read allowlist seed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := tdxStubClaims()
+			sc.platformData["rtmr_3"] = node.rtmr3
+			stubEvidenceClaims(t, sc)
+			f := newLBFixture(t, fixtureOpts{})
+			ts := f.newServer(t, bundleSpec{platform: "tdx", measuredPolicies: node.history})
+			r := node.remote(t)
+			r.PinnedPolicies, r.SigstoreTrustedRoot = []string{tc.entry, leaf}, trustedRoot
+			v, err := newLBAttester(t, ts, r, []*x509.Certificate{f.ca.cert}).Attest(context.Background())
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Attest(%s) = %v, want an error containing %q", tc.entry, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Attest(%s) = %v", tc.entry, err)
+			}
+			if v.PolicyCheck != PolicyPinned || v.Partial {
+				t.Errorf("Attest(%s) PolicyCheck, Partial = %q, %t, want %q, false", tc.entry, v.PolicyCheck, v.Partial, PolicyPinned)
+			}
+		})
+	}
+}
